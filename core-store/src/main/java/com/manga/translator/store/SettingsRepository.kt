@@ -1,0 +1,247 @@
+﻿package com.manga.translator.store
+
+import android.content.Context
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import org.json.JSONObject
+
+class SettingsRepository(context: Context) {
+    private val prefs = EncryptedSharedPreferences.create(
+        context,
+        PREF_NAME,
+        MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    fun getSettings(): AppSettings {
+        val legacyProvider = AiProvider.fromId(prefs.getString(KEY_PROVIDER, AiProvider.OPENAI.id).orEmpty())
+        val legacyBaseUrl = prefs.getString(KEY_BASE_URL, "")?.trim().orEmpty()
+        val legacyModel = prefs.getString(KEY_MODEL, "gpt-4o-mini")?.trim().orEmpty()
+        val legacyApiKey = prefs.getString(KEY_API_KEY, "")?.trim().orEmpty()
+        val ocrProvider = AiProvider.fromId(prefs.getString(KEY_OCR_PROVIDER, legacyProvider.id).orEmpty())
+        val translateProvider = AiProvider.fromId(prefs.getString(KEY_TRANSLATE_PROVIDER, legacyProvider.id).orEmpty())
+        return AppSettings(
+            ocrProvider = ocrProvider.id,
+            ocrBaseUrl = prefs.getString(KEY_OCR_BASE_URL, legacyBaseUrl)?.trim().orEmpty(),
+            ocrModel = prefs.getString(KEY_OCR_MODEL, legacyModel)?.trim().orEmpty(),
+            ocrApiKey = prefs.getString(KEY_OCR_API_KEY, legacyApiKey)?.trim().orEmpty(),
+            translateProvider = translateProvider.id,
+            translateBaseUrl = prefs.getString(KEY_TRANSLATE_BASE_URL, legacyBaseUrl)?.trim().orEmpty(),
+            translateModel = prefs.getString(KEY_TRANSLATE_MODEL, legacyModel)?.trim().orEmpty(),
+            translateApiKey = prefs.getString(KEY_TRANSLATE_API_KEY, legacyApiKey)?.trim().orEmpty(),
+            enabled = prefs.getBoolean(KEY_ENABLED, true),
+            ignoreSimplifiedChinese = prefs.getBoolean(KEY_IGNORE_SIMPLIFIED, false),
+            enableThinking = prefs.getBoolean(KEY_ENABLE_THINKING, false),
+            thinkingBudget = prefs.getInt(KEY_THINKING_BUDGET, DEFAULT_THINKING_BUDGET)
+        )
+    }
+
+    fun saveSettings(settings: AppSettings) {
+        prefs.edit()
+            .putString(KEY_OCR_PROVIDER, AiProvider.fromId(settings.ocrProvider).id)
+            .putString(KEY_OCR_BASE_URL, normalizeBaseUrl(settings.ocrBaseUrl))
+            .putString(KEY_OCR_MODEL, settings.ocrModel.trim())
+            .putString(KEY_OCR_API_KEY, settings.ocrApiKey.trim())
+            .putString(KEY_TRANSLATE_PROVIDER, AiProvider.fromId(settings.translateProvider).id)
+            .putString(KEY_TRANSLATE_BASE_URL, normalizeBaseUrl(settings.translateBaseUrl))
+            .putString(KEY_TRANSLATE_MODEL, settings.translateModel.trim())
+            .putString(KEY_TRANSLATE_API_KEY, settings.translateApiKey.trim())
+            // 兼容旧版本字段，默认同步为翻译配置。
+            .putString(KEY_PROVIDER, AiProvider.fromId(settings.translateProvider).id)
+            .putString(KEY_BASE_URL, normalizeBaseUrl(settings.translateBaseUrl))
+            .putString(KEY_MODEL, settings.translateModel.trim())
+            .putString(KEY_API_KEY, settings.translateApiKey.trim())
+            .putBoolean(KEY_ENABLED, settings.enabled)
+            .putBoolean(KEY_IGNORE_SIMPLIFIED, settings.ignoreSimplifiedChinese)
+            .putBoolean(KEY_ENABLE_THINKING, settings.enableThinking)
+            .putInt(KEY_THINKING_BUDGET, settings.thinkingBudget.coerceIn(1024, 131072))
+            .apply()
+    }
+
+    fun getProfileNames(): List<String> {
+        val root = loadProfilesJson()
+        val names = mutableListOf<String>()
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val name = keys.next().trim()
+            if (name.isNotEmpty()) {
+                names += name
+            }
+        }
+        return names.sorted()
+    }
+
+    fun getProfile(name: String): AppSettings? {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return null
+        val root = loadProfilesJson()
+        val profile = root.optJSONObject(trimmed) ?: return null
+        return jsonToSettings(profile)
+    }
+
+    fun saveProfile(name: String, settings: AppSettings) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        val root = loadProfilesJson()
+        root.put(trimmed, settingsToJson(settings))
+        prefs.edit()
+            .putString(KEY_PROFILES_JSON, root.toString())
+            .putString(KEY_LAST_PROFILE_NAME, trimmed)
+            .apply()
+    }
+
+    fun renameProfile(oldName: String, newName: String): RenameProfileResult {
+        val source = oldName.trim()
+        val target = newName.trim()
+        if (source.isEmpty() || target.isEmpty()) return RenameProfileResult.INVALID_NAME
+        if (source == target) return RenameProfileResult.SUCCESS
+
+        val root = loadProfilesJson()
+        val payload = root.optJSONObject(source) ?: return RenameProfileResult.SOURCE_NOT_FOUND
+        if (root.has(target)) return RenameProfileResult.TARGET_EXISTS
+
+        root.remove(source)
+        root.put(target, payload)
+
+        val editor = prefs.edit().putString(KEY_PROFILES_JSON, root.toString())
+        if (getLastProfileName() == source) {
+            editor.putString(KEY_LAST_PROFILE_NAME, target)
+        }
+        if (getLastOcrProfileName() == source) {
+            editor.putString(KEY_LAST_OCR_PROFILE_NAME, target)
+        }
+        if (getLastTranslateProfileName() == source) {
+            editor.putString(KEY_LAST_TRANSLATE_PROFILE_NAME, target)
+        }
+        editor.apply()
+        return RenameProfileResult.SUCCESS
+    }
+
+    fun deleteProfile(name: String): List<String> {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return getProfileNames()
+        val root = loadProfilesJson()
+        if (!root.has(trimmed)) return getProfileNames()
+        root.remove(trimmed)
+        val editor = prefs.edit()
+            .putString(KEY_PROFILES_JSON, root.toString())
+        if (getLastProfileName() == trimmed) {
+            editor.putString(KEY_LAST_PROFILE_NAME, "")
+        }
+        if (getLastOcrProfileName() == trimmed) {
+            editor.putString(KEY_LAST_OCR_PROFILE_NAME, "")
+        }
+        if (getLastTranslateProfileName() == trimmed) {
+            editor.putString(KEY_LAST_TRANSLATE_PROFILE_NAME, "")
+        }
+        editor.apply()
+        return getProfileNames()
+    }
+
+    fun getLastProfileName(): String {
+        return prefs.getString(KEY_LAST_PROFILE_NAME, "")?.trim().orEmpty()
+    }
+
+    fun getLastOcrProfileName(): String {
+        return prefs.getString(KEY_LAST_OCR_PROFILE_NAME, "")?.trim().orEmpty()
+    }
+
+    fun setLastOcrProfileName(name: String) {
+        prefs.edit().putString(KEY_LAST_OCR_PROFILE_NAME, name.trim()).apply()
+    }
+
+    fun getLastTranslateProfileName(): String {
+        return prefs.getString(KEY_LAST_TRANSLATE_PROFILE_NAME, "")?.trim().orEmpty()
+    }
+
+    fun setLastTranslateProfileName(name: String) {
+        prefs.edit().putString(KEY_LAST_TRANSLATE_PROFILE_NAME, name.trim()).apply()
+    }
+
+    private fun normalizeBaseUrl(baseUrl: String): String {
+        var normalized = baseUrl.trim().trimEnd('/')
+        normalized = normalized.replace(Regex("/chat/completions$", RegexOption.IGNORE_CASE), "")
+        normalized = normalized.replace(Regex("/responses$", RegexOption.IGNORE_CASE), "")
+        return normalized
+    }
+
+    private fun loadProfilesJson(): JSONObject {
+        val raw = prefs.getString(KEY_PROFILES_JSON, "{}").orEmpty()
+        return runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
+    }
+
+    private fun settingsToJson(settings: AppSettings): JSONObject {
+        return JSONObject()
+            .put("ocrProvider", AiProvider.fromId(settings.ocrProvider).id)
+            .put("ocrBaseUrl", normalizeBaseUrl(settings.ocrBaseUrl))
+            .put("ocrModel", settings.ocrModel.trim())
+            .put("ocrApiKey", settings.ocrApiKey.trim())
+            .put("translateProvider", AiProvider.fromId(settings.translateProvider).id)
+            .put("translateBaseUrl", normalizeBaseUrl(settings.translateBaseUrl))
+            .put("translateModel", settings.translateModel.trim())
+            .put("translateApiKey", settings.translateApiKey.trim())
+            // 保留旧字段供旧客户端读取
+            .put("provider", AiProvider.fromId(settings.translateProvider).id)
+            .put("baseUrl", normalizeBaseUrl(settings.translateBaseUrl))
+            .put("model", settings.translateModel.trim())
+            .put("apiKey", settings.translateApiKey.trim())
+            .put("enabled", settings.enabled)
+            .put("ignoreSimplifiedChinese", settings.ignoreSimplifiedChinese)
+            .put("enableThinking", settings.enableThinking)
+            .put("thinkingBudget", settings.thinkingBudget.coerceIn(1024, 131072))
+    }
+
+    private fun jsonToSettings(json: JSONObject): AppSettings {
+        val legacyProvider = AiProvider.fromId(json.optString("provider", AiProvider.OPENAI.id)).id
+        val legacyBaseUrl = json.optString("baseUrl", "").trim()
+        val legacyModel = json.optString("model", "gpt-4o-mini").trim()
+        val legacyApiKey = json.optString("apiKey", "").trim()
+        return AppSettings(
+            ocrProvider = AiProvider.fromId(json.optString("ocrProvider", legacyProvider)).id,
+            ocrBaseUrl = json.optString("ocrBaseUrl", legacyBaseUrl).trim(),
+            ocrModel = json.optString("ocrModel", legacyModel).trim(),
+            ocrApiKey = json.optString("ocrApiKey", legacyApiKey).trim(),
+            translateProvider = AiProvider.fromId(json.optString("translateProvider", legacyProvider)).id,
+            translateBaseUrl = json.optString("translateBaseUrl", legacyBaseUrl).trim(),
+            translateModel = json.optString("translateModel", legacyModel).trim(),
+            translateApiKey = json.optString("translateApiKey", legacyApiKey).trim(),
+            enabled = json.optBoolean("enabled", true),
+            ignoreSimplifiedChinese = json.optBoolean("ignoreSimplifiedChinese", false),
+            enableThinking = json.optBoolean("enableThinking", false),
+            thinkingBudget = json.optInt("thinkingBudget", DEFAULT_THINKING_BUDGET).coerceIn(1024, 131072)
+        )
+    }
+
+    private companion object {
+        const val PREF_NAME = "mt_settings_secure"
+        const val KEY_PROVIDER = "provider"
+        const val KEY_BASE_URL = "base_url"
+        const val KEY_MODEL = "model"
+        const val KEY_API_KEY = "api_key"
+        const val KEY_OCR_PROVIDER = "ocr_provider"
+        const val KEY_OCR_BASE_URL = "ocr_base_url"
+        const val KEY_OCR_MODEL = "ocr_model"
+        const val KEY_OCR_API_KEY = "ocr_api_key"
+        const val KEY_TRANSLATE_PROVIDER = "translate_provider"
+        const val KEY_TRANSLATE_BASE_URL = "translate_base_url"
+        const val KEY_TRANSLATE_MODEL = "translate_model"
+        const val KEY_TRANSLATE_API_KEY = "translate_api_key"
+        const val KEY_ENABLED = "enabled"
+        const val KEY_IGNORE_SIMPLIFIED = "ignore_simplified"
+        const val KEY_ENABLE_THINKING = "enable_thinking"
+        const val KEY_THINKING_BUDGET = "thinking_budget"
+        const val KEY_PROFILES_JSON = "profiles_json"
+        const val KEY_LAST_PROFILE_NAME = "last_profile_name"
+        const val KEY_LAST_OCR_PROFILE_NAME = "last_ocr_profile_name"
+        const val KEY_LAST_TRANSLATE_PROFILE_NAME = "last_translate_profile_name"
+        const val DEFAULT_THINKING_BUDGET = 8192
+    }
+}
+
+enum class RenameProfileResult {
+    SUCCESS,
+    INVALID_NAME,
+    SOURCE_NOT_FOUND,
+    TARGET_EXISTS
+}

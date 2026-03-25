@@ -1,0 +1,7 @@
+﻿<resources>
+    <string name="app_name">Manga Translator</string>
+    <string name="notification_channel_name">Manga Translator Service</string>
+    <string name="notification_running_title">Manga Translator 运行中</string>
+    <string name="notification_running_text">点击悬浮球可触发翻译</string>
+    <string name="notification_action_stop">停止服务</string>
+</resources>
