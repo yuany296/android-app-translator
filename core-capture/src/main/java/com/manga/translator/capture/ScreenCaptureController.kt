@@ -34,6 +34,12 @@ class ScreenCaptureController(private val context: Context) {
     private val captureMutex = Mutex()
     private var firstFrameReady: Boolean = false
     private var readyReader: ImageReader? = null
+    @Volatile
+    private var projectionStopped: Boolean = false
+    @Volatile
+    private var lastCaptureSuccessAt: Long = 0L
+    @Volatile
+    private var lastCaptureFailureType: CaptureFailureType? = null
 
     fun start(resultCode: Int, data: android.content.Intent, width: Int, height: Int, densityDpi: Int) {
         stop()
@@ -43,6 +49,9 @@ class ScreenCaptureController(private val context: Context) {
         captureWidth = width
         captureHeight = height
         captureDensityDpi = densityDpi
+        projectionStopped = false
+        lastCaptureSuccessAt = 0L
+        lastCaptureFailureType = null
 
         val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mgr.getMediaProjection(resultCode, data)
@@ -50,6 +59,7 @@ class ScreenCaptureController(private val context: Context) {
         projectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
                 Log.e(TAG, "media_projection_onStop")
+                projectionStopped = true
                 try {
                     virtualDisplay?.release()
                 } catch (_: Throwable) {
@@ -68,54 +78,56 @@ class ScreenCaptureController(private val context: Context) {
     }
 
     suspend fun captureBitmap(timeoutMs: Long = 5000L): Bitmap = captureMutex.withLock {
-        withContext(Dispatchers.Default) {
-            val reader = imageReader ?: throw CaptureException(
-                CaptureFailureType.NOT_STARTED,
-                "Capture is not started"
-            )
-            if (readyReader !== reader) {
-                firstFrameReady = false
-            }
-            Log.i(
-                TAG,
-                "captureBitmap_enter firstFrameReady=$firstFrameReady imageReader=$reader readyReader=$readyReader"
-            )
-            Log.i(TAG, "capture_start ts=${System.currentTimeMillis()}")
-            if (!firstFrameReady) {
-                val ready = waitForFirstFrame(reader, FIRST_FRAME_WAIT_TIMEOUT_MS)
-                if (!ready) {
-                    throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout(first frame not ready)")
+        try {
+            withContext(Dispatchers.Default) {
+                val reader = imageReader ?: throw CaptureException(
+                    CaptureFailureType.NOT_STARTED,
+                    "Capture is not started"
+                )
+                if (readyReader !== reader) {
+                    firstFrameReady = false
                 }
-                firstFrameReady = true
-                readyReader = reader
-            }
-            val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline) {
-                val image = reader.acquireLatestImage()
-                if (image != null) {
-                    try {
-                        val plane = image.planes.firstOrNull() ?: continue
-                        val buffer: ByteBuffer = plane.buffer
-                        val pixelStride = plane.pixelStride
-                        val rowStride = plane.rowStride
-                        val rowPadding = rowStride - pixelStride * image.width
-
-                        val temp = Bitmap.createBitmap(
-                            image.width + rowPadding / pixelStride,
-                            image.height,
-                            Bitmap.Config.ARGB_8888
-                        )
-                        temp.copyPixelsFromBuffer(buffer)
-                        val result = Bitmap.createBitmap(temp, 0, 0, image.width, image.height)
-                        temp.recycle()
-                        return@withContext result
-                    } finally {
-                        image.close()
+                if (!firstFrameReady) {
+                    val ready = waitForFirstFrame(reader, FIRST_FRAME_WAIT_TIMEOUT_MS)
+                    if (!ready) {
+                        throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout(first frame not ready)")
                     }
+                    firstFrameReady = true
+                    readyReader = reader
                 }
-                delay(50)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    val image = reader.acquireLatestImage()
+                    if (image != null) {
+                        try {
+                            val plane = image.planes.firstOrNull() ?: continue
+                            val buffer: ByteBuffer = plane.buffer
+                            val pixelStride = plane.pixelStride
+                            val rowStride = plane.rowStride
+                            val rowPadding = rowStride - pixelStride * image.width
+
+                            val temp = Bitmap.createBitmap(
+                                image.width + rowPadding / pixelStride,
+                                image.height,
+                                Bitmap.Config.ARGB_8888
+                            )
+                            temp.copyPixelsFromBuffer(buffer)
+                            val result = Bitmap.createBitmap(temp, 0, 0, image.width, image.height)
+                            temp.recycle()
+                            markCaptureSuccess()
+                            return@withContext result
+                        } finally {
+                            image.close()
+                        }
+                    }
+                    delay(50)
+                }
+                throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout")
             }
-            throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout")
+        } catch (error: Throwable) {
+            val wrapped = asCaptureException(error, resolveFailureType(error))
+            markCaptureFailure(wrapped.type)
+            throw wrapped
         }
     }
 
@@ -189,17 +201,25 @@ class ScreenCaptureController(private val context: Context) {
         }
         firstFrameReady = false
         readyReader = null
+        projectionStopped = false
         Log.i(TAG, "capture_pipeline_recreated w=$width h=$height dpi=$densityDpi")
         Log.i(TAG, "pipeline_ready ts=${System.currentTimeMillis()}")
     }
 
     fun isCaptureAlive(): Boolean {
-        return mediaProjection != null &&
+        return !projectionStopped &&
+            mediaProjection != null &&
             virtualDisplay != null &&
             imageReader != null &&
             captureHandler != null &&
             captureThread?.isAlive == true
     }
+
+    fun hasProjectionStopped(): Boolean = projectionStopped
+
+    fun getLastCaptureSuccessAt(): Long = lastCaptureSuccessAt
+
+    fun getLastCaptureFailureType(): CaptureFailureType? = lastCaptureFailureType
 
     fun toJpegDataUrl(bitmap: Bitmap, quality: Int = 75, maxWidth: Int = 1024): String {
         val source = if (bitmap.width > maxWidth && maxWidth > 0) {
@@ -222,6 +242,7 @@ class ScreenCaptureController(private val context: Context) {
     }
 
     fun stop() {
+        projectionStopped = true
         try {
             virtualDisplay?.release()
         } catch (_: Throwable) {
@@ -326,6 +347,15 @@ class ScreenCaptureController(private val context: Context) {
                 error
             )
         }
+    }
+
+    private fun markCaptureSuccess() {
+        lastCaptureSuccessAt = SystemClock.elapsedRealtime()
+        lastCaptureFailureType = null
+    }
+
+    private fun markCaptureFailure(type: CaptureFailureType) {
+        lastCaptureFailureType = type
     }
 
     private companion object {

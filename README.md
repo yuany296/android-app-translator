@@ -2,6 +2,8 @@
 
 目录：`android-app/`
 
+项目结构说明：`docs/PROJECT_STRUCTURE.md`
+
 ## 已实现能力
 - 多模块工程：`app` + `core-capture` + `core-translate` + `core-overlay` + `core-store`
 - 手动优先：悬浮球点击触发翻译

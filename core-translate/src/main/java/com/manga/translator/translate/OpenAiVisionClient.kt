@@ -569,7 +569,7 @@ class OpenAiVisionClient(
             "Detect vertical Japanese text and set layout=vertical when detected."
         )
         if (ignoreSimplifiedChinese) lines += "Important: Ignore already Simplified Chinese text."
-        return lines.joinToString("\\n")
+        return lines.joinToString("\n")
     }
 
     private fun buildTranslatePrompt(count: Int): String {
@@ -579,7 +579,7 @@ class OpenAiVisionClient(
             "Return JSON only with schema: {\"translations\":[\"t0\",\"t1\", ...]}",
             "The translations array length must equal input length = $count.",
             "Do not include explanations."
-        ).joinToString("\\n")
+        ).joinToString("\n")
     }
 
     private fun normalizeBaseUrl(value: String): String {

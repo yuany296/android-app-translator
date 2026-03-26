@@ -4,4 +4,7 @@
     <string name="notification_running_title">Manga Translator 运行中</string>
     <string name="notification_running_text">点击悬浮球可触发翻译</string>
     <string name="notification_action_stop">停止服务</string>
+    <string name="accessibility_service_label">Manga Translator 场景监听</string>
+    <string name="accessibility_service_description">用于识别回桌面、切应用和同应用内容变化，以便及时清理翻译覆写层。</string>
+    <string name="accessibility_service_summary">仅监听前台窗口与内容变化事件，不执行自动操作。</string>
 </resources>

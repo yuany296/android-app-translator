@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -29,6 +30,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.PrintWriter
@@ -36,19 +38,21 @@ import java.io.StringWriter
 
 class CaptureForegroundService : Service() {
     private val serviceScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val homePackages by lazy { resolveHomePackages() }
 
     private var captureController: ScreenCaptureController? = null
     private var overlayController: OverlayController? = null
     private var orchestrator: TranslateOrchestrator? = null
     private var translateJob: Job? = null
-    private var pageMonitorJob: Job? = null
+    private var pageVerifyJob: Job? = null
     private var captureAvailabilityJob: Job? = null
+    private var accessibilityMonitorJob: Job? = null
 
     private var captureTimeoutStreak = 0
-    private var captureHealthTimeoutStreak = 0
     private var projectionUnavailable = false
     private var lastUnavailableToastAt = 0L
-    private var lastUserCaptureAttemptAt = 0L
+    private var activeContentPackage: String? = null
+    private var currentBaselineHash: Long? = null
 
     private var systemUiReceiverRegistered = false
     private val systemUiReceiver = object : BroadcastReceiver() {
@@ -56,11 +60,8 @@ class CaptureForegroundService : Service() {
             if (intent?.action != Intent.ACTION_CLOSE_SYSTEM_DIALOGS) return
             val reason = intent.getStringExtra(SYSTEM_DIALOG_REASON).orEmpty()
             if (reason == REASON_HOME_KEY) {
-                diag("system_dialogs reason=$reason, clear overlay")
-                overlayController?.setInteractionMode(InteractionMode.BROWSE)
-                overlayController?.clearTranslationLayer()
-                stopPageMonitor()
-                enterProjectionUnavailable(shouldToast = false, reason = "homekey")
+                diag("system_dialogs reason=$reason fallback_clear")
+                clearOverlayForReason("home")
             }
         }
     }
@@ -137,10 +138,12 @@ class CaptureForegroundService : Service() {
         overlayController = ServiceLocator.createOverlayController()
         orchestrator = TranslateOrchestrator(captureController!!, overlayController!!)
         ensureSystemUiReceiver()
+        ensureAccessibilityMonitor()
 
         captureTimeoutStreak = 0
-        captureHealthTimeoutStreak = 0
         projectionUnavailable = false
+        activeContentPackage = null
+        currentBaselineHash = null
         stopCaptureAvailabilityMonitor()
 
         overlayController?.setInteractionMode(InteractionMode.BROWSE)
@@ -172,9 +175,8 @@ class CaptureForegroundService : Service() {
 
             overlayController?.setFloatingVisible(true)
             overlayController?.setInteractionMode(InteractionMode.BROWSE)
-            stopPageMonitor()
+            stopPageVerify()
             val current = orchestrator ?: return@showFloatingButton
-            lastUserCaptureAttemptAt = SystemClock.elapsedRealtime()
             translateJob = serviceScope.launch {
                 try {
                     overlayController?.setFloatingState(FloatingState.CAPTURING, "截图中")
@@ -191,10 +193,11 @@ class CaptureForegroundService : Service() {
                         outcome.warningMessage?.let {
                             Toast.makeText(this@CaptureForegroundService, it, Toast.LENGTH_SHORT).show()
                         }
-                        startPageMonitor()
+                        activeContentPackage = resolveActiveContentPackage()
+                        currentBaselineHash = outcome.baselineHash
                     } else {
                         overlayController?.setFloatingState(FloatingState.DONE, "无文本")
-                        stopPageMonitor()
+                        clearOverlayTracking()
                     }
                     delay(1200)
                 } catch (cancelled: CancellationException) {
@@ -202,8 +205,7 @@ class CaptureForegroundService : Service() {
                 } catch (err: Throwable) {
                     diag("runOnce failed: ${err.javaClass.simpleName}: ${err.message}")
                     Log.d("TranslationPerf", "capture_failure_type=${err.javaClass.simpleName}")
-                    overlayController?.clearTranslationLayer()
-                    stopPageMonitor()
+                    clearOverlayForReason("translate_failed")
                     if (isProjectionExpiredError(err)) {
                         enterProjectionUnavailable(shouldToast = false, reason = "projection_expired")
                         Toast.makeText(
@@ -238,7 +240,7 @@ class CaptureForegroundService : Service() {
         diag("reset_active_session reason=$reason")
         translateJob?.cancel()
         translateJob = null
-        stopPageMonitor()
+        stopPageVerify()
         stopCaptureAvailabilityMonitor()
 
         overlayController?.setInteractionMode(InteractionMode.BROWSE)
@@ -252,12 +254,11 @@ class CaptureForegroundService : Service() {
 
         projectionUnavailable = false
         captureTimeoutStreak = 0
-        captureHealthTimeoutStreak = 0
+        clearOverlayTracking()
     }
 
     private fun onCaptureSuccess() {
         captureTimeoutStreak = 0
-        captureHealthTimeoutStreak = 0
         if (projectionUnavailable) {
             projectionUnavailable = false
             overlayController?.setFloatingVisible(true)
@@ -286,14 +287,11 @@ class CaptureForegroundService : Service() {
         if (projectionUnavailable) return
         projectionUnavailable = true
         captureTimeoutStreak = 0
-        captureHealthTimeoutStreak = 0
-        overlayController?.setInteractionMode(InteractionMode.BROWSE)
-        overlayController?.clearTranslationLayer()
+        clearOverlayForReason(reason)
         val requiresReauth = reason.contains("projection_expired")
         // 不再隐藏悬浮球，避免用户误以为服务退出；保留入口用于重新授权后恢复。
         overlayController?.setFloatingVisible(true)
         overlayController?.setFloatingState(FloatingState.ERROR, if (requiresReauth) "需重新授权" else "截图暂不可用")
-        stopPageMonitor()
         Log.d("TranslationPerf", "capture_unavailable_enter reason=$reason")
         diag("projection_unavailable reason=$reason")
         if (shouldToast) {
@@ -306,17 +304,11 @@ class CaptureForegroundService : Service() {
         captureAvailabilityJob = serviceScope.launch {
             while (isActive) {
                 delay(CAPTURE_HEALTH_CHECK_INTERVAL_MS)
-                if (translateJob?.isActive == true || pageMonitorJob?.isActive == true) {
-                    continue
-                }
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastUserCaptureAttemptAt < CAPTURE_HEALTH_SUPPRESS_AFTER_USER_MS) {
+                if (translateJob?.isActive == true || pageVerifyJob?.isActive == true) {
                     continue
                 }
                 val controller = captureController ?: continue
-                val alive = controller.isCaptureAlive()
-                if (alive) {
-                    captureHealthTimeoutStreak = 0
+                if (controller.isCaptureAlive()) {
                     if (projectionUnavailable) {
                         projectionUnavailable = false
                         captureTimeoutStreak = 0
@@ -327,14 +319,18 @@ class CaptureForegroundService : Service() {
                     }
                     continue
                 }
-                if (!projectionUnavailable) {
-                    captureHealthTimeoutStreak += 1
-                    diag("capture_health_timeout_streak=$captureHealthTimeoutStreak")
-                    if (captureHealthTimeoutStreak >= CAPTURE_HEALTH_TIMEOUT_STREAK_THRESHOLD) {
-                        diag("capture_health_timeout_threshold_reached action=enter_unavailable")
-                        enterProjectionUnavailable(shouldToast = false, reason = "capture_unavailable_bg")
-                        captureHealthTimeoutStreak = 0
-                    }
+                if (!projectionUnavailable && (controller.hasProjectionStopped() || controller.getLastCaptureFailureType() == com.manga.translator.capture.CaptureFailureType.PROJECTION_EXPIRED)) {
+                    diag(
+                        "capture_monitor_event type=projection_state package=${AccessibilityMonitor.currentForegroundPackage} " +
+                            "projectionStopped=${controller.hasProjectionStopped()} lastFailure=${controller.getLastCaptureFailureType()}"
+                    )
+                    enterProjectionUnavailable(shouldToast = false, reason = if (controller.hasProjectionStopped()) "projection_stopped" else "projection_expired_bg")
+                } else if (!projectionUnavailable && !controller.isCaptureAlive()) {
+                    diag(
+                        "capture_monitor_event type=object_destroyed package=${AccessibilityMonitor.currentForegroundPackage} " +
+                            "lastSuccessAt=${controller.getLastCaptureSuccessAt()}"
+                    )
+                    enterProjectionUnavailable(shouldToast = false, reason = "capture_object_destroyed")
                 }
             }
         }.also { launched ->
@@ -381,92 +377,144 @@ class CaptureForegroundService : Service() {
         return false
     }
 
-    private fun startPageMonitor() {
-        stopPageMonitor()
-        Log.d("PageMonitor", "monitor start requested")
-        val launched = serviceScope.launch {
-            var safeStreak = 0
-            var fastCandidate = false
-            var previousHash: Long? = null
-            var frameCount = 0
-            val frameHistory = ArrayDeque<Int>()
-            while (isActive) {
-                delay(MONITOR_INTERVAL_MS)
-                val controller = captureController ?: break
-                val currentHash = runCatching {
-                    val bitmap = controller.captureBitmap(timeoutMs = MONITOR_CAPTURE_TIMEOUT_MS)
-                    try {
-                        FrameHash.centerDHash(bitmap)
-                    } finally {
-                        bitmap.recycle()
-                    }
-                }.getOrNull() ?: continue
-
-                val prev = previousHash
-                if (prev == null) {
-                    previousHash = currentHash
-                    Log.d("PageMonitor", "monitor started, baseline hash=$previousHash")
-                    diag("page_monitor_seeded")
-                    continue
-                }
-
-                frameCount += 1
-                val distance = FrameHash.hammingDistance(prev, currentHash)
-                if (frameHistory.size >= 8) {
-                    frameHistory.removeFirst()
-                }
-                frameHistory.addLast(distance)
-                Log.d(
-                    "PageMonitor",
-                    "frame $frameCount, distance=$distance, history=${frameHistory.joinToString(prefix = "[", postfix = "]")}"
-                )
-                diag("page_monitor_distance=$distance fastCandidate=$fastCandidate safeStreak=$safeStreak mode=interframe")
-
-                val fastTrigger = distance >= PAGE_CHANGE_FAST_THRESHOLD
-                fastCandidate = fastCandidate || distance >= PAGE_CHANGE_DISTANCE_THRESHOLD
-                val settleTrigger = fastCandidate &&
-                    distance <= PAGE_CHANGE_SETTLE_DISTANCE_THRESHOLD
-                // 连续检测阶段允许轻微回落，减少临界值抖动导致的漏触发。
-                val nextSafeStreak = if (distance >= PAGE_CHANGE_DISTANCE_THRESHOLD) safeStreak + 1 else 0
-                val safeTrigger = nextSafeStreak >= PAGE_CHANGE_SAFE_FRAMES
-                Log.d("PageMonitor", "fastTrigger=$fastTrigger, safeTrigger=$safeTrigger, settleTrigger=$settleTrigger")
-
-                if (fastTrigger) {
-                    diag("page_clear_path=fast distance=$distance")
-                    Log.d("PageMonitor", "clearTranslationLayer called")
-                    overlayController?.clearTranslationLayer()
-                    break
-                }
-                if (settleTrigger) {
-                    diag("page_clear_path=settle distance=$distance streak=$safeStreak")
-                    Log.d("PageMonitor", "clearTranslationLayer called")
-                    overlayController?.clearTranslationLayer()
-                    break
-                }
-
-                safeStreak = nextSafeStreak
-                diag("page_monitor_streak=$safeStreak")
-                if (safeStreak >= PAGE_CHANGE_SAFE_FRAMES) {
-                    diag("page_clear_path=safe distance=$distance streak=$safeStreak")
-                    Log.d("PageMonitor", "clearTranslationLayer called")
-                    overlayController?.clearTranslationLayer()
-                    break
-                }
-                previousHash = currentHash
+    private fun ensureAccessibilityMonitor() {
+        if (accessibilityMonitorJob?.isActive == true) return
+        accessibilityMonitorJob = serviceScope.launch {
+            AccessibilityMonitor.events.collect { event ->
+                handleAccessibilityMonitorEvent(event)
             }
-        }
-
-        pageMonitorJob = launched
-        launched.invokeOnCompletion {
-            if (pageMonitorJob === launched) {
-                pageMonitorJob = null
+        }.also { launched ->
+            launched.invokeOnCompletion {
+                if (accessibilityMonitorJob === launched) {
+                    accessibilityMonitorJob = null
+                }
             }
         }
     }
 
-    private fun stopPageMonitor() {
-        pageMonitorJob?.cancel()
-        pageMonitorJob = null
+    private fun handleAccessibilityMonitorEvent(event: AccessibilityMonitorEvent) {
+        val packageName = event.packageName.orEmpty()
+        diag("capture_monitor_event type=${event.typeName()} package=$packageName")
+        if (packageName.isBlank()) {
+            return
+        }
+        if (isHomePackage(packageName)) {
+            clearOverlayForReason("home")
+            return
+        }
+        val targetPackage = activeContentPackage
+        if (targetPackage.isNullOrBlank()) {
+            return
+        }
+        if (packageName != targetPackage) {
+            clearOverlayForReason("package_changed")
+            return
+        }
+        if (event.isContentChange()) {
+            schedulePageVerify("content_changed")
+        }
+    }
+
+    private fun schedulePageVerify(reason: String) {
+        if (translateJob?.isActive == true) return
+        val baselineHash = currentBaselineHash ?: return
+        val controller = captureController ?: return
+        if (projectionUnavailable) return
+        stopPageVerify()
+        pageVerifyJob = serviceScope.launch {
+            diag("page_verify_start reason=$reason package=$activeContentPackage")
+            delay(PAGE_VERIFY_SETTLE_MS)
+            val firstDistance = capturePageDistance(controller, baselineHash)
+            if (firstDistance == null) {
+                diag("page_verify_result distance=na decision=keep reason=$reason")
+                return@launch
+            }
+            if (firstDistance >= PAGE_CHANGE_CLEAR_THRESHOLD) {
+                diag("page_verify_result distance=$firstDistance decision=clear reason=$reason")
+                clearOverlayForReason("page_changed")
+                return@launch
+            }
+            if (firstDistance >= PAGE_CHANGE_RECHECK_THRESHOLD) {
+                delay(PAGE_VERIFY_RECHECK_DELAY_MS)
+                val secondDistance = capturePageDistance(controller, baselineHash)
+                val shouldClear = secondDistance != null && secondDistance >= PAGE_CHANGE_RECHECK_THRESHOLD
+                diag(
+                    "page_verify_result distance=${secondDistance ?: firstDistance} " +
+                        "decision=${if (shouldClear) "clear" else "keep"} reason=$reason"
+                )
+                if (shouldClear) {
+                    clearOverlayForReason("page_changed")
+                }
+                return@launch
+            }
+            diag("page_verify_result distance=$firstDistance decision=keep reason=$reason")
+        }.also { launched ->
+            launched.invokeOnCompletion {
+                if (pageVerifyJob === launched) {
+                    pageVerifyJob = null
+                }
+            }
+        }
+    }
+
+    private suspend fun capturePageDistance(
+        controller: ScreenCaptureController,
+        baselineHash: Long
+    ): Int? {
+        val currentHash = runCatching {
+            val bitmap = controller.captureBitmap(timeoutMs = MONITOR_CAPTURE_TIMEOUT_MS)
+            try {
+                FrameHash.centerDHash(bitmap)
+            } finally {
+                bitmap.recycle()
+            }
+        }.onFailure { error ->
+            if (isProjectionExpiredError(error)) {
+                enterProjectionUnavailable(shouldToast = false, reason = "projection_expired_verify")
+            }
+        }.getOrNull() ?: return null
+        return FrameHash.hammingDistance(baselineHash, currentHash)
+    }
+
+    private fun stopPageVerify() {
+        pageVerifyJob?.cancel()
+        pageVerifyJob = null
+    }
+
+    private fun clearOverlayForReason(reason: String) {
+        overlayController?.setInteractionMode(InteractionMode.BROWSE)
+        overlayController?.clearTranslationLayer()
+        stopPageVerify()
+        if (currentBaselineHash == null && activeContentPackage == null) {
+            return
+        }
+        clearOverlayTracking()
+        diag("overlay_clear reason=$reason")
+    }
+
+    private fun clearOverlayTracking() {
+        activeContentPackage = null
+        currentBaselineHash = null
+        stopPageVerify()
+    }
+
+    private fun resolveActiveContentPackage(): String? {
+        return AccessibilityMonitor.currentForegroundPackage
+            ?.takeIf { it.isNotBlank() && !isHomePackage(it) }
+    }
+
+    private fun isHomePackage(packageName: String): Boolean {
+        return packageName in homePackages
+    }
+
+    private fun resolveHomePackages(): Set<String> {
+        val intent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+        }
+        @Suppress("DEPRECATION")
+        return packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+            .mapNotNull { it.activityInfo?.packageName }
+            .toSet()
     }
 
     private fun ensureSystemUiReceiver() {
@@ -535,7 +583,7 @@ class CaptureForegroundService : Service() {
         diag("onDestroy")
         translateJob?.cancel()
         translateJob = null
-        stopPageMonitor()
+        stopPageVerify()
         stopCaptureAvailabilityMonitor()
         unregisterSystemUiReceiver()
 
@@ -550,11 +598,8 @@ class CaptureForegroundService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        diag("onTaskRemoved clear overlay")
-        overlayController?.setInteractionMode(InteractionMode.BROWSE)
-        overlayController?.clearTranslationLayer()
-        enterProjectionUnavailable(shouldToast = false, reason = "task_removed")
-        stopPageMonitor()
+        diag("onTaskRemoved fallback_clear")
+        clearOverlayForReason("task_removed")
         super.onTaskRemoved(rootIntent)
     }
 
@@ -587,18 +632,14 @@ class CaptureForegroundService : Service() {
         private const val NOTIFICATION_ID = 4041
         private const val TAG = "CaptureForegroundSvc"
 
-        private const val MONITOR_INTERVAL_MS = 300L
         private const val MONITOR_CAPTURE_TIMEOUT_MS = 1500L
-        private const val PAGE_CHANGE_DISTANCE_THRESHOLD = 18
-        private const val PAGE_CHANGE_FAST_THRESHOLD = 28
-        private const val PAGE_CHANGE_SAFE_FRAMES = 2
-        private const val PAGE_CHANGE_SETTLE_DISTANCE_THRESHOLD = 12
+        private const val PAGE_CHANGE_RECHECK_THRESHOLD = 18
+        private const val PAGE_CHANGE_CLEAR_THRESHOLD = 28
+        private const val PAGE_VERIFY_SETTLE_MS = 140L
+        private const val PAGE_VERIFY_RECHECK_DELAY_MS = 200L
 
         private const val CAPTURE_TIMEOUT_STREAK_THRESHOLD = 2
-        private const val CAPTURE_HEALTH_TIMEOUT_STREAK_THRESHOLD = 4
         private const val CAPTURE_HEALTH_CHECK_INTERVAL_MS = 1200L
-        private const val CAPTURE_HEALTH_CHECK_TIMEOUT_MS = 900L
-        private const val CAPTURE_HEALTH_SUPPRESS_AFTER_USER_MS = 6000L
         private const val UNAVAILABLE_TOAST_THROTTLE_MS = 1500L
 
         private const val SYSTEM_DIALOG_REASON = "reason"

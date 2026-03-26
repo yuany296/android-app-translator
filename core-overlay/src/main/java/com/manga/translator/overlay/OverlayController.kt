@@ -281,6 +281,7 @@ class OverlayController(private val context: Context) {
         onToggle: ((Bubble, Boolean) -> Unit)? = null,
         erasePatches: List<ErasePatch> = emptyList(),
         bubbleRenderRects: Map<Int, RectF> = emptyMap(),
+        bubbleContentRects: Map<Int, RectF> = emptyMap(),
         pageHash: String = "",
         loadAdjustment: ((String, String) -> BubbleAdjustment?)? = null,
         saveAdjustment: ((String, String, BubbleAdjustment) -> Unit)? = null,
@@ -342,7 +343,7 @@ class OverlayController(private val context: Context) {
                 (((bubble.x + bubble.w) / 100f) * screenW).coerceIn(0f, screenW),
                 (((bubble.y + bubble.h) / 100f) * screenH).coerceIn(0f, screenH)
             )
-            val baseRect = (mappedRect ?: fallbackRect).let {
+            val baseRect = (bubbleContentRects[indexed.index] ?: mappedRect ?: fallbackRect).let {
                 val leftBound = min(it.left, it.right).coerceIn(0f, screenW)
                 val rightBound = max(it.left, it.right).coerceIn(0f, screenW)
                 val topBound = min(it.top, it.bottom).coerceIn(0f, screenH)
@@ -819,7 +820,7 @@ class OverlayController(private val context: Context) {
         val metrics = context.resources.displayMetrics
         val fontScale = context.resources.configuration.fontScale.coerceAtLeast(0.85f)
         val scaledDensity = metrics.density * fontScale
-        val sp = (boxHeightPx / scaledDensity) * 0.15f
+        val sp = (boxHeightPx / scaledDensity) * 0.136f
         return sp.coerceIn(minFitSp, maxFitSp)
     }
 
@@ -836,7 +837,7 @@ class OverlayController(private val context: Context) {
             return TextFitResult(maxSp, truncated = false, lineSpacingMultiplier = 1f)
         }
 
-        val spacingCandidates = listOf(1f, 0.95f, 0.9f)
+        val spacingCandidates = listOf(0.98f, 0.94f, 0.9f, 0.87f)
         var bestSize = minSp
         var bestSpacing = spacingCandidates.last()
         var foundFit = false
@@ -1032,7 +1033,7 @@ class OverlayController(private val context: Context) {
             strokeWidth = max(dpF(0.55f), naturalStrokeWidth(spec.textSizeSp, spec.strokeDp))
             color = patchStrokeColor
         }
-        val step = (paint.textSize * 1.08f).coerceAtLeast(1f)
+        val step = (paint.textSize * 1.03f).coerceAtLeast(1f)
         val rows = max(1, ((spec.rect.height() - dpF(4f)) / step).toInt())
         val cols = kotlin.math.ceil(text.length / rows.toFloat()).toInt().coerceAtLeast(1)
         val requiredW = cols * step
@@ -1070,7 +1071,7 @@ class OverlayController(private val context: Context) {
         val text = normalizeVerticalPunctuation(spec.text.replace("\n", ""))
         if (text.isBlank()) return RectF(spec.rect)
         val textSizePx = spToPx(spec.textSizeSp)
-        val step = (textSizePx * 1.08f).coerceAtLeast(1f)
+        val step = (textSizePx * 1.03f).coerceAtLeast(1f)
         val rows = max(1, ((spec.rect.height() - dpF(2f)) / step).toInt())
         val cols = kotlin.math.ceil(text.length / rows.toFloat()).toInt().coerceAtLeast(1)
         val width = (cols * step).coerceAtMost(spec.rect.width()).coerceAtLeast(1f)
@@ -1100,8 +1101,8 @@ class OverlayController(private val context: Context) {
 
     private fun computePatchBackgroundRect(spec: PatchTextSpec): RectF {
         val textRect = computePatchContentRect(spec)
-        val padX = dpF(3f)
-        val padY = dpF(2f)
+        val padX = dpF(2.4f)
+        val padY = dpF(1.2f)
         return RectF(
             (textRect.left - padX).coerceAtLeast(spec.rect.left),
             (textRect.top - padY).coerceAtLeast(spec.rect.top),

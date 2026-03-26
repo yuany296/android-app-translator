@@ -12,6 +12,7 @@ import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -115,6 +116,24 @@ class MainActivity : ComponentActivity() {
                             fallback = settingsRepository.getLastProfileName()
                         )
                     )
+                }
+
+                // 处理CONFIG页面的返回键
+                BackHandler(enabled = page == MainPage.CONFIG) {
+                    Log.d(TAG, "Back pressed in CONFIG page, returning to LAUNCHER")
+                    // 刷新主界面选择
+                    profiles = settingsRepository.getProfileNames()
+                    selectedOcrProfile = resolveProfileSelection(
+                        profileNames = profiles,
+                        preferred = settingsRepository.getLastOcrProfileName(),
+                        fallback = settingsRepository.getLastProfileName()
+                    )
+                    selectedTranslateProfile = resolveProfileSelection(
+                        profileNames = profiles,
+                        preferred = settingsRepository.getLastTranslateProfileName(),
+                        fallback = settingsRepository.getLastProfileName()
+                    )
+                    page = MainPage.LAUNCHER
                 }
 
                 fun refreshLauncherSelections() {

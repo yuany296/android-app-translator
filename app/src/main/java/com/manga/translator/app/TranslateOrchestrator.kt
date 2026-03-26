@@ -9,6 +9,7 @@ import com.manga.translator.overlay.EraseStrategyPolicy
 import com.manga.translator.overlay.FloatingState
 import com.manga.translator.overlay.OverlayController
 import com.manga.translator.overlay.OverlayRenderConfig
+import com.manga.translator.overlay.WritableAreaRefiner
 import com.manga.translator.store.PageOverlayAdjustment
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.TranslationResult
@@ -25,6 +26,8 @@ class TranslateOrchestrator(
     private val overlayController: OverlayController,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
+    private val writableAreaRefiner = WritableAreaRefiner()
+
     suspend fun runOnce(onStageChanged: ((FloatingState) -> Unit)? = null): RunOnceOutcome {
         val timer = TranslationTimer()
         timer.mark("start")
@@ -195,6 +198,22 @@ class TranslateOrchestrator(
             Log.d("RenderDebug", "bgType=${bubble.bgType}")
             index to renderRect
         }.toMap()
+        val bubbleContentRects = result.bubbles.mapIndexed { index, bubble ->
+            val srcRect = bubbleToSourceRect(bubble, screenshotBitmap.width, screenshotBitmap.height)
+            val refinedSourceRect = writableAreaRefiner.refine(screenshotBitmap, srcRect, bubble.bgType)
+            val refinedRenderRect = mapSourceToRenderRect(
+                srcRect = refinedSourceRect,
+                sourceWidth = screenshotBitmap.width,
+                sourceHeight = screenshotBitmap.height,
+                renderWidth = viewportWidth,
+                renderHeight = viewportHeight
+            )
+            Log.d(
+                "RenderDebug",
+                "content_rect_refined bubble=$index bgType=${bubble.bgType} raw=$srcRect refined=$refinedSourceRect render=$refinedRenderRect"
+            )
+            index to refinedRenderRect
+        }.toMap()
         val erasePatches = sourcePatches.map { patch ->
             patch.copy(
                 renderRect = mapSourceToRenderRect(
@@ -216,6 +235,7 @@ class TranslateOrchestrator(
             renderConfig = OverlayRenderConfig(denseMode = denseMode, erasePolicy = EraseStrategyPolicy.AUTO_TIERED),
             erasePatches = erasePatches,
             bubbleRenderRects = bubbleRenderRects,
+            bubbleContentRects = bubbleContentRects,
             pageHash = pageHash,
             loadAdjustment = { p, key ->
                 ServiceLocator.pageOverlayAdjustmentRepository.get(p, key)
