@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.json.JSONObject
+import java.time.YearMonth
 
 class SettingsRepository(context: Context) {
     private val prefs = EncryptedSharedPreferences.create(
@@ -13,6 +14,7 @@ class SettingsRepository(context: Context) {
         EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
     )
+    private val quotaLock = Any()
 
     fun getSettings(): AppSettings {
         val legacyProvider = AiProvider.fromId(prefs.getString(KEY_PROVIDER, AiProvider.OPENAI.id).orEmpty())
@@ -22,6 +24,8 @@ class SettingsRepository(context: Context) {
         val ocrProvider = AiProvider.fromId(prefs.getString(KEY_OCR_PROVIDER, legacyProvider.id).orEmpty())
         val translateProvider = AiProvider.fromId(prefs.getString(KEY_TRANSLATE_PROVIDER, legacyProvider.id).orEmpty())
         return AppSettings(
+            sourceLanguage = AppLanguage.fromId(prefs.getString(KEY_SOURCE_LANGUAGE, AppLanguage.ENGLISH.id).orEmpty()).id,
+            targetLanguage = AppLanguage.fromId(prefs.getString(KEY_TARGET_LANGUAGE, AppLanguage.CHINESE_SIMPLIFIED.id).orEmpty()).id,
             ocrProvider = ocrProvider.id,
             ocrBaseUrl = prefs.getString(KEY_OCR_BASE_URL, legacyBaseUrl)?.trim().orEmpty(),
             ocrModel = prefs.getString(KEY_OCR_MODEL, legacyModel)?.trim().orEmpty(),
@@ -39,6 +43,8 @@ class SettingsRepository(context: Context) {
 
     fun saveSettings(settings: AppSettings) {
         prefs.edit()
+            .putString(KEY_SOURCE_LANGUAGE, AppLanguage.fromId(settings.sourceLanguage).id)
+            .putString(KEY_TARGET_LANGUAGE, AppLanguage.fromId(settings.targetLanguage).id)
             .putString(KEY_OCR_PROVIDER, AiProvider.fromId(settings.ocrProvider).id)
             .putString(KEY_OCR_BASE_URL, normalizeBaseUrl(settings.ocrBaseUrl))
             .putString(KEY_OCR_MODEL, settings.ocrModel.trim())
@@ -159,6 +165,36 @@ class SettingsRepository(context: Context) {
         prefs.edit().putString(KEY_LAST_TRANSLATE_PROFILE_NAME, name.trim()).apply()
     }
 
+    fun getBaiduOcrUsage(limit: Int = BAIDU_OCR_MONTHLY_LIMIT): MonthlyQuotaUsage {
+        synchronized(quotaLock) {
+            val normalizedLimit = limit.coerceAtLeast(1)
+            val currentMonth = YearMonth.now().toString()
+            val storedMonth = prefs.getString(KEY_BAIDU_OCR_MONTH, "")?.trim().orEmpty()
+            val storedCount = prefs.getInt(KEY_BAIDU_OCR_MONTH_COUNT, 0).coerceAtLeast(0)
+            if (storedMonth == currentMonth) {
+                return MonthlyQuotaUsage(month = currentMonth, used = storedCount, limit = normalizedLimit)
+            }
+            prefs.edit()
+                .putString(KEY_BAIDU_OCR_MONTH, currentMonth)
+                .putInt(KEY_BAIDU_OCR_MONTH_COUNT, 0)
+                .apply()
+            return MonthlyQuotaUsage(month = currentMonth, used = 0, limit = normalizedLimit)
+        }
+    }
+
+    fun incrementBaiduOcrUsage(limit: Int = BAIDU_OCR_MONTHLY_LIMIT): MonthlyQuotaUsage {
+        synchronized(quotaLock) {
+            val current = getBaiduOcrUsage(limit)
+            if (current.used >= current.limit) return current
+            val nextUsed = current.used + 1
+            prefs.edit()
+                .putString(KEY_BAIDU_OCR_MONTH, current.month)
+                .putInt(KEY_BAIDU_OCR_MONTH_COUNT, nextUsed)
+                .apply()
+            return current.copy(used = nextUsed)
+        }
+    }
+
     private fun normalizeBaseUrl(baseUrl: String): String {
         var normalized = baseUrl.trim().trimEnd('/')
         normalized = normalized.replace(Regex("/chat/completions$", RegexOption.IGNORE_CASE), "")
@@ -173,6 +209,8 @@ class SettingsRepository(context: Context) {
 
     private fun settingsToJson(settings: AppSettings): JSONObject {
         return JSONObject()
+            .put("sourceLanguage", AppLanguage.fromId(settings.sourceLanguage).id)
+            .put("targetLanguage", AppLanguage.fromId(settings.targetLanguage).id)
             .put("ocrProvider", AiProvider.fromId(settings.ocrProvider).id)
             .put("ocrBaseUrl", normalizeBaseUrl(settings.ocrBaseUrl))
             .put("ocrModel", settings.ocrModel.trim())
@@ -198,6 +236,8 @@ class SettingsRepository(context: Context) {
         val legacyModel = json.optString("model", "gpt-4o-mini").trim()
         val legacyApiKey = json.optString("apiKey", "").trim()
         return AppSettings(
+            sourceLanguage = AppLanguage.fromId(json.optString("sourceLanguage", AppLanguage.ENGLISH.id)).id,
+            targetLanguage = AppLanguage.fromId(json.optString("targetLanguage", AppLanguage.CHINESE_SIMPLIFIED.id)).id,
             ocrProvider = AiProvider.fromId(json.optString("ocrProvider", legacyProvider)).id,
             ocrBaseUrl = json.optString("ocrBaseUrl", legacyBaseUrl).trim(),
             ocrModel = json.optString("ocrModel", legacyModel).trim(),
@@ -219,6 +259,8 @@ class SettingsRepository(context: Context) {
         const val KEY_BASE_URL = "base_url"
         const val KEY_MODEL = "model"
         const val KEY_API_KEY = "api_key"
+        const val KEY_SOURCE_LANGUAGE = "source_language"
+        const val KEY_TARGET_LANGUAGE = "target_language"
         const val KEY_OCR_PROVIDER = "ocr_provider"
         const val KEY_OCR_BASE_URL = "ocr_base_url"
         const val KEY_OCR_MODEL = "ocr_model"
@@ -235,7 +277,10 @@ class SettingsRepository(context: Context) {
         const val KEY_LAST_PROFILE_NAME = "last_profile_name"
         const val KEY_LAST_OCR_PROFILE_NAME = "last_ocr_profile_name"
         const val KEY_LAST_TRANSLATE_PROFILE_NAME = "last_translate_profile_name"
+        const val KEY_BAIDU_OCR_MONTH = "baidu_ocr_month"
+        const val KEY_BAIDU_OCR_MONTH_COUNT = "baidu_ocr_month_count"
         const val DEFAULT_THINKING_BUDGET = 8192
+        const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }
 }
 
@@ -244,4 +289,12 @@ enum class RenameProfileResult {
     INVALID_NAME,
     SOURCE_NOT_FOUND,
     TARGET_EXISTS
+}
+
+data class MonthlyQuotaUsage(
+    val month: String,
+    val used: Int,
+    val limit: Int
+) {
+    val remaining: Int get() = (limit - used).coerceAtLeast(0)
 }

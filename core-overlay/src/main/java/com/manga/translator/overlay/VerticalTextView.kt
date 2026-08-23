@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Typeface
 import android.widget.TextView
 import kotlin.math.ceil
 import kotlin.math.max
@@ -11,6 +12,10 @@ import kotlin.math.max
 class VerticalTextView(context: Context) : TextView(context) {
     private var strokeColor: Int = Color.WHITE
     private var strokeWidthPx: Float = 0f
+
+    init {
+        typeface = Typeface.SERIF
+    }
 
     fun setStroke(color: Int, widthPx: Float) {
         strokeColor = color
@@ -33,6 +38,7 @@ class VerticalTextView(context: Context) : TextView(context) {
 
         val paint = paint
         paint.isAntiAlias = true
+        paint.typeface = Typeface.SERIF
         val charStep = (paint.textSize * 1.08f).coerceAtLeast(1f)
         val rows = max(1, (drawH / charStep).toInt())
         val cols = ceil(normalized.length / rows.toFloat()).toInt().coerceAtLeast(1)
@@ -81,4 +87,3 @@ class VerticalTextView(context: Context) : TextView(context) {
             .replace('）', '﹚')
     }
 }
-

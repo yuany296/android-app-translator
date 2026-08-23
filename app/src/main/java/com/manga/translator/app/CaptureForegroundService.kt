@@ -39,12 +39,12 @@ import java.io.StringWriter
 class CaptureForegroundService : Service() {
     private val serviceScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val homePackages by lazy { resolveHomePackages() }
+    private val captureSessionStateStore by lazy { ServiceLocator.captureSessionStateStore }
 
     private var captureController: ScreenCaptureController? = null
     private var overlayController: OverlayController? = null
     private var orchestrator: TranslateOrchestrator? = null
     private var translateJob: Job? = null
-    private var pageVerifyJob: Job? = null
     private var captureAvailabilityJob: Job? = null
     private var accessibilityMonitorJob: Job? = null
 
@@ -70,6 +70,13 @@ class CaptureForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         diag("onStartCommand action=${intent?.action} startId=$startId")
+        val fullyStarted = captureController != null && overlayController != null && orchestrator != null
+        if (intent?.action == null && !fullyStarted) {
+            diag("onStartCommand missing_action_without_session stop_self")
+            updateCaptureSessionState(CaptureSessionState.STOPPED, "service_restart_without_projection")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
             ACTION_STOP -> {
                 diag("received stop action")
@@ -86,19 +93,21 @@ class CaptureForegroundService : Service() {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
                 diag("start action resultCode=$resultCode dataNull=${data == null}")
-                val fullyStarted = captureController != null && overlayController != null && orchestrator != null
                 if (resultCode == 0 || data == null) {
                     if (fullyStarted) {
                         diag("invalid media projection grant ignored: session already running")
+                        updateCaptureSessionState(CaptureSessionState.ACTIVE, "duplicate_start_reused_session")
                         return START_STICKY
                     }
                     diag("invalid media projection grant, stop self")
+                    updateCaptureSessionState(CaptureSessionState.STOPPED, "invalid_projection_grant")
                     stopSelf()
                     return START_NOT_STICKY
                 }
                 if (fullyStarted) {
                     if (!projectionUnavailable) {
                         diag("start action ignored: session already running")
+                        updateCaptureSessionState(CaptureSessionState.ACTIVE, "duplicate_start_reused_session")
                         return START_STICKY
                     }
                     diag("start action forcing restart from projection_unavailable")
@@ -114,6 +123,7 @@ class CaptureForegroundService : Service() {
                     diag("startOverlayFlow success")
                 }.onFailure { err ->
                     diag("startOverlayFlow failed: ${err.javaClass.simpleName}: ${err.message}\n${stack(err)}")
+                    updateCaptureSessionState(CaptureSessionState.STOPPED, "start_overlay_failed")
                     Toast.makeText(
                         this,
                         "悬浮窗创建失败: ${err.message ?: "未知错误"}",
@@ -133,6 +143,15 @@ class CaptureForegroundService : Service() {
         (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(displayMetrics)
 
         captureController = ServiceLocator.createCaptureController().also {
+            it.projectionStopListener = projectionStopListener@{ externalStop ->
+                diag("media_projection_callback externalStop=$externalStop projectionUnavailable=$projectionUnavailable")
+                if (!externalStop) {
+                    return@projectionStopListener
+                }
+                serviceScope.launch {
+                    enterProjectionUnavailable(shouldToast = false, reason = "projection_stopped_callback")
+                }
+            }
             it.start(resultCode, data, displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.densityDpi)
         }
         overlayController = ServiceLocator.createOverlayController()
@@ -150,20 +169,17 @@ class CaptureForegroundService : Service() {
         overlayController?.setFloatingVisible(true)
         overlayController?.setFloatingState(FloatingState.IDLE, null)
         startCaptureAvailabilityMonitor()
+        updateCaptureSessionState(CaptureSessionState.ACTIVE, "start_overlay_flow_success")
 
         overlayController?.showFloatingButton {
             if (translateJob?.isActive == true) {
                 return@showFloatingButton
             }
+            overlayController?.unlockTranslationLayer()
 
             val settings = ServiceLocator.settingsRepository.getSettings()
             if (!settings.enabled) {
                 Toast.makeText(this, "翻译已关闭", Toast.LENGTH_SHORT).show()
-                overlayController?.clearTranslationLayer()
-                return@showFloatingButton
-            }
-            if (settings.ocrBaseUrl.isBlank() || settings.ocrApiKey.isBlank()) {
-                Toast.makeText(this, "请先配置 OCR API", Toast.LENGTH_SHORT).show()
                 overlayController?.clearTranslationLayer()
                 return@showFloatingButton
             }
@@ -175,9 +191,9 @@ class CaptureForegroundService : Service() {
 
             overlayController?.setFloatingVisible(true)
             overlayController?.setInteractionMode(InteractionMode.BROWSE)
-            stopPageVerify()
             val current = orchestrator ?: return@showFloatingButton
             translateJob = serviceScope.launch {
+                var keepDoneStateUntilTap = false
                 try {
                     overlayController?.setFloatingState(FloatingState.CAPTURING, "截图中")
                     val outcome = current.runOnce { state ->
@@ -195,9 +211,15 @@ class CaptureForegroundService : Service() {
                         }
                         activeContentPackage = resolveActiveContentPackage()
                         currentBaselineHash = outcome.baselineHash
+                        keepDoneStateUntilTap = true
+                        overlayController?.lockTranslationUntilTap {
+                            clearOverlayForReason("tap_restore")
+                            overlayController?.setFloatingState(FloatingState.IDLE, null)
+                        }
                     } else {
                         overlayController?.setFloatingState(FloatingState.DONE, "无文本")
                         clearOverlayTracking()
+                        overlayController?.unlockTranslationLayer()
                     }
                     delay(1200)
                 } catch (cancelled: CancellationException) {
@@ -205,6 +227,7 @@ class CaptureForegroundService : Service() {
                 } catch (err: Throwable) {
                     diag("runOnce failed: ${err.javaClass.simpleName}: ${err.message}")
                     Log.d("TranslationPerf", "capture_failure_type=${err.javaClass.simpleName}")
+                    overlayController?.unlockTranslationLayer()
                     clearOverlayForReason("translate_failed")
                     if (isProjectionExpiredError(err)) {
                         enterProjectionUnavailable(shouldToast = false, reason = "projection_expired")
@@ -222,7 +245,7 @@ class CaptureForegroundService : Service() {
                     }
                     delay(1200)
                 } finally {
-                    if (!projectionUnavailable) {
+                    if (!projectionUnavailable && !keepDoneStateUntilTap) {
                         overlayController?.setFloatingState(FloatingState.IDLE, null)
                     }
                 }
@@ -240,7 +263,6 @@ class CaptureForegroundService : Service() {
         diag("reset_active_session reason=$reason")
         translateJob?.cancel()
         translateJob = null
-        stopPageVerify()
         stopCaptureAvailabilityMonitor()
 
         overlayController?.setInteractionMode(InteractionMode.BROWSE)
@@ -266,6 +288,7 @@ class CaptureForegroundService : Service() {
             Log.d("TranslationPerf", "capture_unavailable_exit reason=recovered")
             diag("capture_recover_success")
         }
+        updateCaptureSessionState(CaptureSessionState.ACTIVE, "capture_success")
     }
 
     private fun onCaptureTimeoutFailure() {
@@ -284,16 +307,23 @@ class CaptureForegroundService : Service() {
     }
 
     private fun enterProjectionUnavailable(shouldToast: Boolean, reason: String) {
-        if (projectionUnavailable) return
+        val requiresReauth = reason.contains("projection_expired")
+            || reason.contains("projection_stopped")
+        if (projectionUnavailable && (!requiresReauth || captureSessionStateStore.getState() == CaptureSessionState.REAUTH_REQUIRED)) {
+            return
+        }
         projectionUnavailable = true
         captureTimeoutStreak = 0
         clearOverlayForReason(reason)
-        val requiresReauth = reason.contains("projection_expired")
         // 不再隐藏悬浮球，避免用户误以为服务退出；保留入口用于重新授权后恢复。
         overlayController?.setFloatingVisible(true)
         overlayController?.setFloatingState(FloatingState.ERROR, if (requiresReauth) "需重新授权" else "截图暂不可用")
         Log.d("TranslationPerf", "capture_unavailable_enter reason=$reason")
         diag("projection_unavailable reason=$reason")
+        updateCaptureSessionState(
+            state = if (requiresReauth) CaptureSessionState.REAUTH_REQUIRED else CaptureSessionState.UNAVAILABLE,
+            reason = "projection_unavailable:$reason"
+        )
         if (shouldToast) {
             showUnavailableToast(if (requiresReauth) "请重新授权录屏" else "截图暂不可用，请稍后重试")
         }
@@ -304,7 +334,7 @@ class CaptureForegroundService : Service() {
         captureAvailabilityJob = serviceScope.launch {
             while (isActive) {
                 delay(CAPTURE_HEALTH_CHECK_INTERVAL_MS)
-                if (translateJob?.isActive == true || pageVerifyJob?.isActive == true) {
+                if (translateJob?.isActive == true) {
                     continue
                 }
                 val controller = captureController ?: continue
@@ -316,6 +346,7 @@ class CaptureForegroundService : Service() {
                         overlayController?.setFloatingState(FloatingState.IDLE, null)
                         Log.d("TranslationPerf", "capture_unavailable_exit reason=background_recovered")
                         diag("capture_recover_success")
+                        updateCaptureSessionState(CaptureSessionState.ACTIVE, "background_capture_recovered")
                     }
                     continue
                 }
@@ -325,12 +356,6 @@ class CaptureForegroundService : Service() {
                             "projectionStopped=${controller.hasProjectionStopped()} lastFailure=${controller.getLastCaptureFailureType()}"
                     )
                     enterProjectionUnavailable(shouldToast = false, reason = if (controller.hasProjectionStopped()) "projection_stopped" else "projection_expired_bg")
-                } else if (!projectionUnavailable && !controller.isCaptureAlive()) {
-                    diag(
-                        "capture_monitor_event type=object_destroyed package=${AccessibilityMonitor.currentForegroundPackage} " +
-                            "lastSuccessAt=${controller.getLastCaptureSuccessAt()}"
-                    )
-                    enterProjectionUnavailable(shouldToast = false, reason = "capture_object_destroyed")
                 }
             }
         }.also { launched ->
@@ -398,93 +423,28 @@ class CaptureForegroundService : Service() {
         if (packageName.isBlank()) {
             return
         }
-        if (isHomePackage(packageName)) {
-            clearOverlayForReason("home")
-            return
-        }
-        val targetPackage = activeContentPackage
-        if (targetPackage.isNullOrBlank()) {
-            return
-        }
-        if (packageName != targetPackage) {
-            clearOverlayForReason("package_changed")
-            return
-        }
-        if (event.isContentChange()) {
-            schedulePageVerify("content_changed")
-        }
-    }
-
-    private fun schedulePageVerify(reason: String) {
-        if (translateJob?.isActive == true) return
-        val baselineHash = currentBaselineHash ?: return
-        val controller = captureController ?: return
-        if (projectionUnavailable) return
-        stopPageVerify()
-        pageVerifyJob = serviceScope.launch {
-            diag("page_verify_start reason=$reason package=$activeContentPackage")
-            delay(PAGE_VERIFY_SETTLE_MS)
-            val firstDistance = capturePageDistance(controller, baselineHash)
-            if (firstDistance == null) {
-                diag("page_verify_result distance=na decision=keep reason=$reason")
-                return@launch
-            }
-            if (firstDistance >= PAGE_CHANGE_CLEAR_THRESHOLD) {
-                diag("page_verify_result distance=$firstDistance decision=clear reason=$reason")
-                clearOverlayForReason("page_changed")
-                return@launch
-            }
-            if (firstDistance >= PAGE_CHANGE_RECHECK_THRESHOLD) {
-                delay(PAGE_VERIFY_RECHECK_DELAY_MS)
-                val secondDistance = capturePageDistance(controller, baselineHash)
-                val shouldClear = secondDistance != null && secondDistance >= PAGE_CHANGE_RECHECK_THRESHOLD
-                diag(
-                    "page_verify_result distance=${secondDistance ?: firstDistance} " +
-                        "decision=${if (shouldClear) "clear" else "keep"} reason=$reason"
-                )
-                if (shouldClear) {
-                    clearOverlayForReason("page_changed")
-                }
-                return@launch
-            }
-            diag("page_verify_result distance=$firstDistance decision=keep reason=$reason")
-        }.also { launched ->
-            launched.invokeOnCompletion {
-                if (pageVerifyJob === launched) {
-                    pageVerifyJob = null
-                }
+        when (
+            OverlayAccessibilityPolicy.decide(
+                packageName = packageName,
+                targetPackage = activeContentPackage,
+                isHomePackage = isHomePackage(packageName),
+                isContentChange = event.isContentChange(),
+                isTranslationLocked = overlayController?.isTranslationLocked() == true
+            )
+        ) {
+            OverlayAccessibilityAction.NONE -> Unit
+            OverlayAccessibilityAction.CLEAR_HOME -> clearOverlayForReason("home")
+            OverlayAccessibilityAction.CLEAR_PACKAGE_CHANGED -> clearOverlayForReason("package_changed")
+            OverlayAccessibilityAction.CLEAR_PAGE_CHANGED -> clearOverlayForReason("page_changed")
+            OverlayAccessibilityAction.IGNORE_LOCKED_CONTENT_CHANGE -> {
+                diag("overlay_clear_skip reason=locked_content_change package=$packageName")
             }
         }
-    }
-
-    private suspend fun capturePageDistance(
-        controller: ScreenCaptureController,
-        baselineHash: Long
-    ): Int? {
-        val currentHash = runCatching {
-            val bitmap = controller.captureBitmap(timeoutMs = MONITOR_CAPTURE_TIMEOUT_MS)
-            try {
-                FrameHash.centerDHash(bitmap)
-            } finally {
-                bitmap.recycle()
-            }
-        }.onFailure { error ->
-            if (isProjectionExpiredError(error)) {
-                enterProjectionUnavailable(shouldToast = false, reason = "projection_expired_verify")
-            }
-        }.getOrNull() ?: return null
-        return FrameHash.hammingDistance(baselineHash, currentHash)
-    }
-
-    private fun stopPageVerify() {
-        pageVerifyJob?.cancel()
-        pageVerifyJob = null
     }
 
     private fun clearOverlayForReason(reason: String) {
         overlayController?.setInteractionMode(InteractionMode.BROWSE)
         overlayController?.clearTranslationLayer()
-        stopPageVerify()
         if (currentBaselineHash == null && activeContentPackage == null) {
             return
         }
@@ -495,7 +455,6 @@ class CaptureForegroundService : Service() {
     private fun clearOverlayTracking() {
         activeContentPackage = null
         currentBaselineHash = null
-        stopPageVerify()
     }
 
     private fun resolveActiveContentPackage(): String? {
@@ -580,10 +539,11 @@ class CaptureForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        diag("onDestroy")
+        val projectionStopped = captureController?.hasProjectionStopped() == true
+        val preservedState = captureSessionStateStore.getState()
+        diag("onDestroy projectionStopped=$projectionStopped projectionUnavailable=$projectionUnavailable state=${preservedState.id}")
         translateJob?.cancel()
         translateJob = null
-        stopPageVerify()
         stopCaptureAvailabilityMonitor()
         unregisterSystemUiReceiver()
 
@@ -593,6 +553,12 @@ class CaptureForegroundService : Service() {
         captureController?.stop()
         captureController = null
 
+        val finalState = if (projectionStopped || preservedState == CaptureSessionState.REAUTH_REQUIRED) {
+            CaptureSessionState.REAUTH_REQUIRED
+        } else {
+            CaptureSessionState.STOPPED
+        }
+        updateCaptureSessionState(finalState, "service_destroy")
         serviceScope.cancel()
         super.onDestroy()
     }
@@ -616,6 +582,11 @@ class CaptureForegroundService : Service() {
             .apply()
     }
 
+    private fun updateCaptureSessionState(state: CaptureSessionState, reason: String) {
+        captureSessionStateStore.update(state, reason)
+        diag("capture_session_state state=${state.id} reason=$reason")
+    }
+
     private fun stack(t: Throwable): String {
         val sw = StringWriter()
         t.printStackTrace(PrintWriter(sw))
@@ -632,12 +603,6 @@ class CaptureForegroundService : Service() {
         private const val NOTIFICATION_ID = 4041
         private const val TAG = "CaptureForegroundSvc"
 
-        private const val MONITOR_CAPTURE_TIMEOUT_MS = 1500L
-        private const val PAGE_CHANGE_RECHECK_THRESHOLD = 18
-        private const val PAGE_CHANGE_CLEAR_THRESHOLD = 28
-        private const val PAGE_VERIFY_SETTLE_MS = 140L
-        private const val PAGE_VERIFY_RECHECK_DELAY_MS = 200L
-
         private const val CAPTURE_TIMEOUT_STREAK_THRESHOLD = 2
         private const val CAPTURE_HEALTH_CHECK_INTERVAL_MS = 1200L
         private const val UNAVAILABLE_TOAST_THROTTLE_MS = 1500L
@@ -646,4 +611,3 @@ class CaptureForegroundService : Service() {
         private const val REASON_HOME_KEY = "homekey"
     }
 }
-

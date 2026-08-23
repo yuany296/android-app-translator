@@ -1,7 +1,11 @@
 ﻿package com.manga.translator.store
 
 data class AppSettings(
+    val sourceLanguage: String = AppLanguage.ENGLISH.id,
+    val targetLanguage: String = AppLanguage.CHINESE_SIMPLIFIED.id,
+    val ocrMode: String = OcrMode.REMOTE_OCR.id,
     val ocrProvider: String = AiProvider.OPENAI.id,
+    val baiduOcrLanguage: String = BaiduOcrLanguage.JAP.id,
     val ocrBaseUrl: String = "",
     val ocrModel: String = "gpt-4o-mini",
     val ocrApiKey: String = "",

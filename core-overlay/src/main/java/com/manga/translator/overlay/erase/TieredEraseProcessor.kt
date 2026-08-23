@@ -12,8 +12,11 @@ import com.manga.translator.overlay.EraseStrategyPolicy
 import com.manga.translator.translate.Bubble
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
+import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import org.opencv.photo.Photo
 import java.security.MessageDigest
 import kotlin.math.max
@@ -277,12 +280,22 @@ class TieredEraseProcessor(
             mask.put(0, 0, maskBytes)
 
             val dst = Mat()
-            Photo.inpaint(srcMat, mask, dst, 3.0, Photo.INPAINT_TELEA)
+            Imgproc.GaussianBlur(mask, mask, Size(5.0, 5.0), 0.0)
+
+            val blurred = Mat()
+            val texture = Mat()
+            Imgproc.GaussianBlur(srcMat, blurred, Size(7.0, 7.0), 0.0)
+
+            Photo.inpaint(blurred, mask, dst, OPENCV_INPAINT_RADIUS, Photo.INPAINT_NS)
+            Core.subtract(srcMat, blurred, texture)
+            Core.add(dst, texture, dst)
             Utils.matToBitmap(dst, patchBitmap)
             applyRoundAlphaMask(patchBitmap, radius)
 
             srcMat.release()
             mask.release()
+            blurred.release()
+            texture.release()
             dst.release()
 
             val srcRect = RectF(roi)
@@ -525,7 +538,12 @@ class TieredEraseProcessor(
         digest.update(pageHash.toByteArray(Charsets.UTF_8))
         digest.update(policy.name.toByteArray(Charsets.UTF_8))
         bubbles.forEachIndexed { index, bubble ->
-            digest.update("$index,${bubble.x},${bubble.y},${bubble.w},${bubble.h},${bubble.bgType}".toByteArray(Charsets.UTF_8))
+            val keyPart =
+                "$index,${bubble.x},${bubble.y},${bubble.w},${bubble.h}," +
+                    "${bubble.contentX},${bubble.contentY},${bubble.contentW},${bubble.contentH},${bubble.bgType}"
+            digest.update(
+                keyPart.toByteArray(Charsets.UTF_8)
+            )
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
@@ -561,9 +579,10 @@ class TieredEraseProcessor(
     companion object {
         private const val TAG = "TieredEraseProcessor"
 
-        private const val DARK_LUMA_THRESHOLD = 180f
+        private const val DARK_LUMA_THRESHOLD = 190f
         private const val HIGH_VARIANCE_THRESHOLD = 800f
-        private const val EDGE_TRANSITION_PX = 3f
+        private const val EDGE_TRANSITION_PX = 4f
+        private const val OPENCV_INPAINT_RADIUS = 5.0
         private const val SOFTEN_EDGE_PX = 2f
         private const val SAMPLE_STEP_PX = 3
 

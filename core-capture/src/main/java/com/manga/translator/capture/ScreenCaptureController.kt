@@ -22,6 +22,8 @@ import java.io.IOException
 import java.nio.ByteBuffer
 
 class ScreenCaptureController(private val context: Context) {
+    var projectionStopListener: ((externalStop: Boolean) -> Unit)? = null
+
     private var mediaProjection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
     private var imageReader: ImageReader? = null
@@ -40,6 +42,9 @@ class ScreenCaptureController(private val context: Context) {
     private var lastCaptureSuccessAt: Long = 0L
     @Volatile
     private var lastCaptureFailureType: CaptureFailureType? = null
+    @Volatile
+    private var stopRequested: Boolean = false
+    private var latestFrameSnapshot: FrameSnapshot? = null
 
     fun start(resultCode: Int, data: android.content.Intent, width: Int, height: Int, densityDpi: Int) {
         stop()
@@ -52,13 +57,15 @@ class ScreenCaptureController(private val context: Context) {
         projectionStopped = false
         lastCaptureSuccessAt = 0L
         lastCaptureFailureType = null
+        stopRequested = false
 
         val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mgr.getMediaProjection(resultCode, data)
         Log.i(TAG, "mediaProjection=$mediaProjection")
         projectionCallback = object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.e(TAG, "media_projection_onStop")
+                val externalStop = !stopRequested
+                Log.e(TAG, "media_projection_onStop externalStop=$externalStop")
                 projectionStopped = true
                 try {
                     virtualDisplay?.release()
@@ -71,57 +78,112 @@ class ScreenCaptureController(private val context: Context) {
                 } catch (_: Throwable) {
                 }
                 imageReader = null
+                projectionStopListener?.invoke(externalStop)
             }
         }
         mediaProjection?.registerCallback(projectionCallback!!, captureHandler)
         recreateCapturePipeline()
     }
 
-    suspend fun captureBitmap(timeoutMs: Long = 5000L): Bitmap = captureMutex.withLock {
+    suspend fun captureBitmap(
+        timeoutMs: Long = 5000L,
+        traceId: String = SystemClock.elapsedRealtime().toString()
+    ): Bitmap = captureMutex.withLock {
         try {
             withContext(Dispatchers.Default) {
                 val reader = imageReader ?: throw CaptureException(
                     CaptureFailureType.NOT_STARTED,
                     "Capture is not started"
                 )
+                val captureStartMs = SystemClock.elapsedRealtime()
+                Log.i(
+                    TAG,
+                    "trace=$traceId capture_start timeoutMs=$timeoutMs firstFrameReady=$firstFrameReady imageReader=$reader"
+                )
                 if (readyReader !== reader) {
                     firstFrameReady = false
                 }
                 if (!firstFrameReady) {
-                    val ready = waitForFirstFrame(reader, FIRST_FRAME_WAIT_TIMEOUT_MS)
-                    if (!ready) {
-                        throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout(first frame not ready)")
-                    }
+                    val firstImage = waitForFirstFrame(reader, FIRST_FRAME_WAIT_TIMEOUT_MS, traceId)
+                        ?: throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout(first frame not ready)")
                     firstFrameReady = true
                     readyReader = reader
+                    val firstBitmap = imageToBitmap(firstImage)
+                    if (firstBitmap != null) {
+                        val quality = analyzeFrameQuality(firstBitmap)
+                        if (quality.suspicious) {
+                            Log.w(
+                                TAG,
+                                "trace=$traceId stage=image_to_bitmap source=first_frame suspicious=true " +
+                                    "mean=${quality.meanLuma} std=${quality.stddevLuma} dark=${quality.darkRatio} light=${quality.lightRatio}"
+                            )
+                            if (!firstBitmap.isRecycled) {
+                                firstBitmap.recycle()
+                            }
+                        } else {
+                            updateLatestFrameSnapshot(firstBitmap)
+                            markCaptureSuccess()
+                            Log.i(
+                                TAG,
+                                "trace=$traceId stage=image_to_bitmap source=first_frame costMs=${SystemClock.elapsedRealtime() - captureStartMs}"
+                            )
+                            return@withContext firstBitmap
+                        }
+                    }
                 }
-                val deadline = System.currentTimeMillis() + timeoutMs
-                while (System.currentTimeMillis() < deadline) {
+                val waitStartMs = SystemClock.elapsedRealtime()
+                Log.d(TAG, "trace=$traceId stage=wait_frame start timeoutMs=$timeoutMs")
+                val deadline = waitStartMs + timeoutMs
+                while (SystemClock.elapsedRealtime() < deadline) {
                     val image = reader.acquireLatestImage()
                     if (image != null) {
-                        try {
-                            val plane = image.planes.firstOrNull() ?: continue
-                            val buffer: ByteBuffer = plane.buffer
-                            val pixelStride = plane.pixelStride
-                            val rowStride = plane.rowStride
-                            val rowPadding = rowStride - pixelStride * image.width
-
-                            val temp = Bitmap.createBitmap(
-                                image.width + rowPadding / pixelStride,
-                                image.height,
-                                Bitmap.Config.ARGB_8888
-                            )
-                            temp.copyPixelsFromBuffer(buffer)
-                            val result = Bitmap.createBitmap(temp, 0, 0, image.width, image.height)
-                            temp.recycle()
-                            markCaptureSuccess()
-                            return@withContext result
-                        } finally {
-                            image.close()
+                        val result = imageToBitmap(image)
+                        if (result != null) {
+                            val quality = analyzeFrameQuality(result)
+                            if (quality.suspicious) {
+                                Log.w(
+                                    TAG,
+                                    "trace=$traceId stage=wait_frame hit=reader suspicious=true waitedMs=${SystemClock.elapsedRealtime() - waitStartMs} " +
+                                        "mean=${quality.meanLuma} std=${quality.stddevLuma} dark=${quality.darkRatio} light=${quality.lightRatio}"
+                                )
+                                if (!result.isRecycled) {
+                                    result.recycle()
+                                }
+                            } else {
+                                updateLatestFrameSnapshot(result)
+                                markCaptureSuccess()
+                                Log.d(
+                                    TAG,
+                                    "trace=$traceId stage=wait_frame hit=reader waitedMs=${SystemClock.elapsedRealtime() - waitStartMs}"
+                                )
+                                return@withContext result
+                            }
                         }
                     }
                     delay(50)
+                    val cached = tryUseRecentFrameSnapshot(traceId)
+                    if (cached != null) {
+                        markCaptureSuccess()
+                        Log.d(
+                            TAG,
+                            "trace=$traceId stage=wait_frame hit=cached waitedMs=${SystemClock.elapsedRealtime() - waitStartMs}"
+                        )
+                        return@withContext cached
+                    }
                 }
+                val cached = tryUseRecentFrameSnapshot(traceId)
+                if (cached != null) {
+                    markCaptureSuccess()
+                    Log.d(
+                        TAG,
+                        "trace=$traceId stage=wait_frame hit=cached_after_timeout waitedMs=${SystemClock.elapsedRealtime() - waitStartMs}"
+                    )
+                    return@withContext cached
+                }
+                Log.e(
+                    TAG,
+                    "trace=$traceId stage=capture_timeout_final waitedMs=${SystemClock.elapsedRealtime() - waitStartMs}"
+                )
                 throw CaptureException(CaptureFailureType.TIMEOUT, "Screen capture timeout")
             }
         } catch (error: Throwable) {
@@ -131,9 +193,12 @@ class ScreenCaptureController(private val context: Context) {
         }
     }
 
-    suspend fun captureBitmapWithRecovery(timeoutMs: Long = 5000L): Bitmap {
+    suspend fun captureBitmapWithRecovery(
+        timeoutMs: Long = 5000L,
+        traceId: String = SystemClock.elapsedRealtime().toString()
+    ): Bitmap {
         return try {
-            captureBitmap(timeoutMs)
+            captureBitmap(timeoutMs, traceId)
         } catch (first: Throwable) {
             val firstType = resolveFailureType(first)
             if (firstType == CaptureFailureType.PROJECTION_EXPIRED) {
@@ -142,16 +207,22 @@ class ScreenCaptureController(private val context: Context) {
             if (firstType != CaptureFailureType.TIMEOUT) {
                 throw asCaptureException(first, firstType)
             }
-            Log.w(TAG, "capture_timeout_attempt")
-            // Android 14+ 对同一 MediaProjection 实例重复 createVirtualDisplay 有严格限制，
-            // 超时恢复仅做二次抓取重试，避免触发 projection 失效。
+            Log.w(TAG, "trace=$traceId capture_timeout_attempt")
+            captureMutex.withLock {
+                Log.w(TAG, "trace=$traceId stage=hard_recreate begin")
+                recreateCapturePipeline()
+                firstFrameReady = false
+                readyReader = null
+                Log.i(TAG, "trace=$traceId stage=hard_recreate done")
+            }
             delay(120)
+            val retryTimeoutMs = timeoutMs.coerceAtMost(RECOVERY_RETRY_TIMEOUT_MS).coerceAtLeast(600L)
             try {
-                captureBitmap(timeoutMs).also {
-                    Log.i(TAG, "capture_recover_success")
+                captureBitmap(retryTimeoutMs, traceId).also {
+                    Log.i(TAG, "trace=$traceId capture_recover_success retryTimeoutMs=$retryTimeoutMs")
                 }
             } catch (second: Throwable) {
-                Log.e(TAG, "capture_recover_fail_retry: ${second.message}")
+                Log.e(TAG, "trace=$traceId capture_recover_fail_retry: ${second.message}")
                 val secondType = resolveFailureType(second)
                 throw asCaptureException(second, secondType)
             }
@@ -242,6 +313,7 @@ class ScreenCaptureController(private val context: Context) {
     }
 
     fun stop() {
+        stopRequested = true
         projectionStopped = true
         try {
             virtualDisplay?.release()
@@ -256,6 +328,7 @@ class ScreenCaptureController(private val context: Context) {
         imageReader = null
         firstFrameReady = false
         readyReader = null
+        clearLatestFrameSnapshot()
 
         try {
             projectionCallback?.let { callback ->
@@ -283,19 +356,154 @@ class ScreenCaptureController(private val context: Context) {
         Log.i(TAG, "stop_reset ts=${System.currentTimeMillis()} firstFrameReady=$firstFrameReady")
     }
 
-    private suspend fun waitForFirstFrame(reader: ImageReader, timeoutMs: Long): Boolean {
+    private suspend fun waitForFirstFrame(
+        reader: ImageReader,
+        timeoutMs: Long,
+        traceId: String
+    ): android.media.Image? {
+        val stageStartMs = SystemClock.elapsedRealtime()
+        Log.d(TAG, "trace=$traceId stage=wait_frame start scope=first timeoutMs=$timeoutMs")
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             val image = reader.acquireLatestImage()
             if (image != null) {
-                image.close()
-                Log.i(TAG, "first_frame_received ts=${System.currentTimeMillis()}")
-                return true
+                Log.i(
+                    TAG,
+                    "trace=$traceId stage=wait_frame hit=first waitedMs=${SystemClock.elapsedRealtime() - stageStartMs}"
+                )
+                return image  // 不关闭，由调用方直接读取像素后关闭
             }
             delay(30)
         }
-        Log.w(TAG, "first_frame_wait_timeout timeoutMs=$timeoutMs")
-        return false
+        Log.w(TAG, "trace=$traceId first_frame_wait_timeout timeoutMs=$timeoutMs")
+        return null
+    }
+
+    private fun imageToBitmap(image: android.media.Image): Bitmap? {
+        return try {
+            val plane = image.planes.firstOrNull() ?: return null
+            val buffer: ByteBuffer = plane.buffer
+            val pixelStride = plane.pixelStride
+            val rowStride = plane.rowStride
+            val rowPadding = rowStride - pixelStride * image.width
+
+            val temp = Bitmap.createBitmap(
+                image.width + rowPadding / pixelStride,
+                image.height,
+                Bitmap.Config.ARGB_8888
+            )
+            temp.copyPixelsFromBuffer(buffer)
+            val result = Bitmap.createBitmap(temp, 0, 0, image.width, image.height)
+            temp.recycle()
+            result
+        } finally {
+            image.close()
+        }
+    }
+
+    private fun updateLatestFrameSnapshot(bitmap: Bitmap) {
+        val quality = analyzeFrameQuality(bitmap)
+        if (quality.suspicious) {
+            Log.w(
+                TAG,
+                "stage=cache_frame skip=suspicious mean=${quality.meanLuma} std=${quality.stddevLuma} " +
+                    "dark=${quality.darkRatio} light=${quality.lightRatio}"
+            )
+            return
+        }
+        val snapshotBitmap = try {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (_: Throwable) {
+            null
+        } ?: return
+
+        latestFrameSnapshot?.bitmap?.let { old ->
+            if (!old.isRecycled) {
+                old.recycle()
+            }
+        }
+        latestFrameSnapshot = FrameSnapshot(
+            bitmap = snapshotBitmap,
+            capturedAtMs = SystemClock.elapsedRealtime()
+        )
+    }
+
+    private fun tryUseRecentFrameSnapshot(traceId: String): Bitmap? {
+        val snapshot = latestFrameSnapshot ?: return null
+        if (snapshot.bitmap.isRecycled) {
+            latestFrameSnapshot = null
+            return null
+        }
+        val ageMs = SystemClock.elapsedRealtime() - snapshot.capturedAtMs
+        if (ageMs > RECENT_FRAME_MAX_AGE_MS) {
+            Log.d(TAG, "trace=$traceId stage=use_cached_frame skip=expired ageMs=$ageMs")
+            return null
+        }
+        return try {
+            snapshot.bitmap.copy(Bitmap.Config.ARGB_8888, false)?.also {
+                Log.d(TAG, "trace=$traceId stage=use_cached_frame hit=true ageMs=$ageMs")
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun clearLatestFrameSnapshot() {
+        latestFrameSnapshot?.bitmap?.let { old ->
+            if (!old.isRecycled) {
+                old.recycle()
+            }
+        }
+        latestFrameSnapshot = null
+    }
+
+    private fun analyzeFrameQuality(bitmap: Bitmap): FrameQuality {
+        if (bitmap.width <= 0 || bitmap.height <= 0) {
+            return FrameQuality(0f, 0f, 1f, 1f, suspicious = true)
+        }
+        val stepX = maxOf(1, bitmap.width / FRAME_SAMPLE_GRID)
+        val stepY = maxOf(1, bitmap.height / FRAME_SAMPLE_GRID)
+        var samples = 0
+        var lumaSum = 0.0
+        var lumaSqSum = 0.0
+        var darkCount = 0
+        var lightCount = 0
+        var y = 0
+        while (y < bitmap.height) {
+            var x = 0
+            while (x < bitmap.width) {
+                val pixel = bitmap.getPixel(x, y)
+                val r = (pixel shr 16) and 0xFF
+                val g = (pixel shr 8) and 0xFF
+                val b = pixel and 0xFF
+                val luma = 0.299 * r + 0.587 * g + 0.114 * b
+                lumaSum += luma
+                lumaSqSum += luma * luma
+                if (luma <= FRAME_DARK_LUMA_THRESHOLD) darkCount += 1
+                if (luma >= FRAME_LIGHT_LUMA_THRESHOLD) lightCount += 1
+                samples += 1
+                x += stepX
+            }
+            y += stepY
+        }
+        if (samples <= 0) {
+            return FrameQuality(0f, 0f, 1f, 1f, suspicious = true)
+        }
+        val mean = (lumaSum / samples.toDouble()).toFloat()
+        val variance = ((lumaSqSum / samples.toDouble()) - (lumaSum / samples.toDouble()) * (lumaSum / samples.toDouble()))
+            .coerceAtLeast(0.0)
+        val stddev = kotlin.math.sqrt(variance).toFloat()
+        val darkRatio = darkCount.toFloat() / samples.toFloat()
+        val lightRatio = lightCount.toFloat() / samples.toFloat()
+        val suspicious = stddev < FRAME_MIN_STDDEV_LUMA &&
+            (darkRatio >= FRAME_DOMINANT_RATIO || lightRatio >= FRAME_DOMINANT_RATIO)
+        return FrameQuality(
+            meanLuma = mean,
+            stddevLuma = stddev,
+            darkRatio = darkRatio,
+            lightRatio = lightRatio,
+            suspicious = suspicious
+        )
     }
 
     private fun resolveFailureType(error: Throwable): CaptureFailureType {
@@ -361,8 +569,28 @@ class ScreenCaptureController(private val context: Context) {
     private companion object {
         const val TAG = "ScreenCaptureCtrl"
         const val FIRST_FRAME_WAIT_TIMEOUT_MS = 2000L
+        const val RECENT_FRAME_MAX_AGE_MS = 1200L
+        const val RECOVERY_RETRY_TIMEOUT_MS = 2200L
+        const val FRAME_SAMPLE_GRID = 24
+        const val FRAME_DARK_LUMA_THRESHOLD = 24f
+        const val FRAME_LIGHT_LUMA_THRESHOLD = 245f
+        const val FRAME_MIN_STDDEV_LUMA = 9f
+        const val FRAME_DOMINANT_RATIO = 0.985f
     }
 }
+
+private data class FrameSnapshot(
+    val bitmap: Bitmap,
+    val capturedAtMs: Long
+)
+
+private data class FrameQuality(
+    val meanLuma: Float,
+    val stddevLuma: Float,
+    val darkRatio: Float,
+    val lightRatio: Float,
+    val suspicious: Boolean
+)
 
 enum class CaptureFailureType {
     TIMEOUT,

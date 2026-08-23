@@ -9,17 +9,25 @@
 - 手动优先：悬浮球点击触发翻译
 - `MediaProjection` 截屏 -> OpenAI 兼容视觉接口 -> 气泡覆写
 - 覆写层支持：loading 占位、分批淡入、点击切换原文/译文
+- 底栏 4 页：首页 / 翻译设置 / 术语表 / 翻译历史
+- 术语表：源→目标术语映射注入翻译 prompt（人名/地名保持一致），**多集合管理**（如"默认/作品A"各一套，可多选生效集合，翻译注入所有生效集合、靠前集合优先），上限 500 条/集合；UI 分为集合列表与集合详情两级，列表支持开关生效/右划删除/新建/导入，详情支持点击原文或译文直接内联编辑、搜索、添加、右划删除条目；JSON 导入/导出（SAF），支持搜索与下拉刷新
+- API Key 输入掩码显示（`***`）
+- OCR / 翻译分离缓存：OCR 结果 2 小时短期缓存；翻译结果永久保存进历史库，改翻译配置或术语表不重跑 OCR
+- 翻译历史：每次翻译成功永久保存（JSON 文件，上限 500 条），翻回同页直接复用译文不重复扣费，可查看/删除/清空
+- 背景/字体颜色参考原图：渲染前对每个气泡从截图像素采样背景色与文字色，覆写观感贴近原图（默认直接应用）
 - 配置页支持：`baseUrl`、`model`、`apiKey`、启用开关、忽略简体中文开关
 - 配置加密存储：`EncryptedSharedPreferences + MasterKey`
-- 本地短期缓存：2 小时 TTL
+- 本地短期缓存：OCR 层 2 小时 TTL
 
 ## 关键文件
 - `app/src/main/java/com/manga/translator/app/MainActivity.kt`
+- `app/src/main/java/com/manga/translator/app/GlossaryScreen.kt`
 - `app/src/main/java/com/manga/translator/app/CaptureForegroundService.kt`
 - `app/src/main/java/com/manga/translator/app/TranslateOrchestrator.kt`
 - `core-capture/src/main/java/com/manga/translator/capture/ScreenCaptureController.kt`
 - `core-translate/src/main/java/com/manga/translator/translate/OpenAiVisionClient.kt`
 - `core-overlay/src/main/java/com/manga/translator/overlay/OverlayController.kt`
+- `core-store/src/main/java/com/manga/translator/store/GlossaryRepository.kt`
 - `core-store/src/main/java/com/manga/translator/store/SettingsRepository.kt`
 
 ## 运行步骤（Android Studio）

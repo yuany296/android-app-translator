@@ -11,6 +11,7 @@ data class BubbleRenderState(
     var fontScale: Float = 1f,
     var strokeScale: Float = 1f,
     var baseTextSp: Float = 12f,
+    var fittedTextSp: Float = 0f,
     var baseStrokeDp: Float = 1f,
     var bubbleId: Int = -1,
     var solidPatched: Boolean = false,

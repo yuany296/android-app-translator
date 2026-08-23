@@ -27,6 +27,48 @@ enum class AiProvider(
         defaultBaseUrl = "https://open.bigmodel.cn/api/paas/v4",
         defaultModel = "glm-4v-plus",
         supportsThinking = true
+    ),
+    DEEPSEEK(
+        id = "deepseek",
+        label = "DeepSeek",
+        defaultBaseUrl = "https://api.deepseek.com/v1",
+        defaultModel = "deepseek-chat",
+        supportsThinking = false
+    ),
+    KIMI(
+        id = "kimi",
+        label = "Kimi",
+        defaultBaseUrl = "https://api.moonshot.cn/v1",
+        defaultModel = "moonshot-v1-8k",
+        supportsThinking = false
+    ),
+    SILICONFLOW(
+        id = "siliconflow",
+        label = "硅基流动",
+        defaultBaseUrl = "https://api.siliconflow.cn/v1",
+        defaultModel = "Qwen/Qwen2.5-VL-7B-Instruct",
+        supportsThinking = false
+    ),
+    VOLCES(
+        id = "volces",
+        label = "火山方舟",
+        defaultBaseUrl = "https://ark.cn-beijing.volces.com/api/v3",
+        defaultModel = "",
+        supportsThinking = false
+    ),
+    CUSTOM(
+        id = "custom",
+        label = "自定义（OpenAI 兼容）",
+        defaultBaseUrl = "",
+        defaultModel = "",
+        supportsThinking = false
+    ),
+    BAIDU(
+        id = "baidu",
+        label = "百度OCR",
+        defaultBaseUrl = "https://aip.baidubce.com",
+        defaultModel = "accurate",
+        supportsThinking = false
     );
 
     companion object {

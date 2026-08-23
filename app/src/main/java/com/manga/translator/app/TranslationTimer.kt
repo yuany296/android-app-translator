@@ -4,7 +4,7 @@ import android.os.SystemClock
 import android.util.Log
 
 class TranslationTimer(
-    private val traceId: String = SystemClock.elapsedRealtime().toString()
+    val traceId: String = SystemClock.elapsedRealtime().toString()
 ) {
     private val marks = linkedMapOf<String, Long>()
 

@@ -55,6 +55,12 @@ android-app/
 │  └─ src/main/
 │     ├─ AndroidManifest.xml
 │     └─ java/com/manga/translator/store/
+│        ├─ SettingsRepository.kt          # 配置/渠道档案加密持久化
+│        ├─ GlossaryRepository.kt          # 术语表 CRUD + JSON 导入导出 + revision
+│        ├─ OcrCacheRepository.kt          # OCR 结果短期缓存（2h TTL）
+│        ├─ TranslationHistoryRepository.kt# 翻译历史库（永久，JSON 文件，上限 500 条）
+│        ├─ PageOverlayAdjustmentRepository.kt
+│        └─ ...
 ├─ docs/
 │  ├─ LOCAL_DEBUG_GUIDE.md
 │  └─ PROJECT_STRUCTURE.md
@@ -95,8 +101,10 @@ android-app/
 
 补充说明：
 
-- `app/src/main/java/com/manga/translator/app/ServiceLocator.kt` 负责组装 `SettingsRepository`、`TranslationCacheRepository`、`PageOverlayAdjustmentRepository`、`OpenAiVisionClient`、`OverlayController` 与 `ScreenCaptureController`。
+- `app/src/main/java/com/manga/translator/app/ServiceLocator.kt` 负责组装 `SettingsRepository`、`GlossaryRepository`、`OcrCacheRepository`、`TranslationHistoryRepository`、`PageOverlayAdjustmentRepository`、`OpenAiVisionClient`、`OverlayController`、`ScreenCaptureController` 与 `BubbleColorExtractor`。
 - `core-translate/src/main/java/com/manga/translator/translate/Models.kt` 定义 `Bubble` 与 `TranslationResult`，作为翻译结果在模块间传递的核心数据结构。
+- `core-overlay/src/main/java/com/manga/translator/overlay/BubbleColorExtractor.kt` 对每个气泡从截图像素采样背景色与文字色，`OverlayController` 渲染时替换固定颜色。
+- 主链路缓存策略：OCR 结果走 `OcrCacheRepository`（key = 图像指纹 + OCR 配置指纹，2h TTL）；译文走 `TranslationHistoryRepository`（key = 原文序列 + 翻译配置指纹 + 术语表 revision，永久保存），翻译成功后写入历史库。
 
 ## 6. 维护约定
 

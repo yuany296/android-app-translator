@@ -19,5 +19,8 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.security:security-crypto-ktx:1.1.0-alpha06")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 

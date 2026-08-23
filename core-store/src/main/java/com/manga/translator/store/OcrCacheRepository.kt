@@ -1,35 +1,45 @@
-﻿package com.manga.translator.store
+package com.manga.translator.store
 
 import android.content.Context
-import org.json.JSONArray
 import org.json.JSONObject
 
-class TranslationCacheRepository(context: Context) {
+class OcrCacheRepository(context: Context) {
     private val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+    private val lock = Any()
 
     fun get(cacheKey: String): String? {
-        val raw = prefs.getString(cacheKey, null) ?: return null
-        return try {
-            val obj = JSONObject(raw)
-            val ts = obj.optLong("ts", 0L)
-            if (System.currentTimeMillis() - ts > TTL_MS) {
-                prefs.edit().remove(cacheKey).apply()
+        synchronized(lock) {
+            val raw = prefs.getString(cacheKey, null) ?: return null
+            return try {
+                val obj = JSONObject(raw)
+                val ts = obj.optLong("ts", 0L)
+                if (System.currentTimeMillis() - ts > TTL_MS) {
+                    prefs.edit().remove(cacheKey).apply()
+                    null
+                } else {
+                    if (obj.has("value") && !obj.isNull("value")) obj.getString("value") else null
+                }
+            } catch (_: Throwable) {
                 null
-            } else {
-                if (obj.has("value") && !obj.isNull("value")) obj.getString("value") else null
             }
-        } catch (_: Throwable) {
-            null
         }
     }
 
     fun put(cacheKey: String, value: String) {
-        val payload = JSONObject()
-            .put("ts", System.currentTimeMillis())
-            .put("value", value)
-            .toString()
-        prefs.edit().putString(cacheKey, payload).apply()
-        trimIfNeeded()
+        synchronized(lock) {
+            val payload = JSONObject()
+                .put("ts", System.currentTimeMillis())
+                .put("value", value)
+                .toString()
+            prefs.edit().putString(cacheKey, payload).apply()
+            trimIfNeeded()
+        }
+    }
+
+    fun clearAll() {
+        synchronized(lock) {
+            prefs.edit().clear().apply()
+        }
     }
 
     private fun trimIfNeeded() {
@@ -54,12 +64,8 @@ class TranslationCacheRepository(context: Context) {
         editor.apply()
     }
 
-    fun clearAll() {
-        prefs.edit().clear().apply()
-    }
-
     private companion object {
-        const val PREF_NAME = "mt_translate_cache"
+        const val PREF_NAME = "mt_ocr_cache"
         const val TTL_MS = 2 * 60 * 60 * 1000L
         const val MAX_ENTRIES = 120
     }

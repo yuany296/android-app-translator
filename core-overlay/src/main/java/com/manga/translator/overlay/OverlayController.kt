@@ -8,6 +8,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
@@ -35,11 +36,12 @@ import kotlin.math.min
 class OverlayController(private val context: Context) {
     private val patchFillColor = Color.parseColor("#181818")
     private val patchStrokeColor = Color.parseColor("#E6E2DB")
+    private var currentBubbleColors: Map<Int, BubbleColors> = emptyMap()
     private val floatingSizeDp = 40
-    private val denseFontScale = 0.75f
-    private val normalFontScale = 0.85f
-    private val minFitSp = if (context.resources.displayMetrics.densityDpi >= 360) 4.5f else 5f
-    private val maxFitSp = 16f
+    private val denseFontScale = 0.90f
+    private val normalFontScale = 1.00f
+private val minFitSp = 6f
+    private val maxFitSp = 64f
     private val adjustDurationMs = 10_000L
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -59,6 +61,9 @@ class OverlayController(private val context: Context) {
 
     private var translationLayer: FrameLayout? = null
     private var translationParams: WindowManager.LayoutParams? = null
+    private var lockTapView: View? = null
+    private var translationLocked: Boolean = false
+    private var lockReleaseListener: (() -> Unit)? = null
     private var expandedCardView: TextView? = null
     private var expandedCardParams: WindowManager.LayoutParams? = null
     private var erasePatchLayer: ErasePatchLayerView? = null
@@ -79,6 +84,8 @@ class OverlayController(private val context: Context) {
     private var loadAdjustment: ((String, String) -> BubbleAdjustment?)? = null
     private var saveAdjustment: ((String, String, BubbleAdjustment) -> Unit)? = null
     private val patchTextSpecs = linkedMapOf<String, PatchTextSpec>()
+
+    fun isTranslationLocked(): Boolean = translationLocked
 
     fun showFloatingButton(onClick: () -> Unit) {
         if (floatingButton != null) return
@@ -275,7 +282,7 @@ class OverlayController(private val context: Context) {
         return width to height
     }
 
-    fun renderBubbles(
+fun renderBubbles(
         bubbles: List<Bubble>,
         renderConfig: OverlayRenderConfig = OverlayRenderConfig(),
         onToggle: ((Bubble, Boolean) -> Unit)? = null,
@@ -285,17 +292,22 @@ class OverlayController(private val context: Context) {
         pageHash: String = "",
         loadAdjustment: ((String, String) -> BubbleAdjustment?)? = null,
         saveAdjustment: ((String, String, BubbleAdjustment) -> Unit)? = null,
+        bubbleColors: Map<Int, BubbleColors> = emptyMap(),
         onPerf: ((tag: String, extra: String?) -> Unit)? = null
     ) {
         ensureLayer()
         val layer = translationLayer ?: return
         clearErasePatches()
+        translationLocked = false
+        lockReleaseListener = null
+        lockTapView = null
         layer.removeAllViews()
         ensurePatchLayer(layer)
         hideExpandedCard()
         bubbleStates.clear()
         activeBubbleViews.clear()
         patchTextSpecs.clear()
+        currentBubbleColors = bubbleColors
 
         this.currentPageHash = pageHash
         this.loadAdjustment = loadAdjustment
@@ -323,6 +335,7 @@ class OverlayController(private val context: Context) {
         var verticalNormalizedCount = 0
         var dialogueOpaqueCount = 0
         var overlayShiftPxTotal = 0f
+        val renderedTextSizes = mutableListOf<Float>()
         val layoutStartedAt = SystemClock.elapsedRealtime()
 
         ordered.forEachIndexed { orderIndex, indexed ->
@@ -332,7 +345,12 @@ class OverlayController(private val context: Context) {
                 "bubble=${indexed.index} bgType=${bubble.bgType} layout=${bubble.layout}"
             )
             val translatedRaw = bubble.translatedText.ifBlank { bubble.originalText }
-            val normalizedTranslatedText = normalizeVerticalLayoutText(translatedRaw)
+            val useVerticalLayout = isVerticalLayoutBubble(bubble, translatedRaw)
+            val normalizedTranslatedText = if (useVerticalLayout) {
+                normalizeVerticalLayoutText(translatedRaw)
+            } else {
+                translatedRaw
+            }
             if (normalizedTranslatedText != translatedRaw) {
                 verticalNormalizedCount++
             }
@@ -357,14 +375,14 @@ class OverlayController(private val context: Context) {
             val top = baseRect.top
             val isNarration = isNarrationBubble(bubble)
             val isSolidPatched = bubble.bgType.equals("solid", ignoreCase = true)
-            val useVerticalLayout = isVerticalLayoutBubble(bubble, normalizedTranslatedText)
             val key = "v2:${indexed.index}:${bubble.x}:${bubble.y}:${bubble.w}:${bubble.h}"
 
             val state = BubbleRenderState(key = key)
             bubbleStates[key] = state
 
             val densityScale = if (renderConfig.denseMode) denseFontScale else normalFontScale
-            val baseTextSp = (computeFontSp(boxH) * densityScale * if (isNarration) 0.92f else 1f).coerceIn(minFitSp, maxFitSp)
+            val verticalScale = if (useVerticalLayout) 1.08f else 1f
+            val baseTextSp = (computeFontSp(boxH) * densityScale * verticalScale).coerceIn(minFitSp, maxFitSp)
             val baseStrokeDp = if (renderConfig.denseMode) 1.0f else 1.5f
             state.baseTextSp = baseTextSp
             state.baseStrokeDp = baseStrokeDp
@@ -374,11 +392,12 @@ class OverlayController(private val context: Context) {
             state.displayText = normalizedTranslatedText
             state.baseRect = RectF(baseRect)
 
-            val tv = if (useVerticalLayout) {
+val tv = if (useVerticalLayout) {
                 VerticalTextView(context).apply {
                     text = normalizedTranslatedText
-                    setTextColor(patchFillColor)
-                    setStroke(patchStrokeColor, naturalStrokeWidth(baseTextSp, baseStrokeDp))
+                    typeface = Typeface.SERIF
+                    setTextColor(bubbleTextColor(indexed.index))
+                    setStroke(bubbleStrokeColor(indexed.index), naturalStrokeWidth(baseTextSp, baseStrokeDp))
                     setBackgroundColor(Color.TRANSPARENT)
                     gravity = Gravity.CENTER
                     setPadding(dp(1), dp(1), dp(1), dp(1))
@@ -386,8 +405,9 @@ class OverlayController(private val context: Context) {
             } else {
                 StrokeTextView(context).apply {
                     text = normalizedTranslatedText
-                    setTextColor(patchFillColor)
-                    setStroke(patchStrokeColor, naturalStrokeWidth(baseTextSp, baseStrokeDp))
+                    typeface = Typeface.SERIF
+                    setTextColor(bubbleTextColor(indexed.index))
+                    setStroke(bubbleStrokeColor(indexed.index), naturalStrokeWidth(baseTextSp, baseStrokeDp))
                     setBackgroundColor(Color.TRANSPARENT)
                     gravity = Gravity.CENTER
                     layoutDirection = View.LAYOUT_DIRECTION_LTR
@@ -403,7 +423,7 @@ class OverlayController(private val context: Context) {
             val dynamicLetter = if (aspect > 1.25f) 0.02f else if (aspect < 0.85f) -0.01f else 0f
             tv.letterSpacing = dynamicLetter
             val baseMaxLines = if (renderConfig.denseMode) {
-                3
+                max(3, min(5, (boxH / dpF(14f)).toInt() + 1))
             } else {
                 max(1, (boxH / dpF(12f)).toInt() + 1)
             }
@@ -426,6 +446,7 @@ class OverlayController(private val context: Context) {
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fit.textSizeSp)
             tv.maxLines = baseMaxLines
             tv.setLineSpacing(0f, fit.lineSpacingMultiplier)
+            state.fittedTextSp = fit.textSizeSp
             state.isTruncated = fit.truncated
             state.lineSpacingMultiplier = fit.lineSpacingMultiplier
             if (state.isTruncated) {
@@ -436,6 +457,7 @@ class OverlayController(private val context: Context) {
 
             applyPersistedAdjustmentIfAny(state, key)
             applyBubbleStyle(tv, state)
+            renderedTextSizes += (state.baseTextSp * state.fontScale).coerceIn(minFitSp, maxFitSp)
             tv.isClickable = true
             tv.isFocusable = false
             tv.setOnTouchListener(BubbleDragTouchListener(state))
@@ -605,9 +627,20 @@ class OverlayController(private val context: Context) {
                 "vertical_normalized_count=$verticalNormalizedCount dialogue_opaque_count=$dialogueOpaqueCount " +
                 "overlay_shift_px=${overlayShiftPxTotal.toInt()} total=${bubbles.size}"
         )
+        if (renderedTextSizes.isNotEmpty()) {
+            val minTextSp = renderedTextSizes.minOrNull() ?: minFitSp
+            val maxTextSp = renderedTextSizes.maxOrNull() ?: maxFitSp
+            val avgTextSp = renderedTextSizes.average()
+            onPerf?.invoke(
+                "render_font_stats",
+                "dense=${renderConfig.denseMode} bubble_count=${bubbles.size} min_sp=${"%.2f".format(minTextSp)} " +
+                    "max_sp=${"%.2f".format(maxTextSp)} avg_sp=${"%.2f".format(avgTextSp)}"
+            )
+        }
     }
 
     fun clearTranslationLayer() {
+        unlockTranslationLayer()
         clearErasePatches()
         translationLayer?.removeAllViews()
         erasePatchLayer = null
@@ -617,8 +650,24 @@ class OverlayController(private val context: Context) {
         hideExpandedCard()
     }
 
+    fun lockTranslationUntilTap(onRelease: () -> Unit) {
+        val layer = translationLayer ?: return
+        translationLocked = true
+        lockReleaseListener = onRelease
+        ensureLockTapView(layer)
+        applyLayerTouchMode()
+    }
+
+    fun unlockTranslationLayer() {
+        translationLocked = false
+        lockReleaseListener = null
+        removeLockTapView()
+        applyLayerTouchMode()
+    }
+
     fun hideAll() {
         cancelAdjustTimeout()
+        unlockTranslationLayer()
         floatingButton?.let { runCatching { windowManager.removeView(it) } }
         floatingButton = null
         floatingParams = null
@@ -637,6 +686,105 @@ class OverlayController(private val context: Context) {
         bubbleStates.clear()
         activeBubbleViews.clear()
         patchTextSpecs.clear()
+    }
+
+    private fun ensureLockTapView(layer: FrameLayout) {
+        if (lockTapView != null) return
+        val view = View(context).apply {
+            isClickable = true
+            isLongClickable = true
+            isFocusable = false
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setOnTouchListener(object : View.OnTouchListener {
+                private var downRawX = 0f
+                private var downRawY = 0f
+                private var downTimeMs = 0L
+                private var maxDistancePx = 0f
+                private var maxPointerCount = 0
+
+                override fun onTouch(v: View?, event: MotionEvent): Boolean {
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            downRawX = event.rawX
+                            downRawY = event.rawY
+                            downTimeMs = SystemClock.uptimeMillis()
+                            maxDistancePx = 0f
+                            maxPointerCount = 1
+                            return true
+                        }
+
+                        MotionEvent.ACTION_POINTER_DOWN,
+                        MotionEvent.ACTION_MOVE,
+                        MotionEvent.ACTION_POINTER_UP -> {
+                            maxPointerCount = max(maxPointerCount, event.pointerCount)
+                            updateMaxDistance(event.rawX, event.rawY)
+                            return true
+                        }
+
+                        MotionEvent.ACTION_UP -> {
+                            maxPointerCount = max(maxPointerCount, event.pointerCount)
+                            updateMaxDistance(event.rawX, event.rawY)
+                            val durationMs = SystemClock.uptimeMillis() - downTimeMs
+                            val decision = TranslationLockGesturePolicy.decide(
+                                maxDistancePx = maxDistancePx,
+                                durationMs = durationMs,
+                                maxPointerCount = maxPointerCount,
+                                touchSlopPx = touchSlop,
+                                tapTimeoutMs = tapTimeoutMs
+                            )
+                            if (decision.outcome == TranslationLockGestureOutcome.RELEASE) {
+                                Log.d(
+                                    "TranslationPerf",
+                                    "lock_tap_release duration_ms=$durationMs distance_px=$maxDistancePx pointers=$maxPointerCount"
+                                )
+                                val callback = lockReleaseListener
+                                unlockTranslationLayer()
+                                callback?.invoke()
+                            } else {
+                                Log.d(
+                                    "TranslationPerf",
+                                    "lock_gesture_blocked reason=${decision.reason} duration_ms=$durationMs distance_px=$maxDistancePx pointers=$maxPointerCount"
+                                )
+                            }
+                            return true
+                        }
+
+                        MotionEvent.ACTION_CANCEL -> {
+                            Log.d(
+                                "TranslationPerf",
+                                "lock_gesture_blocked reason=cancel duration_ms=${SystemClock.uptimeMillis() - downTimeMs} distance_px=$maxDistancePx pointers=$maxPointerCount"
+                            )
+                            return true
+                        }
+                    }
+                    return true
+                }
+
+                private fun updateMaxDistance(rawX: Float, rawY: Float) {
+                    val distance = hypot((rawX - downRawX).toDouble(), (rawY - downRawY).toDouble()).toFloat()
+                    if (distance > maxDistancePx) {
+                        maxDistancePx = distance
+                    }
+                }
+            })
+            setOnClickListener {
+                // 触摸由 onTouch 完整接管，这里留空以保持 view 可点击。
+            }
+        }
+        layer.addView(
+            view,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        lockTapView = view
+    }
+
+    private fun removeLockTapView() {
+        val view = lockTapView ?: return
+        (view.parent as? FrameLayout)?.removeView(view)
+        lockTapView = null
     }
 
     private fun ensurePatchLayer(layer: FrameLayout) {
@@ -711,18 +859,27 @@ class OverlayController(private val context: Context) {
     }
 
     private fun applyBubbleStyle(view: TextView, state: BubbleRenderState) {
-        val scaledText = (state.baseTextSp * state.fontScale).coerceIn(minFitSp, maxFitSp)
+        val base = if (state.fittedTextSp > 0f) state.fittedTextSp else state.baseTextSp
+        val scaledText = (base * state.fontScale).coerceIn(minFitSp, maxFitSp)
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, scaledText)
         view.setLineSpacing(0f, state.lineSpacingMultiplier.coerceIn(0.85f, 1f))
-        view.setTextColor(patchFillColor)
+        view.setTextColor(bubbleTextColor(state.bubbleId))
         if (view is StrokeTextView) {
             val strokeWidth = naturalStrokeWidth(scaledText, state.baseStrokeDp * state.strokeScale)
-            view.setStroke(patchStrokeColor, strokeWidth)
+            view.setStroke(bubbleStrokeColor(state.bubbleId), strokeWidth)
         }
         if (view is VerticalTextView) {
             val strokeWidth = naturalStrokeWidth(scaledText, state.baseStrokeDp * state.strokeScale)
-            view.setStroke(patchStrokeColor, strokeWidth)
+            view.setStroke(bubbleStrokeColor(state.bubbleId), strokeWidth)
         }
+    }
+
+    private fun bubbleTextColor(index: Int): Int {
+        return currentBubbleColors[index]?.textColor ?: patchFillColor
+    }
+
+    private fun bubbleStrokeColor(index: Int): Int {
+        return currentBubbleColors[index]?.strokeColor ?: patchStrokeColor
     }
 
     private fun buildBubbleLayoutParams(width: Int, height: Int, left: Int, top: Int): FrameLayout.LayoutParams {
@@ -744,7 +901,8 @@ class OverlayController(private val context: Context) {
                 state.baseRect.bottom + state.offsetY
             ),
             vertical = state.verticalLayout,
-            textSizeSp = (state.baseTextSp * state.fontScale).coerceIn(minFitSp, maxFitSp),
+            textSizeSp = ((if (state.fittedTextSp > 0f) state.fittedTextSp else state.baseTextSp) * state.fontScale)
+                .coerceIn(minFitSp, maxFitSp),
             strokeDp = (state.baseStrokeDp * state.strokeScale).coerceAtLeast(0.6f),
             lineSpacingMultiplier = state.lineSpacingMultiplier
         )
@@ -808,7 +966,9 @@ class OverlayController(private val context: Context) {
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
         // 默认浏览模式保持触摸穿透；进入调整模式时允许文字块接收触摸事件。
-        val shouldPassThrough = interactionMode == InteractionMode.BROWSE && !lastRenderConfig.touchEnabled
+        val shouldPassThrough = interactionMode == InteractionMode.BROWSE &&
+            !lastRenderConfig.touchEnabled &&
+            !translationLocked
         return if (shouldPassThrough) {
             base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         } else {
@@ -816,11 +976,12 @@ class OverlayController(private val context: Context) {
         }
     }
 
-    private fun computeFontSp(boxHeightPx: Float): Float {
+private fun computeFontSp(boxHeightPx: Float): Float {
         val metrics = context.resources.displayMetrics
         val fontScale = context.resources.configuration.fontScale.coerceAtLeast(0.85f)
         val scaledDensity = metrics.density * fontScale
-        val sp = (boxHeightPx / scaledDensity) * 0.136f
+        // 让译文文字高度与截图原始文字高度接近：sp ≈ 行高/(scaledDensity*1.28)
+        val sp = (boxHeightPx / scaledDensity) * 0.78f
         return sp.coerceIn(minFitSp, maxFitSp)
     }
 
@@ -940,11 +1101,33 @@ class OverlayController(private val context: Context) {
 
     private fun isVerticalLayoutBubble(bubble: Bubble, text: String): Boolean {
         val layout = bubble.layout.lowercase()
-        return when (layout) {
+        val compact = text.filterNot { it.isWhitespace() }
+        val sourceVertical = when (layout) {
             "vertical" -> true
             "horizontal" -> false
             else -> isVerticalLayoutText(text)
         }
+        if (!sourceVertical) return false
+        val translatedPreferHorizontal = shouldPreferHorizontalTranslatedText(text)
+        if (!translatedPreferHorizontal) return true
+        val narrowTallBubble = bubble.h >= bubble.w * 1.9f || bubble.w <= 10f
+        val shortText = compact.length <= 6
+        return when (layout) {
+            "vertical" -> narrowTallBubble && shortText
+            "horizontal" -> false
+            else -> narrowTallBubble && shortText
+        }
+    }
+
+    private fun shouldPreferHorizontalTranslatedText(text: String): Boolean {
+        val compact = text.filterNot { it.isWhitespace() }
+        if (compact.isEmpty()) return false
+        val hasKana = compact.any { ch ->
+            (ch in '\u3040'..'\u309F') || (ch in '\u30A0'..'\u30FF')
+        }
+        if (hasKana) return false
+        val hasCjk = compact.any { ch -> ch in '\u4E00'..'\u9FFF' }
+        return hasCjk
     }
 
     private fun normalizeVerticalLayoutText(text: String): String {
@@ -982,16 +1165,18 @@ class OverlayController(private val context: Context) {
             drawVerticalPatchText(canvas, text, spec)
             return
         }
+drawPatchBackground(canvas, spec)
 
         val fillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = patchFillColor
+            color = bubbleTextColor(spec.bubbleId)
             textSize = spToPx(spec.textSizeSp)
+            typeface = Typeface.SERIF
         }
         val strokePaint = TextPaint(fillPaint).apply {
             style = Paint.Style.STROKE
             strokeJoin = Paint.Join.ROUND
             strokeWidth = max(dpF(0.55f), naturalStrokeWidth(spec.textSizeSp, spec.strokeDp))
-            color = patchStrokeColor
+            color = bubbleStrokeColor(spec.bubbleId)
         }
         val contentWidth = (spec.rect.width() - dpF(2f)).toInt().coerceAtLeast(1)
         val layoutFill = StaticLayout.Builder.obtain(text, 0, text.length, fillPaint, contentWidth)
@@ -1022,16 +1207,18 @@ class OverlayController(private val context: Context) {
     ) {
         val text = normalizeVerticalPunctuation(rawText.replace("\n", ""))
         if (text.isBlank()) return
+drawPatchBackground(canvas, spec)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = patchFillColor
+            color = bubbleTextColor(spec.bubbleId)
             textSize = spToPx(spec.textSizeSp)
             textAlign = Paint.Align.CENTER
+            typeface = Typeface.SERIF
         }
         val strokePaint = Paint(paint).apply {
             style = Paint.Style.STROKE
             strokeJoin = Paint.Join.ROUND
             strokeWidth = max(dpF(0.55f), naturalStrokeWidth(spec.textSizeSp, spec.strokeDp))
-            color = patchStrokeColor
+            color = bubbleStrokeColor(spec.bubbleId)
         }
         val step = (paint.textSize * 1.03f).coerceAtLeast(1f)
         val rows = max(1, ((spec.rect.height() - dpF(4f)) / step).toInt())
@@ -1053,6 +1240,29 @@ class OverlayController(private val context: Context) {
                 index++
             }
         }
+    }
+
+    private fun drawPatchBackground(canvas: Canvas, spec: PatchTextSpec) {
+        val inset = dpF(2f)
+        val rect = RectF(
+            spec.rect.left - inset,
+            spec.rect.top - inset,
+            spec.rect.right + inset,
+            spec.rect.bottom + inset
+        )
+        val bgColor = bubbleStrokeColor(spec.bubbleId)
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = bgColor
+            alpha = 246
+        }
+        val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = max(dpF(0.6f), dpF(1f))
+            color = bgColor
+            alpha = 255
+        }
+        canvas.drawRoundRect(rect, dpF(4f), dpF(4f), bgPaint)
+        canvas.drawRoundRect(rect, dpF(4f), dpF(4f), edgePaint)
     }
 
     private fun computeHorizontalTextRect(spec: PatchTextSpec, layout: StaticLayout): RectF {
@@ -1672,30 +1882,10 @@ class OverlayController(private val context: Context) {
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val textSpecsByBubbleId = patchTexts.associateBy { it.bubbleId }
             patches.forEach { patch ->
                 if (patch.bitmap.isRecycled) return@forEach
                 if (patch.renderRect.width() <= 0f || patch.renderRect.height() <= 0f) return@forEach
-                val spec = textSpecsByBubbleId[patch.bubbleId]
-                if (spec == null) {
-                    canvas.drawBitmap(patch.bitmap, null, patch.renderRect, patchPaint)
-                    return@forEach
-                }
-                val dstRect = computePatchBackgroundRect(spec)
-                val renderRect = patch.renderRect
-                val width = renderRect.width().coerceAtLeast(1f)
-                val height = renderRect.height().coerceAtLeast(1f)
-                val leftRatio = ((dstRect.left - renderRect.left) / width).coerceIn(0f, 1f)
-                val topRatio = ((dstRect.top - renderRect.top) / height).coerceIn(0f, 1f)
-                val rightRatio = ((dstRect.right - renderRect.left) / width).coerceIn(0f, 1f)
-                val bottomRatio = ((dstRect.bottom - renderRect.top) / height).coerceIn(0f, 1f)
-                val srcRect = Rect(
-                    (leftRatio * patch.bitmap.width).toInt().coerceIn(0, patch.bitmap.width - 1),
-                    (topRatio * patch.bitmap.height).toInt().coerceIn(0, patch.bitmap.height - 1),
-                    (rightRatio * patch.bitmap.width).toInt().coerceIn(1, patch.bitmap.width),
-                    (bottomRatio * patch.bitmap.height).toInt().coerceIn(1, patch.bitmap.height)
-                )
-                canvas.drawBitmap(patch.bitmap, srcRect, dstRect, patchPaint)
+                canvas.drawBitmap(patch.bitmap, null, patch.renderRect, patchPaint)
             }
             patchTexts.forEach { spec ->
                 drawPatchText(canvas, spec)

@@ -5,7 +5,8 @@ if not exist logs mkdir logs
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set TS=%%i
 set OUT=%CD%\logs\regression-smoke-%TS%.txt
 call scripts\_env.bat || exit /b 1
-call scripts\reinstall_debug.bat || exit /b 1
+call scripts\build_debug.bat || exit /b 1
+call scripts\install_debug.bat || exit /b 1
 "%ADB_BIN%" logcat -c
 powershell -NoProfile -Command "Start-Sleep -Seconds 2" >nul
 "%ADB_BIN%" shell am start -n com.manga.translator.app/.MainActivity >nul 2>&1

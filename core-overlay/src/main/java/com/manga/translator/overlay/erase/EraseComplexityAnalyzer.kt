@@ -6,6 +6,7 @@ import androidx.core.graphics.blue
 import androidx.core.graphics.green
 import androidx.core.graphics.red
 import com.manga.translator.translate.Bubble
+import com.manga.translator.translate.BubbleGeometry
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -79,10 +80,11 @@ class EraseComplexityAnalyzer {
     }
 
     fun bubbleToRoi(bitmap: Bitmap, bubble: Bubble, extraPaddingPx: Int = 3): Rect {
-        val left = ((bubble.x / 100f) * bitmap.width).toInt()
-        val top = ((bubble.y / 100f) * bitmap.height).toInt()
-        val width = ((bubble.w / 100f) * bitmap.width).toInt().coerceAtLeast(1)
-        val height = ((bubble.h / 100f) * bitmap.height).toInt().coerceAtLeast(1)
+        val rect = BubbleGeometry.contentRect(bubble)
+        val left = ((rect.left / 100f) * bitmap.width).toInt()
+        val top = ((rect.top / 100f) * bitmap.height).toInt()
+        val width = ((rect.width / 100f) * bitmap.width).toInt().coerceAtLeast(1)
+        val height = ((rect.height / 100f) * bitmap.height).toInt().coerceAtLeast(1)
         return Rect(
             (left - extraPaddingPx).coerceAtLeast(0),
             (top - extraPaddingPx).coerceAtLeast(0),
@@ -91,4 +93,3 @@ class EraseComplexityAnalyzer {
         )
     }
 }
-

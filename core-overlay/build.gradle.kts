@@ -20,5 +20,7 @@ dependencies {
     implementation(project(":core-translate"))
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.opencv:opencv:4.10.0")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
