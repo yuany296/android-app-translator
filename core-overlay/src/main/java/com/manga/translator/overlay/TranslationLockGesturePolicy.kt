@@ -24,21 +24,11 @@ internal object TranslationLockGesturePolicy {
                 reason = "multi_pointer"
             )
         }
-        if (maxDistancePx > touchSlopPx.toFloat()) {
-            return TranslationLockGestureDecision(
-                outcome = TranslationLockGestureOutcome.BLOCKED,
-                reason = "move"
-            )
-        }
-        if (durationMs > tapTimeoutMs) {
-            return TranslationLockGestureDecision(
-                outcome = TranslationLockGestureOutcome.BLOCKED,
-                reason = "hold"
-            )
-        }
+        // 译文锁定层用于防止误触；单指任何手势（点击/滑动/长按）都应直接释放锁定，
+        // 避免用户在模拟器/阅读器里翻页时感觉“译点不动”。
         return TranslationLockGestureDecision(
             outcome = TranslationLockGestureOutcome.RELEASE,
-            reason = "tap"
+            reason = if (maxDistancePx <= touchSlopPx.toFloat() && durationMs <= tapTimeoutMs) "tap" else "touch"
         )
     }
 }

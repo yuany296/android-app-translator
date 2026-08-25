@@ -1,4 +1,4 @@
-﻿package com.manga.translator.store
+package com.manga.translator.store
 
 data class AppSettings(
     val sourceLanguage: String = AppLanguage.ENGLISH.id,
@@ -16,5 +16,7 @@ data class AppSettings(
     val enabled: Boolean = true,
     val ignoreSimplifiedChinese: Boolean = false,
     val enableThinking: Boolean = false,
-    val thinkingBudget: Int = 8192
+    val thinkingBudget: Int = 8192,
+    val ocrEngine: String = OcrEngine.ML_KIT.id,
+    val translateEngine: String = TranslateEngine.CLOUD.id
 )

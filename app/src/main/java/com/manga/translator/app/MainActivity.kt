@@ -1,4 +1,4 @@
-﻿package com.manga.translator.app
+package com.manga.translator.app
 
 import android.Manifest
 import android.app.Activity
@@ -82,6 +82,8 @@ import com.manga.translator.store.AiProvider
 import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.GlossaryEntry
+import com.manga.translator.store.OcrEngine
+import com.manga.translator.store.TranslateEngine
 import com.manga.translator.store.RenameProfileResult
 import com.manga.translator.store.TranslationHistoryEntry
 import kotlinx.coroutines.Dispatchers
@@ -167,6 +169,8 @@ private fun SimpleConfigScreen(
 
     fun loadProfile(name: String) {
         val profile = repo.getProfile(name) ?: return
+        repo.setLastTranslateProfileName(name)
+        onSave(profile)
         applySettings(profile, name)
     }
 
@@ -720,9 +724,9 @@ class MainActivity : ComponentActivity() {
                                     onOpenOverlayPermission = { openOverlayPermissionPage() },
                                     onStart = { startCaptureFlow() },
                                     onStop = { stopService(Intent(this@MainActivity, CaptureForegroundService::class.java)) },
-                                    onClearCache = {
-                                        ServiceLocator.ocrCacheRepository.clearAll()
-                                        toast("OCR 缓存已清空")
+onClearCache = {
+                                        ServiceLocator.sentenceTranslationRepository.clear()
+                                        toast("翻译缓存已清空")
                                     }
                                 )
                             }
@@ -978,10 +982,20 @@ private fun LauncherScreen(
         Text(text = "安卓漫画翻译器", style = MaterialTheme.typography.titleLarge)
         Spacer(modifier = Modifier.height(12.dp))
 
-        LanguageSelectorRow(
+LanguageSelectorRow(
             label = "源语言（OCR 识别）",
             selected = AppLanguage.fromId(settings.sourceLanguage),
             onSelected = { onSettingsChange(settings.copy(sourceLanguage = it.id)) }
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        OcrEngineSelectorRow(
+            selected = OcrEngine.fromId(settings.ocrEngine),
+            onSelected = { onSettingsChange(settings.copy(ocrEngine = it.id)) }
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        TranslateEngineSelectorRow(
+            selected = TranslateEngine.fromId(settings.translateEngine),
+            onSelected = { onSettingsChange(settings.copy(translateEngine = it.id)) }
         )
         Spacer(modifier = Modifier.height(10.dp))
         LanguageSelectorRow(
@@ -998,6 +1012,82 @@ private fun LauncherScreen(
         Button(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("停止服务") }
         Spacer(modifier = Modifier.height(8.dp))
         Button(onClick = onClearCache, modifier = Modifier.fillMaxWidth()) { Text("清空 OCR 缓存") }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OcrEngineSelectorRow(
+    selected: OcrEngine,
+    onSelected: (OcrEngine) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded }
+    ) {
+        OutlinedTextField(
+            value = selected.label,
+            onValueChange = {},
+            label = { Text("OCR 引擎（本地识别）") },
+            readOnly = true,
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth()
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            OcrEngine.entries.forEach { item ->
+                DropdownMenuItem(
+                    text = { Text(item.label) },
+                    onClick = {
+                        expanded = false
+                        onSelected(item)
+                    }
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TranslateEngineSelectorRow(
+    selected: TranslateEngine,
+    onSelected: (TranslateEngine) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded }
+    ) {
+        OutlinedTextField(
+            value = selected.label,
+            onValueChange = {},
+            label = { Text("翻译引擎") },
+            readOnly = true,
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth()
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            TranslateEngine.entries.forEach { item ->
+                DropdownMenuItem(
+                    text = { Text(item.label) },
+                    onClick = {
+                        expanded = false
+                        onSelected(item)
+                    }
+                )
+            }
+        }
     }
 }
 

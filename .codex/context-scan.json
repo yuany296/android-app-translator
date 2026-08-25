@@ -1,0 +1,50 @@
+{
+  "date": "2026-03-27",
+  "executor": "Codex",
+  "location": {
+    "primary": "core-translate/src/main/java/com/manga/translator/translate/OpenAiVisionClient.kt",
+    "model": "core-translate/src/main/java/com/manga/translator/translate/Models.kt",
+    "module_build": "core-translate/build.gradle.kts"
+  },
+  "current_state": {
+    "baidu_parse": "百度 OCR 结果先解析 words_result，再尝试使用 paragraphs_result 生成段落气泡；若段落为空则退回行级气泡。",
+    "merge_flow": "lineBubbles -> buildBaiduParagraphBubbles -> mergeNearbyBaiduBubbles -> dedupeHighlyOverlappingBubbles",
+    "merge_logic": "shouldMergeBaiduBubbles 依赖布局方向一致、近列/近堆叠/横排近邻阈值、union area 与中心距离约束。",
+    "layout_merge": "mergeBaiduBubbleGroup 通过 verticalCount 决定合并后的排序方式与 layout。"
+  },
+  "similar_cases": [
+    "OpenAiVisionClient.kt 中现有的 nearHorizontalLines / nearHorizontalInline 逻辑，可作为阈值风格参考。",
+    "core-overlay/src/test/java/com/manga/translator/overlay/TranslationLockGesturePolicyTest.kt 展示了当前仓库的 JUnit4 单测风格。"
+  ],
+  "tech_stack": {
+    "language": "Kotlin",
+    "framework": "Android Library",
+    "test_style": "JUnit4 本地单元测试",
+    "dependencies": [
+      "androidx.core:core-ktx",
+      "okhttp",
+      "ML Kit OCR"
+    ]
+  },
+  "tests": {
+    "existing": "core-translate 当前无 src/test，且未声明 testImplementation。",
+    "planned": "新增 JUnit4 单测，通过反射验证 shouldMergeBaiduBubbles 与 mergeBaiduBubbleGroup 的关键行为。"
+  },
+  "observations": {
+    "anomalies": [
+      "PowerShell 环境下 rg.exe 不可执行，已降级为 Get-ChildItem/Select-String。",
+      "当前工具集中未提供 code-index 与 shrimp-task-manager，改用 shell 检索与 update_plan 记录计划。"
+    ],
+    "focus_areas": [
+      "避免竖排放宽后误把横排相邻文本错误合并。",
+      "确保合并后 vertical layout 不因整体包围框变宽而降级为 horizontal。",
+      "补充足够日志，便于后续根据 logcat 调参。"
+    ]
+  },
+  "sufficiency_check": {
+    "interface_contract": true,
+    "technical_rationale": true,
+    "main_risks_identified": true,
+    "verification_plan_known": true
+  }
+}

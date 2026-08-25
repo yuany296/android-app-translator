@@ -1,4 +1,4 @@
-﻿package com.manga.translator.store
+package com.manga.translator.store
 
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -37,7 +37,9 @@ class SettingsRepository(context: Context) {
             enabled = prefs.getBoolean(KEY_ENABLED, true),
             ignoreSimplifiedChinese = prefs.getBoolean(KEY_IGNORE_SIMPLIFIED, false),
             enableThinking = prefs.getBoolean(KEY_ENABLE_THINKING, false),
-            thinkingBudget = prefs.getInt(KEY_THINKING_BUDGET, DEFAULT_THINKING_BUDGET)
+            thinkingBudget = prefs.getInt(KEY_THINKING_BUDGET, DEFAULT_THINKING_BUDGET),
+            ocrEngine = OcrEngine.fromId(prefs.getString(KEY_OCR_ENGINE, OcrEngine.ML_KIT.id).orEmpty()).id,
+            translateEngine = TranslateEngine.fromId(prefs.getString(KEY_TRANSLATE_ENGINE, TranslateEngine.CLOUD.id).orEmpty()).id
         )
     }
 
@@ -62,6 +64,8 @@ class SettingsRepository(context: Context) {
             .putBoolean(KEY_IGNORE_SIMPLIFIED, settings.ignoreSimplifiedChinese)
             .putBoolean(KEY_ENABLE_THINKING, settings.enableThinking)
             .putInt(KEY_THINKING_BUDGET, settings.thinkingBudget.coerceIn(1024, 131072))
+            .putString(KEY_OCR_ENGINE, OcrEngine.fromId(settings.ocrEngine).id)
+            .putString(KEY_TRANSLATE_ENGINE, TranslateEngine.fromId(settings.translateEngine).id)
             .apply()
     }
 
@@ -228,6 +232,8 @@ class SettingsRepository(context: Context) {
             .put("ignoreSimplifiedChinese", settings.ignoreSimplifiedChinese)
             .put("enableThinking", settings.enableThinking)
             .put("thinkingBudget", settings.thinkingBudget.coerceIn(1024, 131072))
+            .put("ocrEngine", OcrEngine.fromId(settings.ocrEngine).id)
+            .put("translateEngine", TranslateEngine.fromId(settings.translateEngine).id)
     }
 
     private fun jsonToSettings(json: JSONObject): AppSettings {
@@ -249,7 +255,9 @@ class SettingsRepository(context: Context) {
             enabled = json.optBoolean("enabled", true),
             ignoreSimplifiedChinese = json.optBoolean("ignoreSimplifiedChinese", false),
             enableThinking = json.optBoolean("enableThinking", false),
-            thinkingBudget = json.optInt("thinkingBudget", DEFAULT_THINKING_BUDGET).coerceIn(1024, 131072)
+            thinkingBudget = json.optInt("thinkingBudget", DEFAULT_THINKING_BUDGET).coerceIn(1024, 131072),
+            ocrEngine = OcrEngine.fromId(json.optString("ocrEngine", OcrEngine.ML_KIT.id)).id,
+            translateEngine = TranslateEngine.fromId(json.optString("translateEngine", TranslateEngine.CLOUD.id)).id
         )
     }
 
@@ -279,6 +287,8 @@ class SettingsRepository(context: Context) {
         const val KEY_LAST_TRANSLATE_PROFILE_NAME = "last_translate_profile_name"
         const val KEY_BAIDU_OCR_MONTH = "baidu_ocr_month"
         const val KEY_BAIDU_OCR_MONTH_COUNT = "baidu_ocr_month_count"
+        const val KEY_OCR_ENGINE = "ocr_engine"
+        const val KEY_TRANSLATE_ENGINE = "translate_engine"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }

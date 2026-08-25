@@ -1,4 +1,4 @@
-﻿package com.manga.translator.app
+package com.manga.translator.app
 
 import android.graphics.Bitmap
 import android.graphics.Rect
@@ -14,6 +14,7 @@ import com.manga.translator.overlay.OverlayRenderConfig
 import com.manga.translator.overlay.WritableAreaRefiner
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.PageOverlayAdjustment
+import com.manga.translator.store.TranslationHistoryEntry
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.BubbleGeometry
 import com.manga.translator.translate.BubbleMergeHeuristics
@@ -24,6 +25,9 @@ import com.manga.translator.translate.TextBlock
 import com.manga.translator.translate.TranslationResult
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -63,36 +67,28 @@ class TranslateOrchestrator(
         }
         overlayController.setRenderViewport(bitmap.width, bitmap.height)
         val pageHash = withContext(ioDispatcher) { ServiceLocator.eraseProcessor.buildPageHash(bitmap) }
-        val baselineHash = try {
-            FrameHash.centerDHash(bitmap)
-        } catch (_: Throwable) {
-            null
+        val baselineHash = withContext(ioDispatcher) {
+            try {
+                FrameHash.centerDHash(bitmap)
+            } catch (_: Throwable) {
+                null
+            }
         }
 
-        val dataUrl = captureController.toJpegDataUrl(bitmap = bitmap, quality = 75, maxWidth = 1024)
-        timer.mark("compress_done", "payload_kb=${(dataUrl.length * 3L / 4L) / 1024L}")
+        onStageChanged?.invoke(FloatingState.TRANSLATING)
 
-onStageChanged?.invoke(FloatingState.TRANSLATING)
-
-        val ocrCacheKey = buildOcrCacheKey(dataUrl = dataUrl, settings = settings)
-        val ocrCached = ServiceLocator.ocrCacheRepository.get(ocrCacheKey)
-        val ocrResult = if (!ocrCached.isNullOrBlank()) {
-            timer.mark("ocr_cache", "hit=true")
-            parseCachedResult(ocrCached)
-        } else {
-            try {
-                detectBubblesBubbleFirst(
-                    bitmap = bitmap,
-                    settings = settings,
-                    timer = timer
-                ).also {
-                    timer.mark("ocr_response", "bubbles=${it.bubbles.size}")
-                    ServiceLocator.ocrCacheRepository.put(ocrCacheKey, serializeOcrResult(it))
-                }
-            } catch (err: Throwable) {
-                timer.mark("response_fail", "stage=ocr reason=${err.message?.take(80)}")
-                throw err
+        // 截图内容随时间变化（状态栏时钟等），OCR 结果不做持久缓存，每次都重新识别。
+        val ocrResult = try {
+            detectBubblesBubbleFirst(
+                bitmap = bitmap,
+                settings = settings,
+                timer = timer
+            ).also {
+                timer.mark("ocr_response", "bubbles=${it.bubbles.size}")
             }
+        } catch (err: Throwable) {
+            timer.mark("response_fail", "stage=ocr reason=${err.message?.take(80)}")
+            throw err
         }
 
         if (ocrResult.bubbles.isEmpty()) {
@@ -100,6 +96,18 @@ onStageChanged?.invoke(FloatingState.TRANSLATING)
             overlayController.clearTranslationLayer()
             timer.mark("render_done", "bubbles=0")
             return RunOnceOutcome(hasOverlay = false, baselineHash = null, warningMessage = null)
+        }
+
+        // 擦除/颜色/布局计算只依赖气泡与截图，与翻译请求并行，减少总等待时间
+        val prepDeferred = coroutineScope {
+            async(ioDispatcher) {
+                prepareVisuals(
+                    result = ocrResult,
+                    screenshotBitmap = bitmap,
+                    pageHash = pageHash,
+                    timer = timer
+                )
+            }
         }
 
         val glossaryEntries = ServiceLocator.glossaryRepository.activeGlossaryEntries()
@@ -110,7 +118,12 @@ onStageChanged?.invoke(FloatingState.TRANSLATING)
         )
 
         var warningMessage: String? = null
-        val mergedResult = if (settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()) {
+        var cacheStats = TranslationCacheStats(0, 0, 0, 0, 0)
+        val useLocalEngine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine) ==
+            com.manga.translator.store.TranslateEngine.ML_KIT &&
+            ServiceLocator.localTranslator.isSupported(settings.sourceLanguage, settings.targetLanguage)
+        val missingCloudConfig = settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()
+        val mergedResult = if (missingCloudConfig && !useLocalEngine) {
             warningMessage = "仅OCR（未配置翻译API）"
             timer.mark("translate_response", "skipped=missing_translate_api")
             TranslationResult(
@@ -119,70 +132,220 @@ onStageChanged?.invoke(FloatingState.TRANSLATING)
                 }
             )
         } else {
-            val historyHit = ServiceLocator.translationHistoryRepository.findByFingerprint(translateKey)
-            if (historyHit != null) {
-                timer.mark("translate_response", "history_hit=true")
-                val saved = parseCachedResult(historyHit.bubblesJson)
+            resolveTranslations(
+                bubbles = ocrResult.bubbles,
+                settings = settings,
+                translateKey = translateKey,
+                pageHash = pageHash,
+                glossaryEntries = glossaryEntries,
+                timer = timer
+            ).let { outcome ->
+                warningMessage = outcome.warningMessage
+                cacheStats = outcome.cacheStats
+                outcome.result
+            }
+        }
+
+        val prep = prepDeferred.await()
+        return renderAndBuildOutcome(
+            mergedResult,
+            baselineHash,
+            timer,
+            bitmap,
+            pageHash,
+            warningMessage,
+            prep,
+            cacheStats
+        )
+    }
+
+    private suspend fun resolveTranslations(
+        bubbles: List<Bubble>,
+        settings: com.manga.translator.store.AppSettings,
+        translateKey: String,
+        pageHash: String,
+        glossaryEntries: List<com.manga.translator.store.GlossaryEntry>,
+        timer: TranslationTimer
+    ): TranslationOutcome {
+        val sentenceRepo = ServiceLocator.sentenceTranslationRepository
+        val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
+            val map = hashMapOf<String, String>()
+            val miss = mutableListOf<Bubble>()
+            var exactHits = 0
+            var compactHits = 0
+            var fuzzyHits = 0
+            var skipped = 0
+            bubbles.forEach { bubble ->
+                val original = bubble.originalText
+                if (isNonTranslatableText(original)) {
+                    // URL 片段/纯噪声字符不调用 LLM，原样展示且不入缓存。
+                    map[original] = original
+                    skipped += 1
+                    return@forEach
+                }
+                val lookup = sentenceRepo.lookup(settings.sourceLanguage, settings.targetLanguage, original)
+                when (lookup.matchKind) {
+                    com.manga.translator.store.SentenceCacheMatchKind.EXACT -> {
+                        map[original] = lookup.translatedText!!
+                        exactHits += 1
+                    }
+
+                    com.manga.translator.store.SentenceCacheMatchKind.COMPACT -> {
+                        map[original] = lookup.translatedText!!
+                        compactHits += 1
+                    }
+
+                    com.manga.translator.store.SentenceCacheMatchKind.FUZZY -> {
+                        map[original] = lookup.translatedText!!
+                        fuzzyHits += 1
+                    }
+
+                    null -> miss += bubble
+                }
+            }
+            Triple(
+                map,
+                miss,
+                TranslationCacheStats(exactHits, compactHits, fuzzyHits, skipped, bubbles.size)
+            )
+        }
+        timer.mark(
+            "sentence_cache",
+            "exact=${cacheStats.exact} compact=${cacheStats.compact} fuzzy=${cacheStats.fuzzy} " +
+                "skipped=${cacheStats.skipped} missing=${missing.size} total=${cacheStats.total}"
+        )
+        if (missing.isEmpty()) {
+            timer.mark("translate_response", "sentence_cache_hit=true cached=${translatedByOriginal.size}")
+            return TranslationOutcome(
+                result = TranslationResult(
+                    bubbles.map { bubble ->
+                        bubble.copy(translatedText = translatedByOriginal[bubble.originalText] ?: bubble.originalText)
+                    }
+                ),
+                warningMessage = null,
+                cacheStats = cacheStats
+            )
+        }
+
+        val fresh = runCatching {
+            timer.mark("request_send", "stage=translate missing=${missing.size} total=${bubbles.size}")
+            val translated = withContext(ioDispatcher) {
+                translateMissing(
+                    settings = settings,
+                    texts = missing.map { it.originalText.replace(Regex("\\s+"), " ").trim() },
+                    glossaryEntries = glossaryEntries,
+                    timer = timer
+                )
+            }
+            timer.mark("response_ok", "stage=translate count=${translated.size}")
+            timer.mark("translate_response", "count=${translated.size}")
+            val result = withContext(ioDispatcher) {
+                missing.forEachIndexed { index, bubble ->
+                    // 译文归一化空白（\n/多余空格→单空格），避免 LLM 返回的换行
+                    // 残留到渲染显示（如「超越……留下深刻印象\n以至于」）。
+                    val value = translated.getOrElse(index) { bubble.originalText }
+                        .ifBlank { bubble.originalText }
+                        .replace(Regex("\\s+"), " ").trim()
+                    translatedByOriginal[bubble.originalText] = value
+                    sentenceRepo.put(settings.sourceLanguage, settings.targetLanguage, bubble.originalText, value)
+                }
                 TranslationResult(
-                    ocrResult.bubbles.mapIndexed { index, bubble ->
-                        bubble.copy(
-                            translatedText = saved.bubbles.getOrNull(index)
-                                ?.translatedText
-                                ?.ifBlank { bubble.originalText }
-                                ?: bubble.originalText
-                        )
+                    bubbles.map { bubble ->
+                        bubble.copy(translatedText = translatedByOriginal[bubble.originalText] ?: bubble.originalText)
                     }
                 )
-            } else {
+            }
+            // 历史记录仅用于展示：异步写入并隔离失败，绝不能影响翻译结果或缓存读取。
+            val historySnapshot = result
+            ServiceLocator.appScope.launch {
                 runCatching {
-                    timer.mark("request_send", "stage=translate")
-                    val translated = withContext(ioDispatcher) {
-                        ServiceLocator.visionClient.translateTexts(
-                            provider = settings.translateProvider,
-                            baseUrl = settings.translateBaseUrl,
-                            model = settings.translateModel,
-                            apiKey = settings.translateApiKey,
-                            texts = ocrResult.bubbles.map { it.originalText },
-                            targetLanguageId = settings.targetLanguage,
-                            enableThinking = settings.enableThinking,
-                            thinkingBudget = settings.thinkingBudget,
-                            glossary = glossaryEntries.map { it.source to it.target }
-                        )
-                    }
-                    timer.mark("response_ok", "stage=translate count=${translated.size}")
-                    timer.mark("translate_response", "count=${translated.size}")
-                    val result = TranslationResult(
-                        ocrResult.bubbles.mapIndexed { index, bubble ->
-                            bubble.copy(translatedText = translated.getOrElse(index) { bubble.originalText }.ifBlank { bubble.originalText })
-                        }
-                    )
                     val now = System.currentTimeMillis()
                     ServiceLocator.translationHistoryRepository.add(
-                        com.manga.translator.store.TranslationHistoryEntry(
+                        TranslationHistoryEntry(
                             id = "h${now}_${translateKey.take(8)}",
                             timestampMs = now,
                             pageHash = pageHash,
                             sourceLanguage = settings.sourceLanguage,
                             targetLanguage = settings.targetLanguage,
                             translateFingerprint = translateKey,
-                            bubblesJson = serializeResult(result)
+                            bubblesJson = serializeResult(historySnapshot)
                         )
-                    )
-                    result
-                }.getOrElse { err ->
-                    timer.mark("response_fail", "stage=translate reason=${err.message?.take(80)}")
-                    warningMessage = "翻译失败，已显示原文"
-                    timer.mark("translate_response", "failed=${err.message?.take(80)}")
-                    TranslationResult(
-                        ocrResult.bubbles.map { bubble ->
-                            bubble.copy(translatedText = bubble.originalText)
-                        }
                     )
                 }
             }
+            TranslationOutcome(result = result, warningMessage = null, cacheStats = cacheStats)
+        }.getOrElse { err ->
+            timer.mark("response_fail", "stage=translate reason=${err.message?.take(80)}")
+            timer.mark("translate_response", "failed=${err.message?.take(80)}")
+            TranslationOutcome(
+                result = TranslationResult(
+                    bubbles.map { bubble ->
+                        bubble.copy(translatedText = bubble.originalText)
+                    }
+                ),
+                warningMessage = "翻译失败，已显示原文",
+                cacheStats = cacheStats
+            )
+        }
+        return fresh
+    }
+
+    private suspend fun translateMissing(
+        settings: com.manga.translator.store.AppSettings,
+        texts: List<String>,
+        glossaryEntries: List<com.manga.translator.store.GlossaryEntry>,
+        timer: TranslationTimer
+    ): List<String> {
+        // 本地引擎优先：离线、无网络往返，显著提速；失败则回退云端。
+        val engine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine)
+        if (engine == com.manga.translator.store.TranslateEngine.ML_KIT) {
+            val local = ServiceLocator.localTranslator
+            if (local.isSupported(settings.sourceLanguage, settings.targetLanguage)) {
+                runCatching {
+                    local.translate(texts, settings.sourceLanguage, settings.targetLanguage)
+                }.onSuccess { result ->
+                    if (result.size == texts.size) {
+                        timer.mark("translate_local", "ok=mlkit count=${result.size} engine=${engine.label}")
+                        return result
+                    }
+                }.onFailure { err ->
+                    timer.mark("translate_local_fallback", "reason=${err.message?.take(80)}")
+                }
+            } else {
+                timer.mark("translate_local_skip", "reason=unsupported_pair ${settings.sourceLanguage}->${settings.targetLanguage}")
+            }
         }
 
-        return renderAndBuildOutcome(mergedResult, baselineHash, timer, bitmap, pageHash, warningMessage)
+        // 云端回退：本地引擎不存在/不支持/失败时走 OpenAI 兼容 API。
+        // 未配置云端 API 时直接回显原文（此时上游会给出对应提示）。
+        if (settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()) {
+            timer.mark("translate_response", "skipped=missing_translate_api")
+            return texts
+        }
+        timer.mark("request_send", "stage=translate mode=cloud count=${texts.size}")
+        return ServiceLocator.visionClient.translateTexts(
+            provider = settings.translateProvider,
+            baseUrl = settings.translateBaseUrl,
+            model = settings.translateModel,
+            apiKey = settings.translateApiKey,
+            texts = texts,
+            targetLanguageId = settings.targetLanguage,
+            enableThinking = settings.enableThinking,
+            thinkingBudget = settings.thinkingBudget,
+            glossary = glossaryEntries.map { it.source to it.target }
+        )
+    }
+
+    private fun isNonTranslatableText(text: String): Boolean {
+        val compact = text.filterNot { it.isWhitespace() }.lowercase()
+        if (compact.isEmpty()) return false
+        if (compact.contains("http") || compact.contains("www.") ||
+            compact.contains(".com") || compact.contains(".net") || compact.contains(".org")
+        ) {
+            return true
+        }
+        if (compact.length <= 4 && compact.all { it == compact[0] }) return true
+        return false
     }
 
     private suspend fun detectBubblesBubbleFirst(
@@ -191,17 +354,22 @@ onStageChanged?.invoke(FloatingState.TRANSLATING)
         timer: TranslationTimer
     ): TranslationResult {
         timer.mark("request_send", "stage=ocr mode=bubble_first provider=local")
-        val bubbleRegions = withContext(ioDispatcher) {
-            ServiceLocator.bubbleRegionDetector.detect(bitmap)
+        // 区域检测与整页 OCR 互不依赖，并行执行省去串行等待。
+        val (bubbleRegions, structureBlocks) = coroutineScope {
+            val regions = async(ioDispatcher) {
+                ServiceLocator.bubbleRegionDetector.detect(bitmap)
+            }
+            val blocks = async(ioDispatcher) {
+                detectStructureBlocks(
+                    bitmap = bitmap,
+                    settings = settings,
+                    timer = timer
+                )
+            }
+            regions.await() to blocks.await()
         }
         timer.mark("bubble_region_stats", "detected=${bubbleRegions.size}")
         val separatedByWhitespace = buildWhitespaceSeparatorDetector(bitmap)
-
-        val structureBlocks = detectStructureBlocks(
-            bitmap = bitmap,
-            settings = settings,
-            timer = timer
-        )
         val routing = bubbleFirstRegionPlanner.route(
             bubbleRegions = bubbleRegions,
             textBlocks = structureBlocks,
@@ -504,30 +672,47 @@ onStageChanged?.invoke(FloatingState.TRANSLATING)
         }
     }
 
-    private suspend fun renderAndBuildOutcome(
-        result: TranslationResult,
-        baselineHash: Long?,
-        timer: TranslationTimer,
-        screenshotBitmap: android.graphics.Bitmap,
-        pageHash: String,
-        warningMessage: String?
-    ): RunOnceOutcome {
-        if (result.bubbles.isEmpty()) {
-            screenshotBitmap.recycle()
-            overlayController.clearTranslationLayer()
-            timer.mark("render_done", "bubbles=0")
-            return RunOnceOutcome(hasOverlay = false, baselineHash = null, warningMessage = warningMessage)
-        }
+private data class VisualPrep(
+        val erasePatches: List<com.manga.translator.overlay.erase.ErasePatch>,
+        val bubbleRenderRects: Map<Int, RectF>,
+        val bubbleContentRects: Map<Int, RectF>,
+        val bubbleColors: Map<Int, com.manga.translator.overlay.BubbleColors>
+    )
 
-        val totalChars = totalEffectiveChars(result.bubbles)
-        val denseMode = shouldUseDenseMode(result.bubbles.size, totalChars)
-val sourcePatches = withContext(ioDispatcher) {
-            ServiceLocator.eraseProcessor.erasePage(
-                source = screenshotBitmap,
-                bubbles = result.bubbles,
-                pageHash = pageHash,
-                policy = EraseStrategyPolicy.FAST_ONLY
-            ) { tag, extra -> timer.mark(tag, extra) }
+    private suspend fun prepareVisuals(
+        result: TranslationResult,
+        screenshotBitmap: Bitmap,
+        pageHash: String,
+        timer: TranslationTimer
+    ): VisualPrep {
+        // 有非 solid（旁白/透明文字块）时构建整页清理图：inpaint 去字原图按气泡位置裁切贴回，
+        // 纹理来自原图背景，观感对齐参考项目 local-ocr-service 的 cleanedImage。
+        val needsCleanedImage = result.bubbles.any { !it.bgType.equals("solid", ignoreCase = true) }
+        val cleanedImage = if (needsCleanedImage) {
+            ServiceLocator.cleanedImageProcessor.buildCleanedImage(screenshotBitmap, result.bubbles, pageHash)
+        } else {
+            null
+        }
+        timer.mark(
+            "cleaned_image",
+            if (cleanedImage != null) {
+                "built=${cleanedImage.width}x${cleanedImage.height}"
+            } else if (needsCleanedImage) {
+                "skipped=build_failed"
+            } else {
+                "skipped=all_solid"
+            }
+        )
+        val sourcePatches = ServiceLocator.eraseProcessor.erasePage(
+            source = screenshotBitmap,
+            bubbles = result.bubbles,
+            pageHash = pageHash,
+            policy = EraseStrategyPolicy.OPENCV_WHEN_AVAILABLE,
+            onPerf = { tag, extra -> timer.mark(tag, extra) },
+            cleanedImage = cleanedImage
+        )
+        if (cleanedImage != null && !cleanedImage.isRecycled) {
+            cleanedImage.recycle()
         }
         val (viewportWidth, viewportHeight) = overlayController.getRenderViewport()
         val bubbleRenderRects = result.bubbles.mapIndexed { index, bubble ->
@@ -585,23 +770,50 @@ val sourcePatches = withContext(ioDispatcher) {
                 )
             )
         }
-timer.mark("erase_patch_count", "count=${erasePatches.size}")
+        timer.mark("erase_patch_count", "count=${erasePatches.size}")
         val bubbleColors = result.bubbles.mapIndexed { index, bubble ->
             index to ServiceLocator.bubbleColorExtractor.extract(screenshotBitmap, bubble)
         }.toMap()
         timer.mark("bubble_colors", "count=${bubbleColors.size}")
+        return VisualPrep(
+            erasePatches = erasePatches,
+            bubbleRenderRects = bubbleRenderRects,
+            bubbleContentRects = bubbleContentRects,
+            bubbleColors = bubbleColors
+        )
+    }
+
+    private suspend fun renderAndBuildOutcome(
+        result: TranslationResult,
+        baselineHash: Long?,
+        timer: TranslationTimer,
+        screenshotBitmap: android.graphics.Bitmap,
+        pageHash: String,
+        warningMessage: String?,
+        prep: VisualPrep,
+        cacheStats: TranslationCacheStats = TranslationCacheStats(0, 0, 0, 0, 0)
+    ): RunOnceOutcome {
+        if (result.bubbles.isEmpty()) {
+            screenshotBitmap.recycle()
+            overlayController.clearTranslationLayer()
+            timer.mark("render_done", "bubbles=0")
+            return RunOnceOutcome(hasOverlay = false, baselineHash = null, warningMessage = warningMessage)
+        }
+
+        val totalChars = totalEffectiveChars(result.bubbles)
+        val denseMode = shouldUseDenseMode(result.bubbles.size, totalChars)
         if (!screenshotBitmap.isRecycled) {
             screenshotBitmap.recycle()
         }
 
         overlayController.renderBubbles(
             bubbles = result.bubbles,
-            renderConfig = OverlayRenderConfig(denseMode = denseMode, erasePolicy = EraseStrategyPolicy.FAST_ONLY),
-            erasePatches = erasePatches,
-            bubbleRenderRects = bubbleRenderRects,
-            bubbleContentRects = bubbleContentRects,
+            renderConfig = OverlayRenderConfig(denseMode = denseMode, erasePolicy = EraseStrategyPolicy.OPENCV_WHEN_AVAILABLE),
+            erasePatches = prep.erasePatches,
+            bubbleRenderRects = prep.bubbleRenderRects,
+            bubbleContentRects = prep.bubbleContentRects,
             pageHash = pageHash,
-            bubbleColors = bubbleColors,
+            bubbleColors = prep.bubbleColors,
             loadAdjustment = { p, key ->
                 ServiceLocator.pageOverlayAdjustmentRepository.get(p, key)
                     ?.let { BubbleAdjustment(it.offsetX, it.offsetY, it.fontScale, it.strokeScale) }
@@ -621,7 +833,13 @@ timer.mark("erase_patch_count", "count=${erasePatches.size}")
             onPerf = { tag, extra -> timer.mark(tag, extra) }
         )
         timer.mark("render_done", "bubbles=${result.bubbles.size},dense=$denseMode,total_chars=$totalChars")
-        return RunOnceOutcome(hasOverlay = true, baselineHash = baselineHash, warningMessage = warningMessage)
+        return RunOnceOutcome(
+            hasOverlay = true,
+            baselineHash = baselineHash,
+            warningMessage = warningMessage,
+            cacheHitCount = cacheStats.hitCount,
+            cacheTotalCount = cacheStats.total
+        )
     }
 
     private fun mapSourceToRenderRect(
@@ -858,34 +1076,19 @@ private suspend fun groupLocalBlocks(
         }
     }
 
-    private fun buildOcrCacheKey(dataUrl: String, settings: com.manga.translator.store.AppSettings): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val source = listOf(
-            "local_ocr_v2",
-            settings.sourceLanguage,
-            settings.ocrMode,
-            settings.ocrProvider,
-            settings.ocrBaseUrl,
-            settings.ocrModel,
-            settings.ocrApiKey,
-            settings.baiduOcrLanguage,
-            settings.ignoreSimplifiedChinese.toString(),
-            dataUrl.take(1024),
-            dataUrl.length.toString()
-        ).joinToString("|")
-        val bytes = digest.digest(source.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
-    }
-
     private fun buildTranslateKey(
         texts: List<String>,
         settings: com.manga.translator.store.AppSettings,
         glossaryRevision: Int
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
+        val normalizedTexts = texts
+            .map { it.trim().replace(Regex("\\s+"), " ") }
+            .filter { it.isNotEmpty() }
+            .sorted()
         val source = listOf(
-            "translate_v1",
-            texts.joinToString("\u0001"),
+            "translate_v2",
+            normalizedTexts.joinToString("\u0001"),
             settings.targetLanguage,
             settings.translateProvider,
             settings.translateBaseUrl,
@@ -899,29 +1102,7 @@ private suspend fun groupLocalBlocks(
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
-    private fun serializeOcrResult(result: TranslationResult): String {
-        val array = JSONArray()
-        result.bubbles.forEach { bubble ->
-            array.put(
-                JSONObject()
-                    .put("x", bubble.x)
-                    .put("y", bubble.y)
-                    .put("w", bubble.w)
-                    .put("h", bubble.h)
-                    .put("contentX", bubble.contentX)
-                    .put("contentY", bubble.contentY)
-                    .put("contentW", bubble.contentW)
-                    .put("contentH", bubble.contentH)
-                    .put("bgType", bubble.bgType)
-                    .put("originalText", bubble.originalText)
-                    .put("translatedText", "")
-                    .put("layout", bubble.layout)
-            )
-        }
-        return JSONObject().put("bubbles", array).toString()
-    }
-
-    private fun serializeResult(result: TranslationResult): String {
+private fun serializeResult(result: TranslationResult): String {
         val array = JSONArray()
         result.bubbles.forEach { bubble ->
             array.put(
@@ -940,34 +1121,7 @@ private suspend fun groupLocalBlocks(
                     .put("layout", bubble.layout)
             )
         }
-        return JSONObject().put("bubbles", array).toString()
-    }
-
-    private fun parseCachedResult(raw: String): TranslationResult {
-        if (raw.isBlank()) return TranslationResult(emptyList())
-        return runCatching {
-            val root = JSONObject(raw)
-            val arr = root.optJSONArray("bubbles") ?: JSONArray()
-            val bubbles = mutableListOf<Bubble>()
-            for (index in 0 until arr.length()) {
-                val item = arr.optJSONObject(index) ?: continue
-                bubbles += Bubble(
-                    x = item.optDouble("x", 0.0).toFloat(),
-                    y = item.optDouble("y", 0.0).toFloat(),
-                    w = item.optDouble("w", 0.0).toFloat(),
-                    h = item.optDouble("h", 0.0).toFloat(),
-                    bgType = item.optString("bgType", "solid"),
-                    originalText = item.optString("originalText", ""),
-                    translatedText = item.optString("translatedText", ""),
-                    layout = item.optString("layout", "horizontal"),
-                    contentX = item.optDouble("contentX", item.optDouble("x", 0.0)).toFloat(),
-                    contentY = item.optDouble("contentY", item.optDouble("y", 0.0)).toFloat(),
-                    contentW = item.optDouble("contentW", item.optDouble("w", 0.0)).toFloat(),
-                    contentH = item.optDouble("contentH", item.optDouble("h", 0.0)).toFloat()
-                )
-            }
-            TranslationResult(bubbles)
-        }.getOrElse { TranslationResult(emptyList()) }
+return JSONObject().put("bubbles", array).toString()
     }
 
     companion object {
@@ -992,6 +1146,22 @@ private suspend fun groupLocalBlocks(
     }
 }
 
+private data class TranslationOutcome(
+    val result: TranslationResult,
+    val warningMessage: String?,
+    val cacheStats: TranslationCacheStats = TranslationCacheStats(0, 0, 0, 0, 0)
+)
+
+data class TranslationCacheStats(
+    val exact: Int,
+    val compact: Int,
+    val fuzzy: Int,
+    val skipped: Int,
+    val total: Int
+) {
+    val hitCount: Int get() = exact + compact + fuzzy
+}
+
 private data class BrightnessStats(
     val meanLuma: Float,
     val darkRatio: Float,
@@ -1002,6 +1172,8 @@ private data class BrightnessStats(
 data class RunOnceOutcome(
     val hasOverlay: Boolean,
     val baselineHash: Long?,
-    val warningMessage: String?
+    val warningMessage: String?,
+    val cacheHitCount: Int = 0,
+    val cacheTotalCount: Int = 0
 )
 

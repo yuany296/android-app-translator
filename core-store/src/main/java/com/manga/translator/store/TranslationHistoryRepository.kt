@@ -34,6 +34,15 @@ class TranslationHistoryRepository(context: Context) {
         }
     }
 
+    fun findByPageHash(pageHash: String): TranslationHistoryEntry? {
+        if (pageHash.isBlank()) return null
+        synchronized(lock) {
+            return loadAll()
+                .filter { it.pageHash == pageHash }
+                .maxByOrNull { it.timestampMs }
+        }
+    }
+
     fun add(entry: TranslationHistoryEntry) {
         synchronized(lock) {
             val entries = loadAll()

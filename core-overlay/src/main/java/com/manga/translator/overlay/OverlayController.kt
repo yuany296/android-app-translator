@@ -1,4 +1,4 @@
-﻿package com.manga.translator.overlay
+package com.manga.translator.overlay
 
 import android.animation.ObjectAnimator
 import android.content.Context
@@ -36,6 +36,7 @@ import kotlin.math.min
 class OverlayController(private val context: Context) {
     private val patchFillColor = Color.parseColor("#181818")
     private val patchStrokeColor = Color.parseColor("#E6E2DB")
+    private val backgroundFillRadius = 3f
     private var currentBubbleColors: Map<Int, BubbleColors> = emptyMap()
     private val floatingSizeDp = 40
     private val denseFontScale = 0.90f
@@ -58,6 +59,7 @@ private val minFitSp = 6f
     private var floatingStatusView: TextView? = null
     private var floatingStatusParams: WindowManager.LayoutParams? = null
     private var floatingPulseAnimator: ObjectAnimator? = null
+    private var statusHideRunnable: Runnable? = null
 
     private var translationLayer: FrameLayout? = null
     private var translationParams: WindowManager.LayoutParams? = null
@@ -77,6 +79,7 @@ private val minFitSp = 6f
 
     private var adjustTimeoutRunnable: Runnable? = null
     private var floatingCollapsed: Boolean = false
+    private var floatingEnabled: Boolean = true
     private var dockSide: DockSide = DockSide.RIGHT
     private var lastExpandedX: Int? = null
     private var lastExpandedY: Int? = null
@@ -100,6 +103,9 @@ private val minFitSp = 6f
             isClickable = true
             isFocusable = false
             setOnClickListener {
+                if (!floatingEnabled) {
+                    return@setOnClickListener
+                }
                 if (floatingCollapsed) {
                     setFloatingCollapsed(false)
                     return@setOnClickListener
@@ -149,6 +155,12 @@ private val minFitSp = 6f
                 }
             }
 
+            FloatingState.MODEL_LOADING -> {
+                stopPulse()
+                applyFloatingButtonColor(Color.parseColor("#8E8E8E"))
+                showStatus(message ?: "OCR模型加载中")
+            }
+
             FloatingState.CAPTURING -> {
                 startPulse()
                 applyFloatingButtonColor(Color.parseColor("#F57C00"))
@@ -165,6 +177,8 @@ private val minFitSp = 6f
                 stopPulse()
                 applyFloatingButtonColor(Color.parseColor("#2E7D32"))
                 showStatus(message ?: "完成")
+                // 完成态文案（如「完成·缓存x/y」）展示几秒后自动隐藏，避免长期停留在角落遮挡译文。
+                scheduleStatusAutoHide()
             }
 
             FloatingState.ERROR -> {
@@ -224,6 +238,29 @@ private val minFitSp = 6f
         if (collapsed) {
             Log.d("TranslationPerf", "floating_dock_state=collapsed side=$dockSide")
         }
+    }
+
+    /** 悬浮球可用/不可用切换：不可用时置半透明并忽略所有触摸（模型加载中）。 */
+    fun setFloatingEnabled(enabled: Boolean) {
+        if (floatingEnabled == enabled) return
+        floatingEnabled = enabled
+        floatingButton?.alpha = if (enabled) 1f else 0.45f
+    }
+
+    /**
+     * 把悬浮球窗口重新置顶：翻译层/锁定层添加后会盖住悬浮球，
+     * 导致翻译完成后第一次点击被锁定层吞掉（表现为“要点多几次才有反应”）。
+     * 通过移除后重新 addView，让悬浮球始终在翻译层之上、随时可点。
+     */
+    fun bringFloatingButtonToFront() {
+        val button = floatingButton ?: return
+        val params = floatingParams ?: return
+        if (button.parent != null) {
+            runCatching { windowManager.removeView(button) }
+        }
+        runCatching { windowManager.addView(button, params) }
+        clampFloatingPosition()
+        updateStatusPosition()
     }
 
     fun resetFloatingPosition() {
@@ -315,6 +352,7 @@ fun renderBubbles(
         this.lastRenderConfig = renderConfig
         applyLayerTouchMode()
         applyErasePatches(erasePatches)
+        val patchedBubbleIds = erasePatches.mapTo(hashSetOf()) { it.bubbleId }
 
         if (bubbles.isEmpty()) {
             return
@@ -330,10 +368,11 @@ fun renderBubbles(
         val ordered = bubbles.withIndex().sortedByDescending { it.value.w * it.value.h }
         val prepared = mutableListOf<PreparedBubble>()
 
-        var truncatedCount = 0
+var truncatedCount = 0
         var forcedSingleLineCount = 0
         var verticalNormalizedCount = 0
         var dialogueOpaqueCount = 0
+        var backgroundFallbackCount = 0
         var overlayShiftPxTotal = 0f
         val renderedTextSizes = mutableListOf<Float>()
         val layoutStartedAt = SystemClock.elapsedRealtime()
@@ -373,12 +412,14 @@ fun renderBubbles(
             val centerY = baseRect.centerY()
             val left = baseRect.left
             val top = baseRect.top
-            val isNarration = isNarrationBubble(bubble)
+val isNarration = isNarrationBubble(bubble)
             val isSolidPatched = bubble.bgType.equals("solid", ignoreCase = true)
             val key = "v2:${indexed.index}:${bubble.x}:${bubble.y}:${bubble.w}:${bubble.h}"
 
             val state = BubbleRenderState(key = key)
             bubbleStates[key] = state
+            state.bgType = bubble.bgType
+            state.hasErasePatch = patchedBubbleIds.contains(indexed.index)
 
             val densityScale = if (renderConfig.denseMode) denseFontScale else normalFontScale
             val verticalScale = if (useVerticalLayout) 1.08f else 1f
@@ -397,8 +438,11 @@ val tv = if (useVerticalLayout) {
                     text = normalizedTranslatedText
                     typeface = Typeface.SERIF
                     setTextColor(bubbleTextColor(indexed.index))
-                    setStroke(bubbleStrokeColor(indexed.index), naturalStrokeWidth(baseTextSp, baseStrokeDp))
-                    setBackgroundColor(Color.TRANSPARENT)
+                    setStroke(
+                        bubbleStrokeColor(indexed.index),
+                        if (!isSolidPatched) kakaopageStrokeWidthPx(baseTextSp) else 0f
+                    )
+                    setBackgroundColor(bubbleViewBackgroundFill(indexed.index, isSolidPatched, state.hasErasePatch))
                     gravity = Gravity.CENTER
                     setPadding(dp(1), dp(1), dp(1), dp(1))
                 }
@@ -407,8 +451,11 @@ val tv = if (useVerticalLayout) {
                     text = normalizedTranslatedText
                     typeface = Typeface.SERIF
                     setTextColor(bubbleTextColor(indexed.index))
-                    setStroke(bubbleStrokeColor(indexed.index), naturalStrokeWidth(baseTextSp, baseStrokeDp))
-                    setBackgroundColor(Color.TRANSPARENT)
+                    setStroke(
+                        bubbleStrokeColor(indexed.index),
+                        if (!isSolidPatched) kakaopageStrokeWidthPx(baseTextSp) else 0f
+                    )
+                    setBackgroundColor(bubbleViewBackgroundFill(indexed.index, isSolidPatched, state.hasErasePatch))
                     gravity = Gravity.CENTER
                     layoutDirection = View.LAYOUT_DIRECTION_LTR
                     textDirection = View.TEXT_DIRECTION_FIRST_STRONG_LTR
@@ -417,6 +464,9 @@ val tv = if (useVerticalLayout) {
             }
             if (!isNarration && !isSolidPatched) {
                 dialogueOpaqueCount++
+            }
+            if (!isSolidPatched || !state.hasErasePatch) {
+                backgroundFallbackCount++
             }
 
             val aspect = (boxW / boxH).coerceIn(0.6f, 1.8f)
@@ -623,8 +673,9 @@ val tv = if (useVerticalLayout) {
         Log.d(
             "TranslationPerf",
             "viewport_w=${screenW.toInt()} viewport_h=${screenH.toInt()} " +
-                "render_truncated_count=$truncatedCount render_forced_single_line_count=$forcedSingleLineCount " +
+"render_truncated_count=$truncatedCount render_forced_single_line_count=$forcedSingleLineCount " +
                 "vertical_normalized_count=$verticalNormalizedCount dialogue_opaque_count=$dialogueOpaqueCount " +
+                "background_fallback_count=$backgroundFallbackCount " +
                 "overlay_shift_px=${overlayShiftPxTotal.toInt()} total=${bubbles.size}"
         )
         if (renderedTextSizes.isNotEmpty()) {
@@ -640,6 +691,7 @@ val tv = if (useVerticalLayout) {
     }
 
     fun clearTranslationLayer() {
+        Log.d("OverlayController", "clear_translation_layer states=${bubbleStates.size} locked=$translationLocked")
         unlockTranslationLayer()
         clearErasePatches()
         translationLayer?.removeAllViews()
@@ -656,6 +708,7 @@ val tv = if (useVerticalLayout) {
         lockReleaseListener = onRelease
         ensureLockTapView(layer)
         applyLayerTouchMode()
+        Log.d("OverlayController", "translation_layer_locked")
     }
 
     fun unlockTranslationLayer() {
@@ -663,6 +716,7 @@ val tv = if (useVerticalLayout) {
         lockReleaseListener = null
         removeLockTapView()
         applyLayerTouchMode()
+        Log.d("OverlayController", "translation_layer_unlocked")
     }
 
     fun hideAll() {
@@ -864,12 +918,16 @@ val tv = if (useVerticalLayout) {
         view.setTextSize(TypedValue.COMPLEX_UNIT_SP, scaledText)
         view.setLineSpacing(0f, state.lineSpacingMultiplier.coerceIn(0.85f, 1f))
         view.setTextColor(bubbleTextColor(state.bubbleId))
+        // kakaopage：solid 气泡裸字不描边；旁白/无框文字（非 solid）才加白边。
+        val strokeWidth = if (isNarrationBg(state.bgType)) {
+            kakaopageStrokeWidthPx(scaledText)
+        } else {
+            0f
+        }
         if (view is StrokeTextView) {
-            val strokeWidth = naturalStrokeWidth(scaledText, state.baseStrokeDp * state.strokeScale)
             view.setStroke(bubbleStrokeColor(state.bubbleId), strokeWidth)
         }
         if (view is VerticalTextView) {
-            val strokeWidth = naturalStrokeWidth(scaledText, state.baseStrokeDp * state.strokeScale)
             view.setStroke(bubbleStrokeColor(state.bubbleId), strokeWidth)
         }
     }
@@ -880,6 +938,18 @@ val tv = if (useVerticalLayout) {
 
     private fun bubbleStrokeColor(index: Int): Int {
         return currentBubbleColors[index]?.strokeColor ?: patchStrokeColor
+    }
+
+    private fun bubbleBgColor(index: Int): Int {
+        return currentBubbleColors[index]?.bgColor ?: Color.WHITE
+    }
+
+    private fun bubbleViewBackgroundFill(index: Int, solid: Boolean, hasErasePatch: Boolean): Int {
+        // kakaopage 规则：只有 solid（有气泡底）才垫不透明采样背景盖住原文；
+        // 旁白/无框文字（非 solid）不给背景，文字直接压在画面上。
+        if (!solid) return Color.TRANSPARENT
+        if (solid && hasErasePatch) return Color.TRANSPARENT
+        return bubbleBgColor(index)
     }
 
     private fun buildBubbleLayoutParams(width: Int, height: Int, left: Int, top: Int): FrameLayout.LayoutParams {
@@ -904,7 +974,10 @@ val tv = if (useVerticalLayout) {
             textSizeSp = ((if (state.fittedTextSp > 0f) state.fittedTextSp else state.baseTextSp) * state.fontScale)
                 .coerceIn(minFitSp, maxFitSp),
             strokeDp = (state.baseStrokeDp * state.strokeScale).coerceAtLeast(0.6f),
-            lineSpacingMultiplier = state.lineSpacingMultiplier
+            lineSpacingMultiplier = state.lineSpacingMultiplier,
+            bgType = state.bgType,
+            bgColor = bubbleBgColor(state.bubbleId),
+            hasErasePatch = state.hasErasePatch
         )
     }
 
@@ -952,6 +1025,8 @@ val tv = if (useVerticalLayout) {
         windowManager.addView(layer, params)
         translationLayer = layer
         translationParams = params
+        // 翻译层添加后盖住悬浮球（锁定层会吞掉第一次点击），把悬浮球重新置顶。
+        bringFloatingButtonToFront()
     }
 
     private fun applyLayerTouchMode() {
@@ -1165,18 +1240,23 @@ private fun computeFontSp(boxHeightPx: Float): Float {
             drawVerticalPatchText(canvas, text, spec)
             return
         }
-drawPatchBackground(canvas, spec)
 
         val fillPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             color = bubbleTextColor(spec.bubbleId)
             textSize = spToPx(spec.textSizeSp)
             typeface = Typeface.SERIF
         }
-        val strokePaint = TextPaint(fillPaint).apply {
-            style = Paint.Style.STROKE
-            strokeJoin = Paint.Join.ROUND
-            strokeWidth = max(dpF(0.55f), naturalStrokeWidth(spec.textSizeSp, spec.strokeDp))
-            color = bubbleStrokeColor(spec.bubbleId)
+        // kakaopage：只有旁白/无框文字（非 solid）加描边；solid 气泡裸字。
+        val narration = isNarrationBg(spec.bgType)
+        val strokePaint = if (narration) {
+            TextPaint(fillPaint).apply {
+                style = Paint.Style.STROKE
+                strokeJoin = Paint.Join.ROUND
+                strokeWidth = kakaopageStrokeWidthPx(spec.textSizeSp)
+                color = bubbleStrokeColor(spec.bubbleId)
+            }
+        } else {
+            null
         }
         val contentWidth = (spec.rect.width() - dpF(2f)).toInt().coerceAtLeast(1)
         val layoutFill = StaticLayout.Builder.obtain(text, 0, text.length, fillPaint, contentWidth)
@@ -1184,18 +1264,20 @@ drawPatchBackground(canvas, spec)
             .setAlignment(Layout.Alignment.ALIGN_CENTER)
             .setLineSpacing(0f, spec.lineSpacingMultiplier)
             .build()
-        val layoutStroke = StaticLayout.Builder.obtain(text, 0, text.length, strokePaint, contentWidth)
-            .setIncludePad(false)
-            .setAlignment(Layout.Alignment.ALIGN_CENTER)
-            .setLineSpacing(0f, spec.lineSpacingMultiplier)
-            .build()
+        val layoutStroke = strokePaint?.let {
+            StaticLayout.Builder.obtain(text, 0, text.length, it, contentWidth)
+                .setIncludePad(false)
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setLineSpacing(0f, spec.lineSpacingMultiplier)
+                .build()
+        }
 
         val contentRect = computeHorizontalTextRect(spec, layoutFill)
         val drawX = contentRect.left
         val drawY = contentRect.top
         canvas.save()
         canvas.translate(drawX, drawY)
-        layoutStroke.draw(canvas)
+        layoutStroke?.draw(canvas)
         layoutFill.draw(canvas)
         canvas.restore()
     }
@@ -1207,18 +1289,23 @@ drawPatchBackground(canvas, spec)
     ) {
         val text = normalizeVerticalPunctuation(rawText.replace("\n", ""))
         if (text.isBlank()) return
-drawPatchBackground(canvas, spec)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = bubbleTextColor(spec.bubbleId)
             textSize = spToPx(spec.textSizeSp)
             textAlign = Paint.Align.CENTER
             typeface = Typeface.SERIF
         }
-        val strokePaint = Paint(paint).apply {
-            style = Paint.Style.STROKE
-            strokeJoin = Paint.Join.ROUND
-            strokeWidth = max(dpF(0.55f), naturalStrokeWidth(spec.textSizeSp, spec.strokeDp))
-            color = bubbleStrokeColor(spec.bubbleId)
+        // kakaopage：只有旁白/无框文字（非 solid）加描边；solid 气泡裸字。
+        val narration = isNarrationBg(spec.bgType)
+        val strokePaint = if (narration) {
+            Paint(paint).apply {
+                style = Paint.Style.STROKE
+                strokeJoin = Paint.Join.ROUND
+                strokeWidth = kakaopageStrokeWidthPx(spec.textSizeSp)
+                color = bubbleStrokeColor(spec.bubbleId)
+            }
+        } else {
+            null
         }
         val step = (paint.textSize * 1.03f).coerceAtLeast(1f)
         val rows = max(1, ((spec.rect.height() - dpF(4f)) / step).toInt())
@@ -1235,34 +1322,13 @@ drawPatchBackground(canvas, spec)
                 if (index >= text.length) break
                 val y = spec.rect.top + dpF(1f) + row * step + step / 2f + baselineOffset
                 val ch = text[index].toString()
-                canvas.drawText(ch, x, y, strokePaint)
+                if (strokePaint != null) {
+                    canvas.drawText(ch, x, y, strokePaint)
+                }
                 canvas.drawText(ch, x, y, paint)
                 index++
             }
         }
-    }
-
-    private fun drawPatchBackground(canvas: Canvas, spec: PatchTextSpec) {
-        val inset = dpF(2f)
-        val rect = RectF(
-            spec.rect.left - inset,
-            spec.rect.top - inset,
-            spec.rect.right + inset,
-            spec.rect.bottom + inset
-        )
-        val bgColor = bubbleStrokeColor(spec.bubbleId)
-        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = bgColor
-            alpha = 246
-        }
-        val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeWidth = max(dpF(0.6f), dpF(1f))
-            color = bgColor
-            alpha = 255
-        }
-        canvas.drawRoundRect(rect, dpF(4f), dpF(4f), bgPaint)
-        canvas.drawRoundRect(rect, dpF(4f), dpF(4f), edgePaint)
     }
 
     private fun computeHorizontalTextRect(spec: PatchTextSpec, layout: StaticLayout): RectF {
@@ -1325,6 +1391,16 @@ drawPatchBackground(canvas, spec)
         val adaptive = dpF(0.22f + (textSizeSp / 16f) * 0.18f)
         val base = dpF(strokeDp)
         return min(base, adaptive).coerceAtLeast(dpF(0.5f))
+    }
+
+    /** kakaopage：旁白/无框文字（非 solid）才视为需要描边。 */
+    private fun isNarrationBg(bgType: String): Boolean =
+        !bgType.equals("solid", ignoreCase = true)
+
+    /** kakaopage 动态描边宽度：fontSize * 0.085，clamp 到 [1.8, 4.2]（dp 随密度缩放）。 */
+    private fun kakaopageStrokeWidthPx(textSizeSp: Float): Float {
+        val raw = spToPx(textSizeSp) * 0.085f
+        return raw.coerceIn(dpF(1.8f), dpF(4.2f))
     }
 
     private fun placeWithLimitedAvoidance(
@@ -1486,7 +1562,20 @@ drawPatchBackground(canvas, spec)
     }
 
     private fun hideStatus() {
+        cancelStatusAutoHide()
         floatingStatusView?.visibility = View.GONE
+    }
+
+    private fun scheduleStatusAutoHide() {
+        cancelStatusAutoHide()
+        val runnable = Runnable { hideStatus() }
+        statusHideRunnable = runnable
+        mainHandler.postDelayed(runnable, STATUS_AUTO_HIDE_MS)
+    }
+
+    private fun cancelStatusAutoHide() {
+        statusHideRunnable?.let { mainHandler.removeCallbacks(it) }
+        statusHideRunnable = null
     }
 
     private fun updateStatusPosition() {
@@ -1653,6 +1742,7 @@ drawPatchBackground(canvas, spec)
         private var longPressRunnable: Runnable? = null
 
         override fun onTouch(v: View?, event: MotionEvent): Boolean {
+            if (!floatingEnabled) return false
             val params = floatingParams ?: return false
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -1865,8 +1955,9 @@ drawPatchBackground(canvas, spec)
         }
     }
 
-    private inner class ErasePatchLayerView(context: Context) : View(context) {
+private inner class ErasePatchLayerView(context: Context) : View(context) {
         private val patchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
+        private val backgroundFillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private var patches: List<ErasePatch> = emptyList()
         private var patchTexts: List<PatchTextSpec> = emptyList()
 
@@ -1887,8 +1978,24 @@ drawPatchBackground(canvas, spec)
                 if (patch.renderRect.width() <= 0f || patch.renderRect.height() <= 0f) return@forEach
                 canvas.drawBitmap(patch.bitmap, null, patch.renderRect, patchPaint)
             }
+            drawTextBackgrounds(canvas)
             patchTexts.forEach { spec ->
                 drawPatchText(canvas, spec)
+            }
+        }
+
+        private fun drawTextBackgrounds(canvas: Canvas) {
+            patchTexts.forEach { spec ->
+                if (spec.rect.width() <= 1f || spec.rect.height() <= 1f) return@forEach
+                if (spec.text.isBlank()) return@forEach
+                // kakaopage 规则：只有 solid（有气泡底）垫不透明背景盖住原文；
+                // 旁白/无框文字（非 solid）不垫色块，靠擦除贴片（清洁图）垫底。
+                if (!spec.bgType.equals("solid", ignoreCase = true)) return@forEach
+                // solid 且有擦除贴片时贴片已覆盖原文区域，保留贴片质感。
+                if (spec.hasErasePatch) return@forEach
+                val radius = dpF(backgroundFillRadius)
+                backgroundFillPaint.color = spec.bgColor
+                canvas.drawRoundRect(spec.rect, radius, radius, backgroundFillPaint)
             }
         }
     }
@@ -1919,7 +2026,10 @@ drawPatchBackground(canvas, spec)
         val vertical: Boolean,
         val textSizeSp: Float,
         val strokeDp: Float,
-        val lineSpacingMultiplier: Float
+        val lineSpacingMultiplier: Float,
+        val bgType: String = "",
+        val bgColor: Int = Color.WHITE,
+        val hasErasePatch: Boolean = false
     )
 
     private enum class DockSide {
@@ -1931,6 +2041,7 @@ drawPatchBackground(canvas, spec)
         const val TAG_KEY_STATE = 0x44A1001
         const val LAYOUT_BUDGET_MS = 120L
         const val FRAME_BUDGET_MS = 16L
+        const val STATUS_AUTO_HIDE_MS = 3_000L
     }
 }
 

@@ -17,7 +17,7 @@ import kotlin.math.max
 class OpenAiVisionClient(
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 ) {
@@ -961,6 +961,9 @@ return parseGroups(result, blocks)
         if (includeThinking) {
             body.put("enable_thinking", true)
             body.put("thinking_budget", thinkingBudget)
+        } else {
+            // 非思考模式限制最大输出，避免模型输出失控导致响应时间暴涨（日志曾观测到 2 句译文返回 18KB）。
+            body.put("max_tokens", MAX_OUTPUT_TOKENS)
         }
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
@@ -999,6 +1002,8 @@ return parseGroups(result, blocks)
         if (includeThinking) {
             body.put("enable_thinking", true)
             body.put("thinking_budget", thinkingBudget)
+        } else {
+            body.put("max_tokens", MAX_OUTPUT_TOKENS)
         }
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
@@ -1029,6 +1034,8 @@ return parseGroups(result, blocks)
             val cost = SystemClock.elapsedRealtime() - started
             return if (resp.isSuccessful) {
                 Log.d(TAG, "[$traceId] response_ok code=${resp.code} cost_ms=$cost chars=${raw.length}")
+                // 诊断：记录响应开头，用于确认模型是否输出注水/重复内容（影响耗时）。
+                Log.d(TAG, "[$traceId] response_preview chars=${raw.length} preview=${raw.take(160).replace('\n', ' ')}")
                 ApiResult(true, raw, null)
             } else {
                 val err = extractError(raw).ifBlank { "${resp.code} ${resp.message}" }
@@ -1050,7 +1057,10 @@ return parseGroups(result, blocks)
     private fun parseTranslations(raw: String, sourceTexts: List<String>): List<String> {
         val text = extractCompletionText(raw)
         val candidate = extractJsonCandidate(text)
-        if (candidate.isBlank()) return sourceTexts
+        if (candidate.isBlank()) {
+            Log.w(TAG, "translate_parse_fallback reason=no_json_candidate raw_chars=${raw.length} texts=${sourceTexts.size}")
+            return sourceTexts
+        }
         return runCatching {
             if (candidate.trimStart().startsWith("[")) {
                 val arr = JSONArray(candidate)
@@ -1071,9 +1081,15 @@ return parseGroups(result, blocks)
                     }
                     out
                 }
-                else -> sourceTexts
+                else -> {
+                    Log.w(TAG, "translate_parse_fallback reason=missing_translations_key candidate=${candidate.take(120)}")
+                    sourceTexts
+                }
             }
-        }.getOrElse { sourceTexts }
+        }.getOrElse { err ->
+            Log.w(TAG, "translate_parse_fallback reason=parse_error err=${err.message?.take(120)} candidate=${candidate.take(120)}")
+            sourceTexts
+        }
     }
 
     private fun normalizeTranslationList(arr: JSONArray, sourceTexts: List<String>): List<String> {
@@ -1594,8 +1610,10 @@ return parseGroups(result, blocks)
         val costMs: Long
     )
 
-    private companion object {
+private companion object {
         const val TAG = "VisionClient"
+        const val READ_TIMEOUT_SECONDS = 120L
+        const val MAX_OUTPUT_TOKENS = 2048
         const val BAIDU_PROVIDER_ID = "baidu"
         const val BAIDU_DEFAULT_HOST = "https://aip.baidubce.com"
         const val BAIDU_DEFAULT_LANGUAGE = "JAP"

@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
 }
@@ -24,7 +24,10 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-chinese:16.0.0")
     implementation("com.google.mlkit:text-recognition-japanese:16.0.0")
     implementation("com.google.mlkit:text-recognition-korean:16.0.0")
+    implementation("com.google.mlkit:translate:17.0.3")
     implementation("com.google.android.gms:play-services-tasks:18.2.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.29.0")
+    implementation("org.opencv:opencv:4.10.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

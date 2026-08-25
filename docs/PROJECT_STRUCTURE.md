@@ -94,9 +94,11 @@ android-app/
    - 管理 `MediaProjection`、`VirtualDisplay`、`ImageReader` 与截图恢复逻辑，并输出位图或 JPEG Data URL。
 5. `core-translate/src/main/java/com/manga/translator/translate/OpenAiVisionClient.kt`
    - 负责 OCR 检测与文本翻译两条请求链路，以及 OpenAI 兼容返回结果的解析。
-6. `core-overlay/src/main/java/com/manga/translator/overlay/OverlayController.kt`
+6. `core-translate/src/main/java/com/manga/translator/translate/PaddleOcrLocalTextDetector.kt`
+   - 可选本地 OCR 引擎（PP-OCRv5 mobile，ONNX Runtime），模型按源语言首次下载缓存，失败回退 ML Kit（app 层 `EngineSelectingTextDetector` 选择引擎）。
+7. `core-overlay/src/main/java/com/manga/translator/overlay/OverlayController.kt`
    - 负责悬浮球、状态浮层、翻译框、擦字贴片与浏览/调整态的最终渲染控制。
-7. `core-store/src/main/java/com/manga/translator/store/SettingsRepository.kt`
+8. `core-store/src/main/java/com/manga/translator/store/SettingsRepository.kt`
    - 负责配置、渠道档案和开关项的加密持久化，是本地配置读写入口。
 
 补充说明：

@@ -5,39 +5,36 @@ import org.junit.Test
 
 class OverlayAccessibilityPolicyTest {
     @Test
-    fun decide_ignoresLockedContentChangeForSamePackage() {
+    fun decide_clearsContentChangeForSamePackage() {
         val action = OverlayAccessibilityPolicy.decide(
             packageName = "reader.app",
             targetPackage = "reader.app",
             isHomePackage = false,
-            isContentChange = true,
-            isTranslationLocked = true
+            isContentChange = true
         )
 
-        assertEquals(OverlayAccessibilityAction.IGNORE_LOCKED_CONTENT_CHANGE, action)
+        assertEquals(OverlayAccessibilityAction.CLEAR_PAGE_CHANGED, action)
     }
 
     @Test
-    fun decide_clearsOnHomeEvenWhenLocked() {
+    fun decide_clearsOnHome() {
         val action = OverlayAccessibilityPolicy.decide(
             packageName = "com.android.launcher",
             targetPackage = "reader.app",
             isHomePackage = true,
-            isContentChange = true,
-            isTranslationLocked = true
+            isContentChange = true
         )
 
         assertEquals(OverlayAccessibilityAction.CLEAR_HOME, action)
     }
 
     @Test
-    fun decide_clearsOnPackageChangedEvenWhenLocked() {
+    fun decide_clearsOnPackageChanged() {
         val action = OverlayAccessibilityPolicy.decide(
             packageName = "other.app",
             targetPackage = "reader.app",
             isHomePackage = false,
-            isContentChange = true,
-            isTranslationLocked = true
+            isContentChange = true
         )
 
         assertEquals(OverlayAccessibilityAction.CLEAR_PACKAGE_CHANGED, action)

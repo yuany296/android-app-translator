@@ -62,10 +62,11 @@ class TieredEraseProcessor(
         bubbles: List<Bubble>,
         pageHash: String,
         policy: EraseStrategyPolicy,
-        onPerf: ((tag: String, extra: String?) -> Unit)? = null
+        onPerf: ((tag: String, extra: String?) -> Unit)? = null,
+        cleanedImage: Bitmap? = null
     ): List<ErasePatch> {
         if (bubbles.isEmpty()) return emptyList()
-        val key = buildCacheKey(pageHash, bubbles, policy)
+        val key = buildCacheKey(pageHash, bubbles, policy, cleanedImage != null)
         val cached = cache.get(key)
         if (cached != null) {
             onPerf?.invoke("erase_apply", "cache_hit=true patches=${cached.size}")
@@ -84,12 +85,26 @@ class TieredEraseProcessor(
         val patches = mutableListOf<ErasePatch>()
         var replacedPixels = 0L
         var candidatePixels = 0L
+        var narrationPatched = 0
         val startedAt = SystemClock.elapsedRealtime()
 
         bubbles.forEachIndexed { index, bubble ->
-            if (!isSolidBubble(bubble)) {
+            if (bubble.originalText.isBlank()) {
                 return@forEachIndexed
             }
+            val isSolid = isSolidBubble(bubble)
+
+            // 非 solid（旁白/透明面板）：优先从整页清理图（inpaint 去字原图）裁切贴片，
+            // 纹理直接来自原图背景，避免纯色块/墨色替换带来的色差，观感接近参考项目。
+            if (!isSolid && cleanedImage != null && !cleanedImage.isRecycled) {
+                val cleanedPatch = createCleanedPatch(cleanedImage, bubble, index)
+                if (cleanedPatch != null) {
+                    patches += cleanedPatch
+                    narrationPatched++
+                    return@forEachIndexed
+                }
+            }
+
             val complexity = analyzer.analyze(source, bubble)
             var strategy = resolveStrategy(policy, complexity)
             val elapsed = SystemClock.elapsedRealtime() - startedAt
@@ -98,14 +113,18 @@ class TieredEraseProcessor(
             }
             summary[strategy] = (summary[strategy] ?: 0) + 1
 
+            // 非 solid（旁白/透明面板）同样生成“创可贴”清理贴片：以文字内容框为 ROI，
+            // 只替换文字墨色像素，边缘感知填充贴近原背景，避免文字叠加看不清。
+            val textureAware = !isSolid || complexity.variance >= HIGH_VARIANCE_THRESHOLD
             val result = when (strategy) {
                 EraseStrategy.FAST_FILL -> createLocalPatch(
                     source = source,
                     bubble = bubble,
                     bubbleId = index,
-                    extraPaddingPx = FAST_PADDING_PX,
-                    edgeAware = false,
-                    enableEdgeTransition = complexity.variance >= HIGH_VARIANCE_THRESHOLD
+                    extraPaddingPx = if (isSolid) FAST_PADDING_PX else EDGE_PADDING_PX,
+                    edgeAware = textureAware,
+                    enableEdgeTransition = textureAware,
+                    includeBrightInk = !isSolid
                 )
 
                 EraseStrategy.EDGE_AWARE_FILL -> createLocalPatch(
@@ -114,7 +133,8 @@ class TieredEraseProcessor(
                     bubbleId = index,
                     extraPaddingPx = EDGE_PADDING_PX,
                     edgeAware = true,
-                    enableEdgeTransition = complexity.variance >= HIGH_VARIANCE_THRESHOLD
+                    enableEdgeTransition = textureAware,
+                    includeBrightInk = !isSolid
                 )
 
                 EraseStrategy.OPENCV_INPAINT -> createOpenCvPatch(source, bubble, index)
@@ -124,7 +144,8 @@ class TieredEraseProcessor(
                         bubbleId = index,
                         extraPaddingPx = EDGE_PADDING_PX,
                         edgeAware = true,
-                        enableEdgeTransition = true
+                        enableEdgeTransition = true,
+                        includeBrightInk = !isSolid
                     )
             }
 
@@ -132,6 +153,9 @@ class TieredEraseProcessor(
                 replacedPixels += result.replacedPixelCount
                 candidatePixels += result.candidatePixelCount
                 patches += result.patch
+                if (!isSolid) {
+                    narrationPatched++
+                }
             }
         }
 
@@ -145,7 +169,7 @@ class TieredEraseProcessor(
         }
         onPerf?.invoke(
             "erase_apply",
-            "cache_hit=false fast=$fast edge=$edge opencv=$cv patches=${patches.size} erase_dark_replace_ratio=${"%.3f".format(ratio)}"
+            "cache_hit=false fast=$fast edge=$edge opencv=$cv patches=${patches.size} narration_patched=$narrationPatched erase_dark_replace_ratio=${"%.3f".format(ratio)} cleaned=${cleanedImage != null}"
         )
 
         cache.put(
@@ -178,13 +202,32 @@ class TieredEraseProcessor(
         }
     }
 
+    private fun createCleanedPatch(cleanedImage: Bitmap, bubble: Bubble, bubbleId: Int): ErasePatch? {
+        val roi = analyzer.bubbleToRoi(cleanedImage, bubble, CLEANED_PATCH_PAD_PX)
+        if (roi.width() <= 0 || roi.height() <= 0) return null
+        val crop = runCatching {
+            Bitmap.createBitmap(cleanedImage, roi.left, roi.top, roi.width(), roi.height())
+        }.getOrNull() ?: return null
+        // 独立副本：crop 与清理图共享像素缓冲，需复制避免后续回收互相影响。
+        val bitmap = crop.copy(Bitmap.Config.ARGB_8888, false)
+        crop.recycle()
+        val srcRect = RectF(roi)
+        return ErasePatch(
+            bitmap = bitmap,
+            srcRect = srcRect,
+            renderRect = RectF(srcRect),
+            bubbleId = bubbleId
+        )
+    }
+
     private fun createLocalPatch(
         source: Bitmap,
         bubble: Bubble,
         bubbleId: Int,
         extraPaddingPx: Int,
         edgeAware: Boolean,
-        enableEdgeTransition: Boolean
+        enableEdgeTransition: Boolean,
+        includeBrightInk: Boolean = false
     ): PatchBuildResult? {
         val roi = analyzer.bubbleToRoi(source, bubble, extraPaddingPx)
         if (roi.width() <= 0 || roi.height() <= 0) return null
@@ -201,6 +244,7 @@ class TieredEraseProcessor(
         val leftColor = if (edgeAware) borderProfile.leftColor else fillColor
         val rightColor = if (edgeAware) borderProfile.rightColor else fillColor
         val radius = (min(width, height) * if (edgeAware) 0.14f else 0.12f).coerceAtLeast(6f)
+        val fillIsDark = luma(fillColor) < BRIGHT_FILL_LUMA_GUARD
 
         var replacedCount = 0
         var candidateCount = 0
@@ -213,7 +257,9 @@ class TieredEraseProcessor(
                     continue
                 }
                 candidateCount += 1
-                if (luma(origin) < DARK_LUMA_THRESHOLD) {
+                val isDarkInk = luma(origin) < DARK_LUMA_THRESHOLD
+                val isBrightInk = includeBrightInk && fillIsDark && luma(origin) >= BRIGHT_INK_LUMA_THRESHOLD
+                if (isDarkInk || isBrightInk) {
                     val target = if (edgeAware) {
                         interpolateEdgeColor(x, y, width, height, topColor, bottomColor, leftColor, rightColor)
                     } else {
@@ -533,10 +579,17 @@ class TieredEraseProcessor(
         return lerpColor(origin, target, ratio)
     }
 
-    private fun buildCacheKey(pageHash: String, bubbles: List<Bubble>, policy: EraseStrategyPolicy): String {
+    private fun buildCacheKey(
+        pageHash: String,
+        bubbles: List<Bubble>,
+        policy: EraseStrategyPolicy,
+        hasCleanedImage: Boolean = false
+    ): String {
         val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(CACHE_KEY_VERSION.toByteArray(Charsets.UTF_8))
         digest.update(pageHash.toByteArray(Charsets.UTF_8))
         digest.update(policy.name.toByteArray(Charsets.UTF_8))
+        digest.update("cleaned=$hasCleanedImage".toByteArray(Charsets.UTF_8))
         bubbles.forEachIndexed { index, bubble ->
             val keyPart =
                 "$index,${bubble.x},${bubble.y},${bubble.w},${bubble.h}," +
@@ -579,7 +632,9 @@ class TieredEraseProcessor(
     companion object {
         private const val TAG = "TieredEraseProcessor"
 
-        private const val DARK_LUMA_THRESHOLD = 190f
+private const val DARK_LUMA_THRESHOLD = 190f
+        private const val BRIGHT_INK_LUMA_THRESHOLD = 225f
+        private const val BRIGHT_FILL_LUMA_GUARD = 200f
         private const val HIGH_VARIANCE_THRESHOLD = 800f
         private const val EDGE_TRANSITION_PX = 4f
         private const val OPENCV_INPAINT_RADIUS = 5.0
@@ -588,10 +643,15 @@ class TieredEraseProcessor(
 
         private const val FAST_PADDING_PX = 2
         private const val EDGE_PADDING_PX = 4
+        // 清理图裁切贴片的外扩：需 >= mask 最大膨胀半径（8px），保证裁切边是未 inpaint 的原图像素，无缝衔接。
+        private const val CLEANED_PATCH_PAD_PX = 10
 
         private const val EDGE_VARIANCE_TRIGGER = 320f
         private const val EDGE_DENSITY_TRIGGER = 0.16f
 
-        private const val ERASE_BUDGET_MS = 180L
+        // OpenCV inpaint 单气泡约 50-150ms；预算过小会在首个气泡后就全部降级为 EDGE_AWARE_FILL。
+        // 提高到 3000ms，让一页（约 10-20 个气泡）都能走整块背景纹理恢复，接近参考项目 cleaned image 观感。
+        private const val ERASE_BUDGET_MS = 3000L
+        private const val CACHE_KEY_VERSION = "erase_v4|opencv_enabled|cleaned_image"
     }
 }

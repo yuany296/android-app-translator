@@ -18,5 +18,7 @@ data class BubbleRenderState(
     var verticalLayout: Boolean = false,
     var displayText: String = "",
     var lineSpacingMultiplier: Float = 1f,
+    var bgType: String = "",
+    var hasErasePatch: Boolean = false,
     var baseRect: RectF = RectF()
 )

@@ -19,7 +19,7 @@ class TranslationLockGesturePolicyTest {
     }
 
     @Test
-    fun decide_blocksSwipeBeyondSlop() {
+    fun decide_releasesSwipeBeyondSlop() {
         val decision = TranslationLockGesturePolicy.decide(
             maxDistancePx = 24f,
             durationMs = 80L,
@@ -28,7 +28,21 @@ class TranslationLockGesturePolicyTest {
             tapTimeoutMs = 100L
         )
 
+        assertEquals(TranslationLockGestureOutcome.RELEASE, decision.outcome)
+        assertEquals("touch", decision.reason)
+    }
+
+    @Test
+    fun decide_blocksMultiPointer() {
+        val decision = TranslationLockGesturePolicy.decide(
+            maxDistancePx = 6f,
+            durationMs = 80L,
+            maxPointerCount = 2,
+            touchSlopPx = 12,
+            tapTimeoutMs = 100L
+        )
+
         assertEquals(TranslationLockGestureOutcome.BLOCKED, decision.outcome)
-        assertEquals("move", decision.reason)
+        assertEquals("multi_pointer", decision.reason)
     }
 }

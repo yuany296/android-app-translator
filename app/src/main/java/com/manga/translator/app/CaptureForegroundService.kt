@@ -1,4 +1,4 @@
-﻿package com.manga.translator.app
+package com.manga.translator.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -33,6 +33,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.PrintWriter
 import java.io.StringWriter
 
@@ -149,7 +150,7 @@ class CaptureForegroundService : Service() {
                     return@projectionStopListener
                 }
                 serviceScope.launch {
-                    enterProjectionUnavailable(shouldToast = false, reason = "projection_stopped_callback")
+                    enterProjectionUnavailable(reason = "projection_stopped_callback")
                 }
             }
             it.start(resultCode, data, displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.densityDpi)
@@ -170,6 +171,8 @@ class CaptureForegroundService : Service() {
         overlayController?.setFloatingState(FloatingState.IDLE, null)
         startCaptureAvailabilityMonitor()
         updateCaptureSessionState(CaptureSessionState.ACTIVE, "start_overlay_flow_success")
+        prewarmOcrModel()
+        prewarmTranslateModel()
 
         overlayController?.showFloatingButton {
             if (translateJob?.isActive == true) {
@@ -189,6 +192,21 @@ class CaptureForegroundService : Service() {
                 return@showFloatingButton
             }
 
+            // OCR 模型未就绪：悬浮球置灰不可用 + 旁白提示"OCR模型加载中"，后台预热完成后恢复可用。
+            val detector = ServiceLocator.localTextDetector
+            if (!detector.isReady(settings.sourceLanguage)) {
+                Log.d("TranslationPerf", "model_loading_prewarm lang=${settings.sourceLanguage}")
+                overlayController?.setFloatingEnabled(false)
+                overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "OCR模型加载中")
+                serviceScope.launch {
+                    withContext(Dispatchers.IO) { detector.prewarm(settings.sourceLanguage) }
+                    Log.d("TranslationPerf", "model_prewarm_done lang=${settings.sourceLanguage}")
+                    overlayController?.setFloatingEnabled(true)
+                    overlayController?.setFloatingState(FloatingState.IDLE, null)
+                }
+                return@showFloatingButton
+            }
+
             overlayController?.setFloatingVisible(true)
             overlayController?.setInteractionMode(InteractionMode.BROWSE)
             val current = orchestrator ?: return@showFloatingButton
@@ -204,7 +222,11 @@ class CaptureForegroundService : Service() {
                     onCaptureSuccess()
 
                     if (outcome.hasOverlay) {
-                        val doneText = outcome.warningMessage ?: "完成"
+                        val doneText = when {
+                            outcome.cacheTotalCount > 0 ->
+                                "完成·缓存${outcome.cacheHitCount}/${outcome.cacheTotalCount}"
+                            else -> outcome.warningMessage ?: "完成"
+                        }
                         overlayController?.setFloatingState(FloatingState.DONE, doneText)
                         outcome.warningMessage?.let {
                             Toast.makeText(this@CaptureForegroundService, it, Toast.LENGTH_SHORT).show()
@@ -230,7 +252,7 @@ class CaptureForegroundService : Service() {
                     overlayController?.unlockTranslationLayer()
                     clearOverlayForReason("translate_failed")
                     if (isProjectionExpiredError(err)) {
-                        enterProjectionUnavailable(shouldToast = false, reason = "projection_expired")
+                        enterProjectionUnavailable(reason = "projection_expired")
                         Toast.makeText(
                             this@CaptureForegroundService,
                             "请重新启动服务并授权录屏",
@@ -256,6 +278,36 @@ class CaptureForegroundService : Service() {
                     }
                 }
             }
+        }
+    }
+
+    /** 服务启动后后台预热 OCR 模型，减少首次点击等待（模型下载/加载在 IO 线程）。 */
+    private fun prewarmOcrModel() {
+        val settings = ServiceLocator.settingsRepository.getSettings()
+        if (!settings.enabled) return
+        val detector = ServiceLocator.localTextDetector
+        if (detector.isReady(settings.sourceLanguage)) return
+        Log.d("TranslationPerf", "model_prewarm_start lang=${settings.sourceLanguage}")
+        serviceScope.launch {
+            withContext(Dispatchers.IO) { detector.prewarm(settings.sourceLanguage) }
+            Log.d("TranslationPerf", "model_prewarm_done lang=${settings.sourceLanguage}")
+        }
+    }
+
+    /** 服务启动后后台预热本地翻译模型（ML Kit），首次点击无需联网下载，减少等待。 */
+    private fun prewarmTranslateModel() {
+        val settings = ServiceLocator.settingsRepository.getSettings()
+        if (!settings.enabled) return
+        val engine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine)
+        if (engine != com.manga.translator.store.TranslateEngine.ML_KIT) return
+        val translator = ServiceLocator.localTranslator
+        if (!translator.isSupported(settings.sourceLanguage, settings.targetLanguage)) return
+        Log.d("TranslationPerf", "translate_model_prewarm_start pair=${settings.sourceLanguage}->${settings.targetLanguage}")
+        serviceScope.launch {
+            withContext(Dispatchers.IO) {
+                translator.prewarm(settings.sourceLanguage, settings.targetLanguage)
+            }
+            Log.d("TranslationPerf", "translate_model_prewarm_done pair=${settings.sourceLanguage}->${settings.targetLanguage}")
         }
     }
 
@@ -306,27 +358,35 @@ class CaptureForegroundService : Service() {
         Toast.makeText(this, "截图超时，请保持在已投射应用内", Toast.LENGTH_SHORT).show()
     }
 
-    private fun enterProjectionUnavailable(shouldToast: Boolean, reason: String) {
+    private fun enterProjectionUnavailable(reason: String) {
         val requiresReauth = reason.contains("projection_expired")
             || reason.contains("projection_stopped")
-        if (projectionUnavailable && (!requiresReauth || captureSessionStateStore.getState() == CaptureSessionState.REAUTH_REQUIRED)) {
+        if (projectionUnavailable && captureSessionStateStore.getState() == CaptureSessionState.REAUTH_REQUIRED) {
             return
         }
         projectionUnavailable = true
         captureTimeoutStreak = 0
         clearOverlayForReason(reason)
-        // 不再隐藏悬浮球，避免用户误以为服务退出；保留入口用于重新授权后恢复。
-        overlayController?.setFloatingVisible(true)
-        overlayController?.setFloatingState(FloatingState.ERROR, if (requiresReauth) "需重新授权" else "截图暂不可用")
-        Log.d("TranslationPerf", "capture_unavailable_enter reason=$reason")
-        diag("projection_unavailable reason=$reason")
+        // 投影一旦失效（过期或被停止）就无法自行恢复：本项目没有"重新获取
+        // MediaProjection token"的路径（那需要 App 的 Activity 在 MainActivity
+        // 里重新发起 createScreenCaptureIntent()）。isCaptureAlive() 依赖
+        // projectionStopped=false 且 mediaProjection 非空，onStop 后永不复原，
+        // 因此 background_capture_recovered 实际上触发不到。
+        // 与其留一个点了没反应、toast 还被限流的悬浮球，不如明确停止服务，
+        // 让用户重开 App 走重新授权流程（onDestroy 会把状态存为 REAUTH_REQUIRED）。
         updateCaptureSessionState(
             state = if (requiresReauth) CaptureSessionState.REAUTH_REQUIRED else CaptureSessionState.UNAVAILABLE,
             reason = "projection_unavailable:$reason"
         )
-        if (shouldToast) {
-            showUnavailableToast(if (requiresReauth) "请重新授权录屏" else "截图暂不可用，请稍后重试")
-        }
+        Log.d("TranslationPerf", "capture_unavailable_auto_stop reason=$reason requiresReauth=$requiresReauth")
+        diag("auto_stop_service reason=$reason")
+        Toast.makeText(
+            this,
+            if (requiresReauth) "录屏授权已失效，服务已停止，请重新打开 App 重新授权"
+            else "截图暂不可用，服务已停止，请重新打开 App 启动",
+            Toast.LENGTH_LONG
+        ).show()
+        stopSelf()
     }
 
     private fun startCaptureAvailabilityMonitor() {
@@ -355,7 +415,7 @@ class CaptureForegroundService : Service() {
                         "capture_monitor_event type=projection_state package=${AccessibilityMonitor.currentForegroundPackage} " +
                             "projectionStopped=${controller.hasProjectionStopped()} lastFailure=${controller.getLastCaptureFailureType()}"
                     )
-                    enterProjectionUnavailable(shouldToast = false, reason = if (controller.hasProjectionStopped()) "projection_stopped" else "projection_expired_bg")
+                    enterProjectionUnavailable(reason = if (controller.hasProjectionStopped()) "projection_stopped" else "projection_expired_bg")
                 }
             }
         }.also { launched ->
@@ -419,37 +479,37 @@ class CaptureForegroundService : Service() {
 
     private fun handleAccessibilityMonitorEvent(event: AccessibilityMonitorEvent) {
         val packageName = event.packageName.orEmpty()
-        diag("capture_monitor_event type=${event.typeName()} package=$packageName")
+        val locked = overlayController?.isTranslationLocked() == true
+        diag("capture_monitor_event type=${event.typeName()} package=$packageName target=$activeContentPackage locked=$locked")
         if (packageName.isBlank()) {
             return
         }
-        when (
-            OverlayAccessibilityPolicy.decide(
-                packageName = packageName,
-                targetPackage = activeContentPackage,
-                isHomePackage = isHomePackage(packageName),
-                isContentChange = event.isContentChange(),
-                isTranslationLocked = overlayController?.isTranslationLocked() == true
-            )
-        ) {
+        val action = OverlayAccessibilityPolicy.decide(
+            packageName = packageName,
+            targetPackage = activeContentPackage,
+            isHomePackage = isHomePackage(packageName),
+            isContentChange = event.isContentChange()
+        )
+        diag("overlay_accessibility_decision action=${action.name.lowercase()} package=$packageName target=$activeContentPackage locked=$locked")
+        when (action) {
             OverlayAccessibilityAction.NONE -> Unit
             OverlayAccessibilityAction.CLEAR_HOME -> clearOverlayForReason("home")
             OverlayAccessibilityAction.CLEAR_PACKAGE_CHANGED -> clearOverlayForReason("package_changed")
             OverlayAccessibilityAction.CLEAR_PAGE_CHANGED -> clearOverlayForReason("page_changed")
-            OverlayAccessibilityAction.IGNORE_LOCKED_CONTENT_CHANGE -> {
-                diag("overlay_clear_skip reason=locked_content_change package=$packageName")
-            }
         }
     }
 
     private fun clearOverlayForReason(reason: String) {
+        val hadBaseline = currentBaselineHash != null
+        val hadTarget = activeContentPackage != null
         overlayController?.setInteractionMode(InteractionMode.BROWSE)
         overlayController?.clearTranslationLayer()
-        if (currentBaselineHash == null && activeContentPackage == null) {
+        if (!hadBaseline && !hadTarget) {
+            diag("overlay_clear_skip reason=$reason no_active_overlay")
             return
         }
         clearOverlayTracking()
-        diag("overlay_clear reason=$reason")
+        diag("overlay_clear reason=$reason hadBaseline=$hadBaseline hadTarget=$hadTarget")
     }
 
     private fun clearOverlayTracking() {

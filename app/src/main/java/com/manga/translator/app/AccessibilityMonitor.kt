@@ -1,5 +1,6 @@
 package com.manga.translator.app
 
+import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -44,6 +45,11 @@ object AccessibilityMonitor {
         event.packageName?.takeIf { it.isNotBlank() }?.let {
             currentForegroundPackage = it
         }
+        Log.d(
+            "OverlayA11yMonitor",
+            "publish type=${event.typeName()} package=${event.packageName} class=${event.className} " +
+                "current=$currentForegroundPackage"
+        )
         _events.tryEmit(event)
     }
 }
