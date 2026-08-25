@@ -1,4 +1,4 @@
-﻿# Todolist
+# Todolist
 
 ## 进行中（遗留问题，未处理）
 
@@ -18,13 +18,14 @@
 
 ## 5.翻译速度
 
-- 已做：擦除/颜色/布局计算与翻译请求并行（async + coroutineScope），减少总等待时间；OCR 已本地化（bubble-first + ML Kit / PaddleOCR 可选）。
+- 已做：擦除/颜色/布局计算与翻译请求并行（async + coroutineScope），减少总等待时间；OCR 已本地化（bubble-first + ML Kit / PaddleOCR 可选）；翻译已可选本地引擎（ML Kit 端侧离线，2026-08-25，见 HumanTODO.md）。
 - 待办：真机采集 TranslationPerf 日志确认各阶段耗时，若翻译请求本身慢则考虑流式输出/更小 prompt。
 
 ---
 
 ## 已完成功能记录
 
+- 2026-08-25 本地翻译引擎（ML Kit 端侧翻译）接入：新增「翻译引擎」选择（云端 API / ML Kit 本地离线），`TranslateEngine` 枚举 + `AppSettings/SettingsRepository.translateEngine` 字段；新增 `LocalTranslator` 接口与 `MlKitLocalTranslator`（com.google.mlkit:translate:17.0.3，覆盖 英/日/韩 → 简中 及互译，繁体目标不支持自动回退云端）；`TranslateOrchestrator.translateMissing` 本地优先、云端回退；`CaptureForegroundService.prewarmTranslateModel` 服务启动后台预热模型；首页「翻译引擎」下拉 UI。详见 HumanTODO.md 2026-08-25
 - 2026-08-25 PaddleOCR 提速：识别级联（原图置信度≥0.93 直接返回，跳过其余 7 个变体，配 rec_cascade_hit/full 计数）；recovery 变体在降采样工作图（长边≤960）上构建再映射回原图坐标；区域检测与整页 OCR 并行；centerDHash 移 IO。模拟器实测 OCR 2846ms→944ms、清理图 566ms→228ms
 - 2026-08-25 整页"清理图"（cleaned image）接入：新增 `CleanedImageProcessor`（对齐参考项目 local-ocr-service 的 build_cleaned_image_data_url：非 solid 气泡内容框生成 mask + 椭圆膨胀（半径 clamp(高*0.08,2,8)）+ 整页 TELEA inpaint），`TieredEraseProcessor` 对非 solid（旁白/透明）气泡改为从清理图裁切贴片（外扩 10px 保证无缝），无清理图时回退原"创可贴"墨色替换；按 pageHash 缓存
 - 2026-08-24 PaddleOCR 可选 OCR 引擎：PP-OCRv5 mobile（ONNX Runtime）接入 LocalTextDetector，zh/ja/ko 三语模型按需下载，失败回退 ML Kit，首页引擎选择，评估文档 docs/PADDLE_OCR_MOBILE_INTEGRATION.md

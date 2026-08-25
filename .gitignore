@@ -1,6 +1,44 @@
-﻿/.gradle/
-/local.properties
-/.idea/
+# ===== Gradle / Android =====
+.gradle/
 **/build/
+/local.properties
+.cxx/
+*.apk
+*.aab
+*.keystore
+*.jks
+*.ks
+
+# ===== IDE =====
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# ===== OS =====
 .DS_Store
+Thumbs.db
+
+# ===== 本地日志 =====
 /logs/
+*.log
+
+# ===== 本地模型 / 运行时产物 =====
+/cache/
+*.onnx
+*.bin
+
+# ===== 调试 / 验证用的临时截图与产物 =====
+bg1_screen.png
+screen_current.png
+verify_*.png
+
+# ===== 工具链临时文件 =====
+.codex/*.html
+.codex/context-*.json
+.codex/structured-request.json
+
+# ===== 凭据/隐私（禁止提交）=====
+local.properties
+*.secret

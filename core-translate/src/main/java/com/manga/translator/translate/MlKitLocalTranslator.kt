@@ -13,7 +13,8 @@ import kotlinx.coroutines.withContext
 
 /**
  * 基于 ML Kit 端侧翻译（Google Play 服务）的本地翻译器。
- * - 覆盖漫画常见语言对：英文/日文/韩文 -> 简体/繁体中文，以及这些语言之间的互译（ML Kit 支持的组合）。
+ * - 覆盖漫画常见语言对：英文/日文/韩文 -> 简体中文，以及这些语言之间的互译（ML Kit 支持的语言）。
+ * - 繁体中文目标（zh-tw）本版本 ML Kit 端侧不支持，调用方会回退云端。
  * - 首次使用某语言对时联网下载模型并缓存，之后完全离线翻译。
  * - 需要设备安装 Google Play 服务；模型下载失败时抛出异常由调用方回退云端。
  */
@@ -61,10 +62,8 @@ class MlKitLocalTranslator : LocalTranslator {
         val dst = toMlKitLanguage(targetLanguageId) ?: return
         val translator = getOrCreateTranslator(src, dst)
         // 仅触发下载，不阻塞；失败静默，等真正翻译时再处理。
-        Tasks.call {
-            ensureModelDownloaded(translator, src, dst)
-            null
-        }.addOnFailureListener { err ->
+        val conditions = DownloadConditions.Builder().requireWifi().build()
+        translator.downloadModelIfNeeded(conditions).addOnFailureListener { err ->
             Log.w(TAG, "mlkit_translate_prewarm_failed reason=${err.message?.take(120)}")
         }
     }
@@ -97,7 +96,8 @@ class MlKitLocalTranslator : LocalTranslator {
             "ja" -> TranslateLanguage.JAPANESE
             "ko" -> TranslateLanguage.KOREAN
             "zh-cn", "zh", "zh-hans" -> TranslateLanguage.CHINESE
-            "zh-tw", "zh-hant" -> TranslateLanguage.CHINESE_ZH_HANT
+            // ML Kit 端侧翻译（本版本）仅区分 CHINESE（简体）；繁体中文需回退云端。
+            "zh-tw", "zh-hant" -> null
             else -> null
         }
     }

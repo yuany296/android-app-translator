@@ -3,6 +3,21 @@
 - 日期：2026-08-25
 - 维护者：OpenCode
 
+## 2026-08-25 本地翻译引擎（ML Kit 端侧翻译）人工验证
+
+- 新增「翻译引擎」下拉（首页，OCR 引擎下方）：`云端 API`（默认）/ `ML Kit 本地翻译（离线）`。
+- 本地翻译（ML Kit Translation，`com.google.mlkit:translate:17.0.3`）：
+  - 支持语言对：英文/日文/韩文 → 简体中文，以及这些语言之间的互译。**繁体中文目标（zh-tw）不支持**，会自动回退云端。
+  - 首次使用某语言对需联网下载模型并缓存（约几 MB，需 WiFi）；服务启动后已后台预热（`TranslationPerf` 过滤 `translate_model_prewarm_start/done`）。之后完全离线翻译、无网络往返，明显提速。
+  - 需设备装有 Google Play 服务（与现有 ML Kit OCR 同依赖链）。
+- 真机验证清单：
+  1. 首页「翻译引擎」切到「ML Kit 本地翻译（离线）」后翻译韩漫/日漫/英漫页：logcat 过滤 `TranslationPerf` 看 `translate_local ok=mlkit count=N`，确认不再出现 `request_send stage=translate mode=cloud`，且总耗时显著下降（离线无网络往返）。
+  2. 首次切到本地引擎时，确认服务启动后 `translate_model_prewarm_start` → `done`（WiFi 下模型下载），首次点击不再卡在下载。
+  3. 将设备切飞行模式（断网）翻译：本地引擎应仍能出译文；若断网且模型未缓存，应回退/提示失败（logcat 过滤 `MlKitLocalTranslator` 看 `mlkit_translate_prewarm_failed` 或 `translate_local_fallback`）。
+  4. 目标语言选「繁体中文」时：本地引擎不支持会自动回退云端（`translate_local_skip reason=unsupported_pair`）。
+  5. 本地译文质量与云端对比如可接受（端侧模型质量一般低于大模型，台词恐有翻译腔）。
+  6. 确认未配置云端 API + 选择本地引擎时仍能正常翻译（之前"仅OCR"分支不再拦截本地引擎）。
+
 ## 2026-08-25 PaddleOCR 提速 + 模拟器联网 人工验证
 
 - 模拟器联网：主机 Clash 代理 127.0.0.1:7890 需手动设置模拟器代理（重启后失效）：
