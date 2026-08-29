@@ -39,7 +39,10 @@ class SettingsRepository(context: Context) {
             enableThinking = prefs.getBoolean(KEY_ENABLE_THINKING, false),
             thinkingBudget = prefs.getInt(KEY_THINKING_BUDGET, DEFAULT_THINKING_BUDGET),
             ocrEngine = OcrEngine.fromId(prefs.getString(KEY_OCR_ENGINE, OcrEngine.ML_KIT.id).orEmpty()).id,
-            translateEngine = TranslateEngine.fromId(prefs.getString(KEY_TRANSLATE_ENGINE, TranslateEngine.CLOUD.id).orEmpty()).id
+            ocrSpeedMode = OcrSpeedMode.fromId(prefs.getString(KEY_OCR_SPEED_MODE, OcrSpeedMode.BALANCED.id).orEmpty()).id,
+            translateEngine = TranslateEngine.fromId(prefs.getString(KEY_TRANSLATE_ENGINE, TranslateEngine.CLOUD.id).orEmpty()).id,
+            baiduTranslateAppId = prefs.getString(KEY_BAIDU_TRANSLATE_APP_ID, "")?.trim().orEmpty(),
+            baiduTranslateSecretKey = prefs.getString(KEY_BAIDU_TRANSLATE_SECRET_KEY, "")?.trim().orEmpty()
         )
     }
 
@@ -65,7 +68,10 @@ class SettingsRepository(context: Context) {
             .putBoolean(KEY_ENABLE_THINKING, settings.enableThinking)
             .putInt(KEY_THINKING_BUDGET, settings.thinkingBudget.coerceIn(1024, 131072))
             .putString(KEY_OCR_ENGINE, OcrEngine.fromId(settings.ocrEngine).id)
+            .putString(KEY_OCR_SPEED_MODE, OcrSpeedMode.fromId(settings.ocrSpeedMode).id)
             .putString(KEY_TRANSLATE_ENGINE, TranslateEngine.fromId(settings.translateEngine).id)
+            .putString(KEY_BAIDU_TRANSLATE_APP_ID, settings.baiduTranslateAppId.trim())
+            .putString(KEY_BAIDU_TRANSLATE_SECRET_KEY, settings.baiduTranslateSecretKey.trim())
             .apply()
     }
 
@@ -233,7 +239,10 @@ class SettingsRepository(context: Context) {
             .put("enableThinking", settings.enableThinking)
             .put("thinkingBudget", settings.thinkingBudget.coerceIn(1024, 131072))
             .put("ocrEngine", OcrEngine.fromId(settings.ocrEngine).id)
+            .put("ocrSpeedMode", OcrSpeedMode.fromId(settings.ocrSpeedMode).id)
             .put("translateEngine", TranslateEngine.fromId(settings.translateEngine).id)
+            .put("baiduTranslateAppId", settings.baiduTranslateAppId.trim())
+            .put("baiduTranslateSecretKey", settings.baiduTranslateSecretKey.trim())
     }
 
     private fun jsonToSettings(json: JSONObject): AppSettings {
@@ -257,7 +266,10 @@ class SettingsRepository(context: Context) {
             enableThinking = json.optBoolean("enableThinking", false),
             thinkingBudget = json.optInt("thinkingBudget", DEFAULT_THINKING_BUDGET).coerceIn(1024, 131072),
             ocrEngine = OcrEngine.fromId(json.optString("ocrEngine", OcrEngine.ML_KIT.id)).id,
-            translateEngine = TranslateEngine.fromId(json.optString("translateEngine", TranslateEngine.CLOUD.id)).id
+            ocrSpeedMode = OcrSpeedMode.fromId(json.optString("ocrSpeedMode", OcrSpeedMode.BALANCED.id)).id,
+            translateEngine = TranslateEngine.fromId(json.optString("translateEngine", TranslateEngine.CLOUD.id)).id,
+            baiduTranslateAppId = json.optString("baiduTranslateAppId", "").trim(),
+            baiduTranslateSecretKey = json.optString("baiduTranslateSecretKey", "").trim()
         )
     }
 
@@ -288,7 +300,10 @@ class SettingsRepository(context: Context) {
         const val KEY_BAIDU_OCR_MONTH = "baidu_ocr_month"
         const val KEY_BAIDU_OCR_MONTH_COUNT = "baidu_ocr_month_count"
         const val KEY_OCR_ENGINE = "ocr_engine"
+        const val KEY_OCR_SPEED_MODE = "ocr_speed_mode"
         const val KEY_TRANSLATE_ENGINE = "translate_engine"
+        const val KEY_BAIDU_TRANSLATE_APP_ID = "baidu_translate_app_id"
+        const val KEY_BAIDU_TRANSLATE_SECRET_KEY = "baidu_translate_secret_key"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }

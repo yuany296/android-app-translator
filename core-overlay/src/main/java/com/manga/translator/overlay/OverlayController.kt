@@ -702,6 +702,16 @@ val tv = if (useVerticalLayout) {
         hideExpandedCard()
     }
 
+    /**
+     * 是否存在活动译文层（含锁定中）。
+     * 2026-08-27 新增：悬浮球点击时据此区分"清除译文（恢复原文）"与"开始新翻译"。
+     */
+    fun hasActiveTranslationLayer(): Boolean {
+        if (translationLocked) return true
+        val layer = translationLayer ?: return false
+        return layer.childCount > 0
+    }
+
     fun lockTranslationUntilTap(onRelease: () -> Unit) {
         val layer = translationLayer ?: return
         translationLocked = true

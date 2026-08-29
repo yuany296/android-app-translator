@@ -114,8 +114,10 @@ class BubbleFirstRegionPlanner {
             blocks.sortedWith(compareByDescending<TextBlock> { it.centerX() }.thenBy { it.top })
                 .joinToString(separator = "") { it.text.trim().replace("\n", "") }
         } else {
+            // 横排多行用空格连接成完整句子（之前用 \n 会把换行带进原文/译文，
+            // ML Kit 逐行翻译时表现很怪；排版交给渲染侧按气泡宽度自动换行）。
             blocks.sortedWith(compareBy<TextBlock> { it.top }.thenBy { it.left })
-                .joinToString(separator = "\n") { it.text.trim() }
+                .joinToString(separator = " ") { it.text.trim() }
         }.trim()
         if (orderedText.isBlank()) return null
 
@@ -394,7 +396,7 @@ class BubbleFirstRegionPlanner {
         imageHeight: Int,
         separatedByWhitespace: ((TextBlock, TextBlock) -> Boolean)?
     ): Boolean {
-        if (separatedByWhitespace?.invoke(a, b) == true) return false
+        if (isGutterSeparated(a, b, separatedByWhitespace)) return false
         return BubbleMergeHeuristics.shouldMerge(
             a = BubbleGeometry.mergeCandidate(a),
             b = BubbleGeometry.mergeCandidate(b),
@@ -412,7 +414,7 @@ class BubbleFirstRegionPlanner {
         imageHeight: Int,
         separatedByWhitespace: ((TextBlock, TextBlock) -> Boolean)?
     ): Boolean {
-        if (separatedByWhitespace?.invoke(a, b) == true) return false
+        if (isGutterSeparated(a, b, separatedByWhitespace)) return false
         val decision = BubbleMergeHeuristics.shouldMerge(
             a = BubbleGeometry.mergeCandidate(a),
             b = BubbleGeometry.mergeCandidate(b),
@@ -422,14 +424,34 @@ class BubbleFirstRegionPlanner {
         )
         if (!decision.merge) return false
         val regionWidth = (region.right - region.left).coerceAtLeast(1f)
-        val regionHeight = (region.bottom - region.top).coerceAtLeast(1f)
+        val maxH = max(a.heightPx(), b.heightPx()).coerceAtLeast(1f)
         val horizontalSeparation = max(0f, max(a.left, b.left) - min(a.right, b.right))
         val verticalSeparation = max(0f, max(a.top, b.top) - min(a.bottom, b.bottom))
         if (horizontalSeparation > regionWidth * 0.16f) return false
-        if (verticalSeparation > regionHeight * 0.12f && !(isVerticalTextBlock(a) || isVerticalTextBlock(b))) {
+        // 行距超过 1.2 倍字高视为不同气泡（此前按区域高度 12% 判定过严，
+        // 会把同一气泡的多行拆开，导致逐行翻译）。
+        if (verticalSeparation > maxH * 1.2f && !(isVerticalTextBlock(a) || isVerticalTextBlock(b))) {
             return false
         }
         return true
+    }
+
+    /**
+     * 白色空隙分隔判定：仅当空隙足够大（≥1.5 倍字高，真实页距/面板间距）时才视为分隔。
+     * 同一段落/气泡的行间空隙通常只有 0.3~0.8 倍字高，白色空隙检测会把相邻行误判为
+     * 分隔，导致 ML Kit 逐行翻译（译文很怪）。
+     */
+    private fun isGutterSeparated(
+        a: TextBlock,
+        b: TextBlock,
+        separatedByWhitespace: ((TextBlock, TextBlock) -> Boolean)?
+    ): Boolean {
+        if (separatedByWhitespace == null) return false
+        val hGap = max(0f, max(a.left, b.left) - min(a.right, b.right))
+        val vGap = max(0f, max(a.top, b.top) - min(a.bottom, b.bottom))
+        val minH = min(a.heightPx(), b.heightPx()).coerceAtLeast(1f)
+        if (vGap >= hGap && vGap < minH * GUTTER_MIN_GAP_RATIO) return false
+        return separatedByWhitespace(a, b)
     }
 
     private fun isVerticalTextBlock(block: TextBlock): Boolean {
@@ -453,6 +475,8 @@ class BubbleFirstRegionPlanner {
         private const val BUBBLE_SPLIT_BASE_GAP_PX = 8f
         private const val BUBBLE_SPLIT_PADDING_X = 0.26f
         private const val BUBBLE_SPLIT_PADDING_Y = 0.20f
+        // 白色空隙只有在 ≥1.5 倍字高（真实页距）时才视为分隔
+        private const val GUTTER_MIN_GAP_RATIO = 1.5f
     }
 }
 

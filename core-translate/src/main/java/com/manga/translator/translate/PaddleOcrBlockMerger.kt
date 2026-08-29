@@ -71,9 +71,22 @@ object PaddleOcrBlockMerger {
             val overlapY = min(a.bottom, b.bottom) - max(a.top, b.top)
             val centerYDist = abs(a.centerY() - b.centerY())
             val gapX = max(0f, max(a.left, b.left) - min(a.right, b.right))
-            overlapY >= minH * MIN_OVERLAP_RATIO &&
+            val sameRow = overlapY >= minH * MIN_OVERLAP_RATIO &&
                 centerYDist <= maxH * BASELINE_DIST_RATIO &&
                 gapX <= maxH * INLINE_GAP_RATIO
+            if (sameRow) return true
+            // 倾斜行的楼梯式碎片：基线随行斜率逐级偏移，垂直重叠可能很小甚至为负，
+            // 但只要高度一致、中心连线斜率落在合理倾斜角内、水平间隔合理，仍视为同一行。
+            val dx = abs(a.centerX() - b.centerX())
+            val dy = abs(a.centerY() - b.centerY())
+            val slope = if (dx <= 1f) 0f else dy / dx
+            // 2026-08-27 收紧：倾斜楼梯碎片必须高度一致，防止不同字号/不同行误合并。
+            val heightConsistent = max(hA, hB) / min(hA, hB) <= SLANT_HEIGHT_RATIO_LIMIT
+            val slanted = heightConsistent &&
+                slope in SLANT_SLOPE_MIN..SLANT_SLOPE_MAX &&
+                gapX <= maxH * SLANT_INLINE_GAP_RATIO &&
+                overlapY >= -maxH * SLANT_NEG_OVERLAP_LIMIT
+            slanted
         }
     }
 
@@ -124,17 +137,22 @@ object PaddleOcrBlockMerger {
             (a.centerY() - b.centerY()).toDouble()
         ).toFloat()
 
+        // 2026-08-27 收紧：段落合并首先要求主轴中心距不超过严格阈值，防止跨列/跨气泡误合并。
+        // 横排看垂直中心距，竖排看水平中心距。
+        val axisCenterDist = if (aVertical) abs(a.centerX() - b.centerX()) else abs(a.centerY() - b.centerY())
+        if (axisCenterDist > avgH * PARAGRAPH_MAX_AXIS_DIST_RATIO) return false
+
         return if (aVertical) {
             // 竖排列之间
             hGap <= avgH * PARAGRAPH_INLINE_GAP_RATIO &&
                 overlapX >= minW * PARAGRAPH_OVERLAP_RATIO &&
                 centerDist <= max(wA, wB) * PARAGRAPH_CENTER_DIST_RATIO
         } else {
-            // 横排行之间
-            vGap <= avgH * PARAGRAPH_LINE_GAP_RATIO &&
-                (overlapX >= minW * PARAGRAPH_OVERLAP_RATIO ||
-                    hGap <= minW * PARAGRAPH_ALIGN_GAP_RATIO ||
-                    centerDist <= avgH * PARAGRAPH_CENTER_DIST_RATIO)
+            // 横排行之间：要求同一列有实质重叠，或短行居中缩进对齐（两条都满足才算）
+            val columnAligned = overlapX >= minW * PARAGRAPH_OVERLAP_RATIO
+            val centeredIndent = hGap <= minW * PARAGRAPH_ALIGN_GAP_RATIO &&
+                centerDist <= avgH * PARAGRAPH_CENTER_DIST_RATIO
+            vGap <= avgH * PARAGRAPH_LINE_GAP_RATIO && (columnAligned || centeredIndent)
         }
     }
 
@@ -201,16 +219,27 @@ object PaddleOcrBlockMerger {
     private fun TextBlock.centerY(): Float = (top + bottom) / 2f
 
     // 阈值全部基于字体高度/宽度比例，参考 translator 的 ocr-lines.js
-    private const val HEIGHT_RATIO_LIMIT = 1 / 0.65f // 高度差异不超过 ~1.54 倍
-    private const val MIN_OVERLAP_RATIO = 0.45f
-    private const val BASELINE_DIST_RATIO = 0.35f
-    private const val CENTER_DIST_RATIO = 0.35f
-    private const val INLINE_GAP_RATIO = 1.2f
+    // 2026-08-26 收紧：此前段落级过松（中心距可达 2 倍字高、行距 1.3 倍字高），
+    // 会把上下相邻的不同气泡/旁白误合并成一个句子。
+    // 2026-08-27 再次收紧：用户反馈仍太宽松，减少跨气泡/跨行误合并。
+    private const val HEIGHT_RATIO_LIMIT = 1 / 0.72f // 高度差异不超过 ~1.39 倍
+    private const val MIN_OVERLAP_RATIO = 0.55f
+    private const val BASELINE_DIST_RATIO = 0.24f
+    private const val CENTER_DIST_RATIO = 0.24f
+    private const val INLINE_GAP_RATIO = 0.65f
 
-    private const val PARAGRAPH_LINE_GAP_RATIO = 1.3f // 行间距不超过 1.3 倍字高
-    private const val PARAGRAPH_INLINE_GAP_RATIO = 1.2f
-    private const val PARAGRAPH_OVERLAP_RATIO = 0.20f
-    private const val PARAGRAPH_ALIGN_GAP_RATIO = 0.50f
-    private const val PARAGRAPH_CENTER_DIST_RATIO = 2.0f
-    private const val ROW_SPLIT_CENTER_RATIO = 0.35f
+    private const val PARAGRAPH_LINE_GAP_RATIO = 0.65f // 行间距不超过 0.65 倍字高
+    private const val PARAGRAPH_INLINE_GAP_RATIO = 0.65f
+    private const val PARAGRAPH_OVERLAP_RATIO = 0.45f
+    private const val PARAGRAPH_ALIGN_GAP_RATIO = 0.22f
+    private const val PARAGRAPH_CENTER_DIST_RATIO = 0.85f
+    private const val PARAGRAPH_MAX_AXIS_DIST_RATIO = 1.5f // 段落合并前主轴中心距上限（横排看 Y、竖排看 X）
+    private const val ROW_SPLIT_CENTER_RATIO = 0.30f
+
+    // 倾斜行楼梯碎片合并：中心连线斜率范围（tan，约 2°~19°）
+    private const val SLANT_SLOPE_MIN = 0.03f
+    private const val SLANT_SLOPE_MAX = 0.35f
+    private const val SLANT_INLINE_GAP_RATIO = 0.70f
+    private const val SLANT_NEG_OVERLAP_LIMIT = 0.15f
+    private const val SLANT_HEIGHT_RATIO_LIMIT = 1 / 0.80f // 倾斜碎片高度差异不超过 1.25 倍
 }

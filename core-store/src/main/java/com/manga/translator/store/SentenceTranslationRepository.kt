@@ -55,6 +55,10 @@ class SentenceTranslationRepository(context: Context) {
             ensureLoaded()
             val exactKey = "$langKey|$normalized"
             index[exactKey]?.let { entry ->
+                if (isPoisoned(entry, normalized)) {
+                    Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=exact text=${truncate(originalText)}")
+                    return SentenceCacheLookup.MISS
+                }
                 return SentenceCacheLookup(entry.translatedText, SentenceCacheMatchKind.EXACT)
             }
 
@@ -65,6 +69,10 @@ class SentenceTranslationRepository(context: Context) {
                 if (compactCandidates.isNotEmpty()) {
                     compactCandidates.firstOrNull()?.let { rawKey ->
                         index[rawKey]?.let { entry ->
+                            if (isPoisoned(entry, normalized)) {
+                                Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=compact text=${truncate(originalText)}")
+                                return SentenceCacheLookup.MISS
+                            }
                             return SentenceCacheLookup(entry.translatedText, SentenceCacheMatchKind.COMPACT)
                         }
                     }
@@ -85,6 +93,10 @@ class SentenceTranslationRepository(context: Context) {
                     }
                     if (bestRawKey != null) {
                         index[bestRawKey]?.let { entry ->
+                            if (isPoisoned(entry, normalized)) {
+                                Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=fuzzy text=${truncate(originalText)}")
+                                return SentenceCacheLookup.MISS
+                            }
                             Log.d(
                                 TAG,
                                 "lookup fuzzy_hit lang=$langKey dist=$bestDist " +
@@ -104,6 +116,12 @@ class SentenceTranslationRepository(context: Context) {
         val normalized = normalize(originalText)
         val value = normalize(translatedText)
         if (normalized.isEmpty() || value.isEmpty()) return
+        if (value == normalized) {
+            // 译文等于原文：视为翻译未生效（本地引擎失败回退、模型原样返回等），不入缓存，
+            // 否则会形成"原文当译文"的毒化条目，后续全部命中显示原文。
+            Log.d(TAG, "put skip_noop lang=$sourceLanguage|$targetLanguage text=${truncate(originalText)}")
+            return
+        }
         synchronized(lock) {
             ensureLoaded()
             val key = keyOf(sourceLanguage, targetLanguage, normalized)
@@ -249,6 +267,12 @@ class SentenceTranslationRepository(context: Context) {
             curr = tmp
         }
         return prev[b.length]
+    }
+
+    private fun isPoisoned(entry: SentenceTranslation, normalizedQuery: String): Boolean {
+        // 历史遗留：早期"本地引擎失败/未配置云端 API"时会把原文当译文写入缓存。
+        // 命中此类条目视为未命中，允许重新翻译并覆盖。
+        return entry.translatedText == normalizedQuery
     }
 
     private fun truncate(text: String): String {

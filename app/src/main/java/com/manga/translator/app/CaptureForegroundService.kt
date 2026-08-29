@@ -156,6 +156,10 @@ class CaptureForegroundService : Service() {
             it.start(resultCode, data, displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.densityDpi)
         }
         overlayController = ServiceLocator.createOverlayController()
+        // 2026-08-27 防御：启动时强制清除可能残留的译文层/锁定层，
+        // 避免"上次的译文层突然出现在屏幕上且屏幕被锁定层拦截"。
+        overlayController?.unlockTranslationLayer()
+        overlayController?.clearTranslationLayer()
         orchestrator = TranslateOrchestrator(captureController!!, overlayController!!)
         ensureSystemUiReceiver()
         ensureAccessibilityMonitor()
@@ -176,6 +180,16 @@ class CaptureForegroundService : Service() {
 
         overlayController?.showFloatingButton {
             if (translateJob?.isActive == true) {
+                return@showFloatingButton
+            }
+            // 2026-08-27 新增：译文层显示/锁定时点击悬浮球 = 恢复原文（清除译文层），
+            // 不触发新翻译，避免出现"应该点不动/恢复原文，结果却显示翻译中"。
+            if (overlayController?.hasActiveTranslationLayer() == true) {
+                Log.d("TranslationPerf", "floating_tap_restore_original")
+                overlayController?.unlockTranslationLayer()
+                overlayController?.clearTranslationLayer()
+                overlayController?.setFloatingState(FloatingState.IDLE, null)
+                clearOverlayTracking()
                 return@showFloatingButton
             }
             overlayController?.unlockTranslationLayer()
@@ -215,8 +229,12 @@ class CaptureForegroundService : Service() {
                 try {
                     overlayController?.setFloatingState(FloatingState.CAPTURING, "截图中")
                     val outcome = current.runOnce { state ->
-                        if (state == FloatingState.TRANSLATING) {
-                            overlayController?.setFloatingState(FloatingState.TRANSLATING, "翻译中")
+                        when (state) {
+                            FloatingState.MODEL_LOADING ->
+                                overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "正在下载翻译模型")
+                            FloatingState.TRANSLATING ->
+                                overlayController?.setFloatingState(FloatingState.TRANSLATING, "翻译中")
+                            else -> {}
                         }
                     }
                     onCaptureSuccess()

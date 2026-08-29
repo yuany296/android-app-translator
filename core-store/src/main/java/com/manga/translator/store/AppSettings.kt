@@ -18,5 +18,8 @@ data class AppSettings(
     val enableThinking: Boolean = false,
     val thinkingBudget: Int = 8192,
     val ocrEngine: String = OcrEngine.ML_KIT.id,
-    val translateEngine: String = TranslateEngine.CLOUD.id
+    val ocrSpeedMode: String = OcrSpeedMode.BALANCED.id,
+    val translateEngine: String = TranslateEngine.CLOUD.id,
+    val baiduTranslateAppId: String = "",
+    val baiduTranslateSecretKey: String = ""
 )

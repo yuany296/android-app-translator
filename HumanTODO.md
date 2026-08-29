@@ -1,7 +1,175 @@
 # Human TODO（待人工确认）
 
-- 日期：2026-08-25
+- 日期：2026-08-27
+- 维护者：DSH Agent
+
+## 2026-08-27 接入百度翻译 API（免费 500 万字符/月 + 整页批量快译）待真实验证
+
+- 背景：用户要求"免费又快，或便宜点"的翻译方案；已确认用户有百度翻译开放平台账号。
+- 改动：
+  1. 新增 `BaiduTranslateClient`（core-translate）：专用翻译接口，q 以 `\n` 分隔多行**整页一次请求**（延迟 <1s）；自动按 2000 字节分批（标准版限制）+ QPS=1 批间间隔；MD5(appid+q+salt+secretKey) 签名；语言映射 en/ja→jp/ko→kor/zh/cht。
+  2. `TranslateEngine` 新增 `BAIDU("百度翻译（免费额度，快）")`；`AppSettings`/`SettingsRepository` 新增 `baiduTranslateAppId`/`baiduTranslateSecretKey`（加密存储 + 档案 JSON）。
+  3. `TranslateOrchestrator.translateMissing` 新增 BAIDU 分支：未配置 → 提示"百度翻译未配置 APP ID/密钥"；失败 → 提示原因并显示原文（不回退云端）；成功 → 结果入句子缓存（再次翻译零延迟）。
+  4. 翻译设置页：选百度引擎时显示「百度翻译配置」（APP ID / 密钥输入框，即输即存）。
+- 模拟器已验证：翻译设置页可切换「百度翻译」引擎、配置输入框正常显示。
+- 待人工验证（需真实 APP ID/密钥）：
+  1. 在 fanyi-api.baidu.com 开通「通用文本翻译」标准版（免费）→ 填 APP ID + Secret Key。
+  2. 翻译一页：logcat 过滤 `TranslationPerf` 应见 `translate_local` 或 `mode=baidu` 的 `request_send/response_ok`，总耗时应显著低于大模型（OCR 除外）。
+  3. 质量确认：百度专用翻译对漫画对白的可读性（预期不如大模型，但快）。
+- 日期：2026-08-27
+- 维护者：DSH Agent
+
+## 2026-08-27 译文层显示时点悬浮球 = 恢复原文（模拟器已验证）
+
+- 背景：用户反馈「出现译文层时点击悬浮球，本应恢复原文/点不动，实际状态却显示翻译中」。
+- 根因：悬浮球点击回调无条件启动新翻译（先 unlock 再 runOnce），译文层显示时点悬浮球会重新走一遍「截图中→翻译中」流程。
+- 改动：
+  1. `OverlayController` 新增 `hasActiveTranslationLayer()`（translationLocked 或译文层有子 View）。
+  2. `CaptureForegroundService` 悬浮球点击回调：`hasActiveTranslationLayer()==true` 时 → `floating_tap_restore_original` 日志 → 解锁 + 清除译文层 + 悬浮球回 IDLE + `clearOverlayTracking()` + 直接 return（不启动新翻译）。
+- 模拟器验证：
+  - 翻译完成锁定（14 气泡）→ 点击悬浮球 → `floating_tap_restore_original` + `clear_translation_layer states=14`，**无**「翻译中」状态；
+  - 无译文层时点击悬浮球 → `start: 0ms` 正常翻译（无回归）。
+- 真机确认：译文层显示时点悬浮球应直接恢复原文；无译文层时点悬浮球照常翻译。
+- 日期：2026-08-27
+- 维护者：DSH Agent
+
+## 2026-08-27 ML Kit 无法翻译 / 不要回退云端 / 译文层突然出现 修复（模拟器已验）
+
+- 背景：用户反馈「ML Kit 翻译模型下载了但还是无法翻译或返回原文」「不要进行到云端的回退」「莫名出现之前的译文层、整个屏幕动不了」。
+- 根因（模拟器 logcat 定位）：
+  1. **质量检查误判**：上一版 `mlkit_translate_suspicious`/`mlkit_translate_noop` 把纯符号/emoji 文本（如 `+ ②`、`😍`）判为"翻译未生效"→ 整批抛异常 → 回退云端 → 无云端配置 → 显示原文。日志见 `mlkit_translate_suspicious text=+ ②`、`mlkit_translate_noop text=😍`。
+  2. **模型未就绪时阻塞过长**：旧逻辑 `ensureModelDownloaded` 120s×3 重试，网络差时点击一次卡住 6 分钟（日志 `mlkit_translate_download_retry ... Timed out waiting for Task`）。
+  3. **用户要求不回退云端**：选 ML Kit 引擎时失败仍走云端回退分支。
+  4. **译文层残留/手势拦截**：锁定层多指手势被 BLOCKED，阅读器里双指缩放/滑动感觉"屏幕动不了"。
+- 改动：
+  1. `MlKitLocalTranslator.translate` 逐句容错：单句失败只保留该句原文，不拖垮整批；**纯符号/emoji/数字文本（无语言字符）原样返回，不做质量检查**（`containsTranslatableScript`）；全部失败才抛异常。
+  2. `MlKitLocalTranslator` 新增 `ensureModelReadyOrThrow`：翻译前 3s 快速探测磁盘缓存；未缓存 → 触发后台下载 + 抛"模型下载中，请稍后重试"（不再阻塞 6 分钟）。
+  3. `TranslateOrchestrator.translateMissing`：**选择 ML Kit 引擎时本地失败直接返回原文+Toast 提示，不再回退云端**（删除"已改用云端"分支）；部分失败提示"本地翻译部分句子未生效（N/M 句已显示原文）"。
+  4. `CaptureForegroundService.startOverlayFlow` 启动时强制 `unlockTranslationLayer()` + `clearTranslationLayer()`，清除可能残留的旧译文层。
+  5. `TranslationLockGesturePolicy`：任何手势（点击/滑动/长按/**双指**）都释放锁定并清除译文，不再 BLOCKED。
+- 模拟器验证（Pixel_8，OCR=PaddleOCR fast、翻译=ML Kit en→zh，模型已就绪）：
+  - `translate_local: ok=mlkit count=4 / count=10` —— ML Kit 翻译成功，未回退云端；
+  - 翻译完成后 `translation_layer_locked` → 点击/滑动解锁 → `clear_translation_layer states=N` 正常清除；
+  - `paddle_total_ms=4876 speed_mode=fast`（OCR 快速模式生效）；
+  - 服务启动日志 `translation_layer_unlocked / clear_translation_layer states=0`（防御性清除生效）。
+- 真机验证清单：
+  1. 切「ML Kit 本地翻译」翻译英文/韩文/日文页：logcat 过滤 `TranslationPerf` 应见 `translate_local ok=mlkit count=N`；**不再出现** `translate_local_fallback ... 已改用云端`。
+  2. 若点击后提示"翻译模型下载中，请稍后重试"：等通知栏下载完成后再点一次即可翻译（不再卡 6 分钟）。
+  3. 纯 emoji/符号文本（如 😍、+②）应原样显示且不报错（logcat 无 `mlkit_translate_suspicious`）。
+  4. 译文显示期间任意滑动/双指缩放应立即清除译文层（不再"屏幕动不了"）；重启服务不应出现旧译文层。
+- 日期：2026-08-27
+- 维护者：DSH Agent
+
+## 2026-08-27 PaddleOCR 合并收紧 + 速度模式 + 倾斜文字日志 + ML Kit 质量检查
+
+- 改动：
+  1. `PaddleOcrBlockMerger` 再次收紧合并阈值，减少跨气泡/跨行误合并。
+  2. 新增 `OcrSpeedMode` 枚举与首页选择器（PaddleOCR 引擎下显示）：快速/均衡/质量。
+  3. `PaddleOcrLocalTextDetector` 按速度模式调整检测分辨率与识别变体数量。
+  4. 倾斜文字：`PaddleQuadGeometry.checkQuadHealth` 退化四边形检查、`cropQuad` 减小高长宽比倾斜框 padding、增加 `crop_fail`/`degenerate`/`speed_mode` 日志。
+  5. `MlKitLocalTranslator` 新增「译文质量可疑」启发式检查（目标中文时 CJK 表意文字占比过低），回退云端。
+- 需重新构建并安装最新 APK（`scripts\build_debug.bat` + `install_debug.bat`）。
+- 真机验证清单：
+  1. PaddleOCR 合并：找一页含多个相邻气泡/旁白的漫画，确认不同气泡不再被误合并成一句（logcat 过滤 `PaddleOcr` 看 `merged=N` 与原文是否匹配）。
+  2. PaddleOCR 速度：首页切换「快速/均衡/质量」模式，同一页连续翻译 3 次，过滤 `paddle_total_ms` 对比耗时；快速模式应明显更快。
+  3. 倾斜文字：找含斜放气泡/拟声字的页面，过滤 `PaddleOcr` 看 `paddle_quad_degenerate` / `paddle_crop_fail` 数量；确认倾斜字译文不再明显拉伸/错位。
+  4. ML Kit 翻译：选择「ML Kit 本地翻译」翻译日漫/韩漫页，若译文仍含大量原文假名/韩文，应弹出提示并回退云端（logcat `mlkit_translate_suspicious`）。
+- 日期：2026-08-26
 - 维护者：OpenCode
+
+## 2026-08-26 ML Kit 翻译"返回全是原文"根因修复（模拟器+真机已验证）
+
+- 背景：用户反馈 ML Kit 本地翻译"无用，返回的全是原文"，且已确认模型下载成功。
+- 根因（排障闭环：logcat `TranslationPerf`）：
+  - **主因（运行时崩溃）**：`request_send stage=translate` 之后立即 `response_fail reason=Animators may only be run on Looper threads`。
+    `translateMissing` 在 `withContext(ioDispatcher)` 里调用 `onTranslatorDownloading?.invoke(true/false)`，该回调触发
+    `OverlayController.setFloatingState(MODEL_LOADING/TRANSLATING)` → `startPulse()`（View.animate）→ 非主线程抛异常 →
+    `runCatching` 捕获 → 所有气泡回显原文，**ML Kit 根本没被调用**（模型下载成功与否都无所谓）。
+  - 次要（缓存毒化，防御性修复）：历史上"本地引擎失败+未配置云端 API"路径会把原文当译文 `sentenceRepo.put` 永久缓存，
+    之后全部命中显示原文；ML Kit 模型对汉字/假名混合文本原样返回时同样被缓存。
+- 改动：
+  1. `TranslateOrchestrator.translateMissing`：`onTranslatorDownloading` 的两次 invoke 用 `withContext(Dispatchers.Main)` 包裹。
+  2. `MlKitLocalTranslator.translate`：输出规范化后等于输入（或空白）→ 视为翻译未生效，抛异常回退云端（log `mlkit_translate_noop`）。
+  3. `SentenceTranslationRepository`：`put` 跳过"译文==原文"（log `put skip_noop`）；`lookup` 命中"译文==原文"条目视为 miss
+     （log `lookup poisoned_skip`），旧毒化缓存自动失效、重新翻译后覆盖。
+  4. `TranslateOrchestrator`：本地失败提示保留（不再被"未配置云端 API"分支吞掉），失败时提示"本地翻译不可用（原因）；未配置云端 API，已显示原文"。
+- 验证：
+  - 新增 androidTest `MlKitTranslateVerificationTest`（`app/src/androidTest/...`）：模拟器 Pixel_8 与真机 MAA-AN10 均通过
+    （failures=0）。模拟器实测输出：`Hello world, this is a test.` → `你好世界，这是一个测试`；`The heroes were born in that age.` → `英雄出生在那个年龄`。
+    证明 ML Kit 模型（en→zh 已缓存）与翻译本身工作正常，问题只在编排层崩溃。
+  - 单元测试：core-store / core-translate / core-overlay / app 全部 BUILD SUCCESSFUL。
+- 待人工确认（真机复测）：
+  1. 已安装修复 APK（MAA-AN10 与模拟器均已装）：选「ML Kit 本地翻译」翻译页面，logcat 过滤 `TranslationPerf` 应见
+     `translate_local ok=mlkit count=N`（不再 `response_fail ... Animators`）；悬浮球状态应依次显示「正在下载翻译模型/翻译中」。
+  2. 若此前有"原文当译文"的历史缓存：`SentenceCache` 会打 `lookup poisoned_skip` 并重新翻译（无需手动清缓存，重译后自动覆盖）。
+  3. 确认 ML Kit 端侧模型翻译质量：对汉字/假名混合文本若仍原样返回，会回退云端并提示（属模型质量限制，非故障）。
+
+## 2026-08-25 ML Kit 翻译模型下载修复 + 真机下载超时排查
+
+- 背景：真机（荣耀 100 国行，MAA-AN10）选「ML Kit 本地翻译」后回退到原文；模拟器可正常下载。
+- 已修复（app 侧）：
+  1. **下载超时 8s → 120s×3 次重试**（`MlKitLocalTranslator.kt`）：原 8s 超时对 10~40MB 模型必然误判失败 → 回退云端 → 无云端 API 时显示原文。模拟器验证下载成功。
+  2. **首页新增手动下载入口**：按钮带语言对标注（如「下载 英文 → 简体中文 翻译模型」），显示下载中/已就绪/失败原因+重试。
+  3. **磁盘探测 `isDownloaded`**（短超时 probe）：重启后不再误显示下载按钮；模型已缓存时首页显示「XX → YY 翻译模型已就绪，可离线翻译」，不出现按钮。
+  4. **翻译引擎选择器移到「翻译设置」页**（首页只留源/目标语言 + OCR 引擎；下载按钮留在首页，因模型按源→目标语言对配对）。
+- 模拟器已验证：缓存后重启显示「韩文 → 简体中文 翻译模型已就绪」；设置页可见翻译引擎选择器。
+- **真机最终结论（2026-08-25 晚间复测）：荣耀 100 国行可以下载 ML Kit 模型！** 之前多次「Timed out waiting for Task」是**网络过慢/卡顿**导致，120s×3 重试在网速好转后下载成功（首页显示「英文 → 简体中文 翻译模型已就绪」）。此前对"国行荣耀未认证导致 GMS 模型服务卡死"的判断**不成立**，保留备查。
+
+### ML Kit 端侧翻译的硬性条件（实测修正版）
+
+1. **设备需安装 Google Play 服务（GMS）**：国行华为/荣耀用安装器装的 GMS 也能正常工作（本机实测通过，只要网络能访问 Google）。
+2. **必须能联网访问 Google 服务器**：模型（10~40MB）运行时从 Google CDN 下载；国内需系统级翻墙（仅浏览器代理不够）。网络慢会触发超时（app 已 120s×3 重试兜底）。可用 curl 验证：`curl -m 8 https://dl.google.com` 返回 404 即网络通（404=可达，非错误）。
+3. **翻译模型没有捆绑版**：ML Kit 官方仅提供运行时下载（`com.google.mlkit:translate`），不存在"打进 APK"的选项。与 OCR 形成对比：zh/ja/ko OCR 有捆绑版依赖（模型随 APK 安装、离线可用），PaddleOCR 完全自带。
+4. **语言对限制**：仅英/日/韩 → 简体中文及互译；繁体中文目标不支持（自动回退云端）。
+
+### 排查过程留档（2026-08-25）
+
+- GMS 26.32.34 与模拟器一致、Play 商店无更新 → 排除版本问题。
+- curl 验证 dl.google.com / firebasestorage / gstatic 均可达 → 网络通；但实测下载仍多次超时，最终在网速好转后成功 → 定位为**网络慢**而非认证/版本问题。
+- 存储 40G 空闲、GMS 未停用 → 排除资源/禁用问题。
+
+## 2026-08-25 倾斜/变形文字处理（PaddleOCR）人工验证
+
+- 背景：用户要求参考 `C:\homework\translator` 处理图片中的倾斜文字/变形文字（竖排、旋转、透视变形）。
+- 改动（`PaddleOcrLocalTextDetector` + 新增 `PaddleQuadGeometry`，对齐参考项目 crop_geometry.py / crop_recognition.py）：
+  1. **透视矫正裁剪修复**：`cropQuad` 目标宽高改用四边形边长（width=max(上,下)、height=max(左,右)），此前用轴对齐包围盒会把倾斜字拉伸变形；并外扩 padding（min(12, max(2, 边长×0.06))）+ 双线性过滤绘制（等价 INTER_CUBIC）。
+  2. **角点排序修复（排障闭环）**：`orderedCorners` 原按象限归类，薄/倾斜矩形两个角落在同一象限互相覆盖 → 退化四边形（如 `quad=233.2,95.3|233.2,95.3|695.2,334.3|695.2,334.3`）→ 透视裁剪失败、倾斜文字整体漏识别。改为参考项目 `_order_polygon_points` 角度排序法（按相对中心角度排序 + 最小(x+y)起点 + 叉积定向）；另加退化兜底（近零厚度矩形退化为轴对齐包围盒 quad）。
+  3. **竖排文字（高≥宽×1.4）**：deskew 后旋转 ±90° 生成两个方向候选分别识别，按「识别质量（置信度+目标文字奖励）」+「检测四边形旋转方向偏好」择优（`selectBestOrientation`，平局容差 0.08）；先双方向原图识别、高分即级联结束，仅质量更优方向跑全变体投票，控制耗时。
+  4. **横排弱结果 180° 重试**：0° 识别分数 < 0.72 或无目标文字时旋转 180° 重试，质量更优才采纳（与参考项目一致的已知局限：倒置假名可能被识别成高置信乱码如 `ギ4コソコ` @0.91 而不触发重试）。
+- 单测：`PaddleQuadGeometryTest` 12 条通过。
+- 模拟器已验证（Pixel_8 API 16，`PaddleSkewVerticalTextTest` 3 条全绿）：
+  1. 竖排「こんにちは」列 → `paddle_quad rot=89 vertical=true orient=-90 text=んにちば score=0.943`（4/5 字正确，首字こ→ん为 rec 模型小字误识）。
+  2. 15° 倾斜行 → `rot=14 vertical=false orient=0 text=こんにちは score=0.996` 完全正确（修复前整行漏识别）。
+  3. 180° 倒置行 → 产出块但为乱码（见上局限 4）。
+  4. 回归：`PaddleOcrKoreanMangaTest` 韩漫截图（뭔가/있는가 合并、단순히 均通过；底部彩色大字由仅「이」改善为「이거」@0.737，「재밌네」仍漏检 —— 2026-08-24 起记录的既有 FAIL，非本次回归）；`PaddleOcrLocalTextDetectorTest`、`PaddleComplexBackgroundsTest` 均通过。
+- 真机验证清单（过滤 logcat `PaddleOcr`）：
+  1. **竖排日漫页**（日文源语言）：确认竖排对白/旁白被识别（`paddle_quad ... vertical=true orient=+90/-90 ...`，`paddle_total_ms` 行 `vertical=N orient90=.. orient-90=..`）；译文块按列正确合并（原文顺序从右到左）。
+  2. **倾斜文字**（斜放气泡文字、倾斜拟声字）：确认 `paddle_quad rot=..` 非 0 的框正常出字、无拉伸变形错字。
+  3. **旋转 180° 场景**（气泡里倒置文字）：确认 `rot180=N` 出现且文本正确；若倒置字被高置信乱码吞掉（如 `ギ4コソコ`），反馈 logcat 评估是否放宽重试阈值。
+  4. **性能**：竖排页 `paddle_total_ms` 增幅可接受（每竖排框约 2~10 次 rec）；若明显变慢（>2s），反馈 logcat 评估限制方向候选数量。
+  5. 对照参考项目：同一张含竖排/倾斜文字的截图，识别结果应与 `C:\homework\translator` 本地 OCR 服务输出量级一致。
+
+## 2026-08-25 PaddleOCR 模型打包进 APK（离线免下载）人工验证
+
+- 背景：用户反馈「打包时自带本地 Paddle 模型，而不是交给软件下载（怕下载不来）」；经确认，**只打包 Paddle OCR 模型**（ML Kit OCR 随 Play 服务自带、无需下载；ML Kit 翻译模型由 Google Play 服务 Dynamite 管理，**技术上无法**打进 APK，仅能走下载）。
+- 改动：
+  - `PaddleOcrLocalTextDetector.ensureModelsLoaded`：**优先从 assets 加载**模型（复制到 filesDir 供 ONNX `createSession` 用），assets 缺失时才回退在线下载（det/rec 各自独立判断，语言可部分打包）。
+  - `PaddleModelCatalog` 新增 `detAssetName()` / `recAssetName(key)`（`paddle_models/xxx.onnx`）。
+  - 新增下载脚本 `scripts\download-paddle-models.ps1`（纯 ASCII，兼容 PowerShell 5.1 GBK 解析）：在联网电脑运行一次，把 det + zh/ja/ko rec 四个 ONNX 下载/解包到 `core-translate\src\main\assets\paddle_models\`，下次 `assembleDebug` 即打进 APK。
+- 模型清单（已确认打进 `app-debug.apk`：`assets/paddle_models/`）：
+  - `PP-OCRv5_mobile_det.onnx`（det，4.8MB）
+  - `PP-OCRv5_mobile_rec.onnx`（rec-zh，16.5MB）
+  - `japan_PP-OCRv5_mobile_rec.onnx`（rec-ja，10.0MB）
+  - `korean_PP-OCRv5_mobile_rec.onnx`（rec-ko，13.4MB）
+  - 注：字典 txt 早已在 assets（paddle_zh/ja/ko_dict.txt）。
+- **状态：脚本已跑通、模型已打包、assembleDebug 成功（APK 约 266MB，含 4 个 onnx）。**
+- **模拟器验证已通过（Pixel_8 AVD）：** androidTest `PaddleOcrLocalTextDetectorTest` 走 assets 离线加载，logcat 见 `model_loaded_from_asset path=paddle_models/japan_PP-OCRv5_mobile_rec.onnx bytes=10031937`，全程无 `model_download_*`，识别「こんにちは世界」通过（paddle_total_ms=623, lang=ja）。真机 MAA-AN10 的 androidTest 安装被系统拦截（INSTALL_FAILED_ABORTED，HarmonyOS 拒绝测试 APK 安装），与本次改动无关。
+- 人工验收清单（剩余步骤，需真机）：
+  1. 安装到**无网络**设备，切 PaddleOCR 引擎翻译：logcat 过滤 `PaddleOcr` 看 `model_loaded_from_asset path=paddle_models/...`，全程无 `model_download_*`、不联网也能 OCR。首次翻译不应再有"下载模型"的明显等待。
+  2. 若 assets 删掉某个模型（模拟只打包部分语言），对应语言仍应回退下载（logcat `model_asset_missing` → `model_download_start`）。
+  3. 打包后特殊字体/彩色大字识别率相对下载模式无回退（复用语言模型一致）。
+
+---
 
 ## 2026-08-25 本地翻译引擎（ML Kit 端侧翻译）人工验证
 
@@ -17,6 +185,11 @@
   4. 目标语言选「繁体中文」时：本地引擎不支持会自动回退云端（`translate_local_skip reason=unsupported_pair`）。
   5. 本地译文质量与云端对比如可接受（端侧模型质量一般低于大模型，台词恐有翻译腔）。
   6. 确认未配置云端 API + 选择本地引擎时仍能正常翻译（之前"仅OCR"分支不再拦截本地引擎）。
+- **无 Google Play 服务设备（华为/荣耀纯鸿蒙、EMUI 无 GMS）说明**：
+  - ML Kit 端侧翻译依赖 Google Play 服务，**无 GMS 设备上不可用**。
+  - 本项目策略（按用户确认）：**华为/荣耀不专门接入离线翻译，需要时自动回退云端**。
+  - 验证：在无 GMS 设备上即使误选「ML Kit 本地翻译」引擎，应自动回退云端（logcat 过滤 `TranslationPerf` 看 `translate_local_fallback reason=...`，随后走 `request_send mode=cloud`），不应卡死/报错；**且翻译完成时会弹出明确提示 Toast**「本地翻译不可用，已改用云端（...）」；默认「云端 API」引擎行为不受影响。
+  - 附带：无 GMS 设备上「OCR 引擎」的 ML Kit OCR 同样不可用，但 PaddleOCR（ONNX）可用。
 
 ## 2026-08-25 PaddleOCR 提速 + 模拟器联网 人工验证
 

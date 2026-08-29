@@ -13,6 +13,7 @@ import com.manga.translator.store.PageOverlayAdjustmentRepository
 import com.manga.translator.store.SentenceTranslationRepository
 import com.manga.translator.store.SettingsRepository
 import com.manga.translator.store.TranslationHistoryRepository
+import com.manga.translator.translate.BaiduTranslateClient
 import com.manga.translator.translate.LocalTextDetector
 import com.manga.translator.translate.LocalTranslator
 import com.manga.translator.translate.MlKitLocalTextDetector
@@ -46,6 +47,8 @@ object ServiceLocator {
         private set
     lateinit var visionClient: OpenAiVisionClient
         private set
+    lateinit var baiduTranslateClient: BaiduTranslateClient
+        private set
     lateinit var localTextDetector: LocalTextDetector
         private set
     lateinit var localTranslator: LocalTranslator
@@ -72,8 +75,12 @@ object ServiceLocator {
         pageOverlayAdjustmentRepository = PageOverlayAdjustmentRepository(appContext)
         captureSessionStateStore = CaptureSessionStateStore(appContext)
         visionClient = OpenAiVisionClient()
+        baiduTranslateClient = BaiduTranslateClient()
         mlKitTextDetector = MlKitLocalTextDetector()
-        paddleTextDetector = PaddleOcrLocalTextDetector(appContext)
+        paddleTextDetector = PaddleOcrLocalTextDetector(
+            appContext,
+            speedModeProvider = { settingsRepository.getSettings().ocrSpeedMode }
+        )
         localTextDetector = EngineSelectingTextDetector(mlKitTextDetector, paddleTextDetector)
         localTranslator = MlKitLocalTranslator()
         eraseProcessor = TieredEraseProcessor()

@@ -23,7 +23,9 @@ import java.nio.FloatBuffer
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.ceil
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -39,7 +41,8 @@ import kotlin.math.roundToInt
  */
 class PaddleOcrLocalTextDetector(
     private val appContext: Context,
-    private val catalog: PaddleModelCatalog = PaddleModelCatalog()
+    private val catalog: PaddleModelCatalog = PaddleModelCatalog(),
+    private val speedModeProvider: (() -> String)? = null
 ) : LocalTextDetector {
 
     private val loadLock = ReentrantLock()
@@ -54,6 +57,18 @@ class PaddleOcrLocalTextDetector(
 
     @Volatile
     private var recCascadeFull = 0
+
+    @Volatile
+    private var verticalCrops = 0
+
+    @Volatile
+    private var verticalOrient90 = 0
+
+    @Volatile
+    private var verticalOrientNeg90 = 0
+
+    @Volatile
+    private var rot180Retries = 0
 
     override fun detect(bitmap: Bitmap, sourceLanguageId: String): List<TextBlock> {
         if (!ensureOpenCvLoaded()) {
@@ -100,10 +115,18 @@ class PaddleOcrLocalTextDetector(
         val startedAt = System.currentTimeMillis()
         val srcW = bitmap.width
         val srcH = bitmap.height
+        verticalCrops = 0
+        verticalOrient90 = 0
+        verticalOrientNeg90 = 0
+        rot180Retries = 0
+
+        // 2026-08-27 新增：按首页选择的 OCR 速度模式调整检测/识别参数。
+        val config = speedModeConfig()
 
         // 1. 主检测：原图 + 默认参数（与参考项目 production 默认值对齐）
         val primaryQuads = runDetPass(
             bitmap = bitmap,
+            resizeLong = config.detResizeLong,
             thresh = DET_THRESH,
             boxThresh = DET_BOX_THRESH,
             unclipRatio = DET_UNCLIP_RATIO,
@@ -114,11 +137,11 @@ class PaddleOcrLocalTextDetector(
         // 2. 如果主检测块数少 / 覆盖率低，跑 recovery 检测：
         //    用增强灰度/二值掩码/反色增强 + 更松的阈值，召回彩色艺术字和低对比度字。
         val coverage = estimateTextCoverage(primaryQuads, srcW, srcH)
-        val needRecovery = primaryQuads.size < RECOVERY_MIN_BLOCKS || coverage < RECOVERY_MIN_COVERAGE
+        val needRecovery = primaryQuads.size < config.recoveryMinBlocks || coverage < config.recoveryMinCoverage
         if (needRecovery) {
-            // recovery 变体只需在降采样工作图上构建：det 内部仍会缩到 DET_RESIZE_LONG，
+            // recovery 变体只需在降采样工作图上构建：det 内部仍会缩到 detResizeLong，
             // 在缩小图上跑像素级变体（灰度/二值/反色）比全分辨率省 ~6 倍，quad 再映射回原图坐标。
-            val scale = min(1f, DET_RESIZE_LONG / max(srcW, srcH).toFloat())
+            val scale = min(1f, config.detResizeLong / max(srcW, srcH).toFloat())
             val workW = max(1, (srcW * scale).roundToInt())
             val workH = max(1, (srcH * scale).roundToInt())
             val work = if (scale < 1f) {
@@ -132,17 +155,20 @@ class PaddleOcrLocalTextDetector(
                 "inv_gray" to { PaddleOcrImagePreprocessor.buildEnhancedGrayscale(work, invert = true) }
             )
             var variantsRun = 0
+            var addedQuads = 0
             for ((name, builder) in variants) {
-                if (variantsRun >= RECOVERY_MAX_VARIANTS) break
+                if (variantsRun >= config.recoveryMaxVariants) break
                 val variant = runCatching { builder() }.getOrNull() ?: continue
                 variantsRun++
                 val quads = runDetPass(
                     bitmap = variant,
+                    resizeLong = config.detResizeLong,
                     thresh = DET_THRESH_RECOVERY,
                     boxThresh = DET_BOX_THRESH_RECOVERY,
                     unclipRatio = DET_UNCLIP_RATIO_RECOVERY,
                     tag = "recovery_$name"
                 )
+                var added = 0
                 for (quad in quads) {
                     val mapped = quad.map { point ->
                         PointF(
@@ -152,26 +178,61 @@ class PaddleOcrLocalTextDetector(
                     }.toTypedArray()
                     if (allQuads.none { existing -> quadIoU(existing, mapped) >= MERGE_IOU_THRESHOLD }) {
                         allQuads += mapped
+                        added++
                     }
                 }
                 variant.recycle()
+                addedQuads += added
+                // 已召回到足够多的新框就停止，减少多余 det 变体耗时。
+                if (addedQuads >= config.recoveryEarlyStopBoxes) break
             }
             if (work !== bitmap) {
                 work.recycle()
             }
         }
 
-        // 3. 对每个候选框在原图上裁剪，并用多个识别变体投票，选出最可信结果。
+        // 3. 对每个候选框在原图上做透视矫正裁剪，再按方向（横排 0° / 竖排 ±90° / 弱结果 180°）识别，
+        //    多个识别变体投票选出最可信结果。
         val recSession = recSessions[recKey] ?: return emptyList()
         val alphabet = loadDict(recKey)
+        val lang = recKey.id
         val rawBlocks = mutableListOf<TextBlock>()
+        var cropFailures = 0
+        var degenerateQuads = 0
         allQuads.forEachIndexed { index, quad ->
-            val cropOriginal = cropQuad(bitmap, quad) ?: return@forEachIndexed
+            val rotation = PaddleQuadGeometry.rotationDeg(quad.toPoints())
+            val geometryCheck = PaddleQuadGeometry.checkQuadHealth(quad.toPoints())
+            if (!geometryCheck.healthy) {
+                degenerateQuads++
+                Log.w(
+                    TAG,
+                    String.format(
+                        java.util.Locale.US,
+                        "paddle_quad_degenerate quad_idx=%d rot=%d reason=%s",
+                        index, rotation.roundToInt(), geometryCheck.reason
+                    )
+                )
+            }
+            val cropOriginal = cropQuad(bitmap, quad) ?: run {
+                cropFailures++
+                Log.w(
+                    TAG,
+                    String.format(
+                        java.util.Locale.US,
+                        "paddle_crop_fail quad_idx=%d rot=%d",
+                        index, rotation.roundToInt()
+                    )
+                )
+                return@forEachIndexed
+            }
             if (cropOriginal.width < MIN_BOX_SIZE_PX || cropOriginal.height < MIN_BOX_SIZE_PX) {
+                cropFailures++
                 cropOriginal.recycle()
                 return@forEachIndexed
             }
-            val (text, score) = recognizeBest(cropOriginal, recSession, alphabet)
+            val (text, score) = recognizeWithOrientation(
+                cropOriginal, rotation, recSession, alphabet, lang, config
+            )
             cropOriginal.recycle()
             if (text.isBlank()) return@forEachIndexed
             val left = quadsLeft(quad).coerceIn(0f, srcW.toFloat())
@@ -196,13 +257,17 @@ class PaddleOcrLocalTextDetector(
             TAG,
             "paddle_total_ms=${totalMs} primary=${primaryQuads.size} total_quads=${allQuads.size} " +
                 "raw_blocks=${rawBlocks.size} merged=${merged.size} recovery=$needRecovery coverage=${"%.4f".format(coverage)} " +
-                "rec_cascade_hit=$recCascadeHits rec_cascade_full=$recCascadeFull lang=${recKey.id}"
+                "rec_cascade_hit=$recCascadeHits rec_cascade_full=$recCascadeFull " +
+                "vertical=$verticalCrops orient90=$verticalOrient90 orient-90=$verticalOrientNeg90 rot180=$rot180Retries " +
+                "crop_fail=$cropFailures degenerate=$degenerateQuads speed_mode=${speedModeProvider?.invoke() ?: "balanced"} " +
+                "lang=${recKey.id}"
         )
         return merged
     }
 
     private fun runDetPass(
         bitmap: Bitmap,
+        resizeLong: Float,
         thresh: Float,
         boxThresh: Float,
         unclipRatio: Float,
@@ -211,7 +276,7 @@ class PaddleOcrLocalTextDetector(
         val detSession = detSession ?: return emptyList()
         val srcW = bitmap.width
         val srcH = bitmap.height
-        val detInput = detPreprocess(bitmap)
+        val detInput = detPreprocess(bitmap, resizeLong)
         val ratioH = detInput.resizeH / detInput.srcH.toFloat()
         val ratioW = detInput.resizeW / detInput.srcW.toFloat()
 
@@ -244,15 +309,37 @@ class PaddleOcrLocalTextDetector(
         return quads
     }
 
-    private fun recognizeBest(crop: Bitmap, recSession: OrtSession, alphabet: List<String>): Pair<String, Float> {
-        // 级联快速路径：原图识别置信度足够高就直接返回，跳过其余 7 个变体。
+    private fun recognizeBest(
+        crop: Bitmap,
+        recSession: OrtSession,
+        alphabet: List<String>,
+        config: SpeedModeConfig
+    ): Pair<String, Float> {
+        // 级联快速路径：原图识别置信度足够高就直接返回，跳过其余识别变体。
         // 清晰文字是绝大多数场景，能省 ~7/8 的识别耗时；低置信度框仍走全变体投票。
         val raw = runCatching { recognizeCrop(crop, recSession, alphabet) }.getOrDefault("" to 0f)
-        if (raw.first.isNotBlank() && raw.second >= REC_CASCADE_HIGH_CONF) {
+        if (raw.first.isNotBlank() && raw.second >= config.recCascadeHighConf) {
             recCascadeHits++
             return raw
         }
         recCascadeFull++
+        // 中等置信度档：只跑灰度/反色两个增强变体（共 3 次识别），
+        // 跳过 2x 放大等高成本变体，兼顾速度与召回。
+        if (raw.first.isNotBlank() && raw.second >= config.recCascadeMidConf) {
+            val gray = runCatching { PaddleOcrImagePreprocessor.buildEnhancedGrayscale(crop, invert = false) }.getOrNull()
+            val invGray = runCatching { PaddleOcrImagePreprocessor.buildEnhancedGrayscale(crop, invert = true) }.getOrNull()
+            val result = listOfNotNull(
+                raw,
+                gray?.let { recognizeCrop(it, recSession, alphabet) },
+                invGray?.let { recognizeCrop(it, recSession, alphabet) }
+            )
+                .filter { it.first.isNotBlank() }
+                .maxByOrNull { it.second }
+                ?: raw
+            gray?.recycle()
+            invGray?.recycle()
+            return result
+        }
         val gray = runCatching { PaddleOcrImagePreprocessor.buildEnhancedGrayscale(crop, invert = false) }.getOrNull()
         val invGray = runCatching { PaddleOcrImagePreprocessor.buildEnhancedGrayscale(crop, invert = true) }.getOrNull()
         val binary = runCatching { PaddleOcrImagePreprocessor.buildBinaryTextMask(crop) }.getOrNull()
@@ -297,6 +384,112 @@ class PaddleOcrLocalTextDetector(
         }.getOrDefault("" to 0f)
     }
 
+    /**
+     * 按文字方向识别（参考 C:\homework\translator crop_recognition.py）：
+     * - 竖排 crop（高 ≥ 宽 × 1.4）：旋转 ±90° 后识别，按识别质量 + 检测四边形方向选择最优方向。
+     *   先对两个方向各跑一次原图识别（高分即可级联结束），质量更优的方向再做全变体投票，
+     *   另一方向保留原图结果参与择优，控制耗时。
+     * - 横排 crop：先 0° 识别，弱结果（分数 < 0.72 或没有目标文字）再旋转 180° 重试。
+     */
+    private fun recognizeWithOrientation(
+        crop: Bitmap,
+        rotation: Float,
+        recSession: OrtSession,
+        alphabet: List<String>,
+        lang: String,
+        config: SpeedModeConfig
+    ): Pair<String, Float> {
+        if (PaddleQuadGeometry.isConfidentVerticalCrop(crop.width, crop.height)) {
+            verticalCrops++
+            val cw = runCatching { rotate90(crop, clockwise = true) }.getOrNull()
+            val ccw = runCatching { rotate90(crop, clockwise = false) }.getOrNull()
+            val cwRaw = cw?.let { recognizeCrop(it, recSession, alphabet) } ?: ("" to 0f)
+            val ccwRaw = ccw?.let { recognizeCrop(it, recSession, alphabet) } ?: ("" to 0f)
+            val cwQuality = PaddleQuadGeometry.recognitionQuality(cwRaw.first, cwRaw.second, lang)
+            val ccwQuality = PaddleQuadGeometry.recognitionQuality(ccwRaw.first, ccwRaw.second, lang)
+            val winnerIsCw = cwQuality >= ccwQuality
+            val winnerCrop = if (winnerIsCw) cw else ccw
+            val winnerRaw = if (winnerIsCw) cwRaw else ccwRaw
+            val winnerFull = if (winnerCrop == null || winnerRaw.second >= config.recCascadeHighConf) {
+                winnerRaw
+            } else {
+                recognizeBest(winnerCrop, recSession, alphabet, config)
+            }
+            val results = mutableListOf<PaddleQuadGeometry.OrientedResult>()
+            if (winnerIsCw) {
+                results += PaddleQuadGeometry.OrientedResult(90, winnerFull.first, winnerFull.second)
+                results += PaddleQuadGeometry.OrientedResult(-90, ccwRaw.first, ccwRaw.second)
+            } else {
+                results += PaddleQuadGeometry.OrientedResult(-90, winnerFull.first, winnerFull.second)
+                results += PaddleQuadGeometry.OrientedResult(90, cwRaw.first, cwRaw.second)
+            }
+            cw?.recycle()
+            ccw?.recycle()
+            val chosen = PaddleQuadGeometry.selectBestOrientation(rotation, results, lang)
+            if (chosen == null || chosen.text.isBlank()) return "" to 0f
+            if (chosen.orientation == 90) verticalOrient90++ else verticalOrientNeg90++
+            Log.d(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "paddle_quad rot=%d vertical=true orient=%+d text=%s score=%.3f",
+                    rotation.roundToInt(),
+                    chosen.orientation,
+                    chosen.text.take(24),
+                    chosen.score
+                )
+            )
+            return chosen.text to chosen.score
+        }
+        // 横排：弱结果（分数 < 0.72 / 无目标文字，含空结果）再旋转 180° 重试
+        val raw = recognizeBest(crop, recSession, alphabet, config)
+        if (PaddleQuadGeometry.isWeakResult(raw.first, raw.second, lang)) {
+            val rotated = runCatching { rotate180(crop) }.getOrNull()
+            if (rotated != null) {
+                val retry = recognizeBest(rotated, recSession, alphabet, config)
+                rotated.recycle()
+                if (retry.first.isNotBlank() &&
+                    PaddleQuadGeometry.recognitionQuality(retry.first, retry.second, lang) >
+                    PaddleQuadGeometry.recognitionQuality(raw.first, raw.second, lang)
+                ) {
+                    rot180Retries++
+                    Log.d(
+                        TAG,
+                        String.format(
+                            java.util.Locale.US,
+                            "paddle_quad rot=%d vertical=false orient=180 text=%s score=%.3f",
+                            rotation.roundToInt(),
+                            retry.first.take(24),
+                            retry.second
+                        )
+                    )
+                    return retry
+                }
+            }
+        }
+        Log.d(
+            TAG,
+            String.format(
+                java.util.Locale.US,
+                "paddle_quad rot=%d vertical=false orient=0 text=%s score=%.3f",
+                rotation.roundToInt(),
+                raw.first.take(24),
+                raw.second
+            )
+        )
+        return raw
+    }
+
+    private fun rotate90(bitmap: Bitmap, clockwise: Boolean): Bitmap {
+        val matrix = android.graphics.Matrix().apply { postRotate(if (clockwise) 90f else -90f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun rotate180(bitmap: Bitmap): Bitmap {
+        val matrix = android.graphics.Matrix().apply { postRotate(180f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
     private fun estimateTextCoverage(quads: List<Array<PointF>>, imageW: Int, imageH: Int): Float {
         if (imageW <= 0 || imageH <= 0) return 0f
         var area = 0f
@@ -333,27 +526,38 @@ class PaddleOcrLocalTextDetector(
         modelDir = dir
         val detFile = File(dir, catalog.detModelFileName)
         val recFile = File(dir, catalog.recModelFileName(recKey))
+        if (!dir.exists()) dir.mkdirs()
+
+        // 1) 优先使用打包进 APK assets 的模型：存在则复制到 filesDir 供 ONNX 加载，
+        //    完全离线、无网络依赖，也避免重复占用设备存储。
+        val detFromAsset = ensureAssetModel(catalog.detAssetName(), detFile)
+        val recFromAsset = ensureAssetModel(catalog.recAssetName(recKey), recFile)
+
+        // 2) 任一模型在 assets 缺失（本地打包不含该语言）时，回退在线下载。
         val needDownload = !(detFile.exists() && detFile.length() > 1_000_000 && recFile.exists() && recFile.length() > 1_000_000)
         if (!needDownload) return true
         if (!isNetworkAvailable()) {
-            Log.w(TAG, "model_download_skip reason=no_network")
+            Log.w(TAG, "model_download_skip reason=no_network det_asset=$detFromAsset rec_asset=$recFromAsset")
             return false
         }
         Log.i(TAG, "model_download_start det=${catalog.detModelFileName} rec=${catalog.recModelFileName(recKey)}")
-        if (!dir.exists()) dir.mkdirs()
         val ok = runCatching {
-            downloadWithFallback(
-                primary = catalog.detModelTarUrl(),
-                primaryIsTar = true,
-                direct = catalog.detModelUrl(),
-                target = detFile
-            )
-            downloadWithFallback(
-                primary = catalog.recModelTarUrl(recKey),
-                primaryIsTar = true,
-                direct = catalog.recModelUrl(recKey),
-                target = recFile
-            )
+            if (detFile.length() <= 1_000_000) {
+                downloadWithFallback(
+                    primary = catalog.detModelTarUrl(),
+                    primaryIsTar = true,
+                    direct = catalog.detModelUrl(),
+                    target = detFile
+                )
+            }
+            if (recFile.length() <= 1_000_000) {
+                downloadWithFallback(
+                    primary = catalog.recModelTarUrl(recKey),
+                    primaryIsTar = true,
+                    direct = catalog.recModelUrl(recKey),
+                    target = recFile
+                )
+            }
             true
         }.getOrElse { err ->
             Log.w(TAG, "model_download_fail reason=${err.message?.take(120)}")
@@ -363,6 +567,29 @@ class PaddleOcrLocalTextDetector(
         }
         Log.i(TAG, "model_download_done ok=$ok")
         return ok
+    }
+
+    /** 若 assets 中存在同名模型，则（按需）复制到 filesDir 目标文件；返回是否来自 assets。 */
+    private fun ensureAssetModel(assetPath: String, target: File): Boolean {
+        return runCatching {
+            // 文件已就绪（来自之前复制或下载）则视为存在
+            if (target.exists() && target.length() > 1_000_000) return true
+            val stream = appContext.assets.open(assetPath) ?: return false
+            stream.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            val ok = target.length() > 1_000_000
+            if (ok) {
+                Log.i(TAG, "model_loaded_from_asset path=$assetPath bytes=${target.length()}")
+            } else {
+                target.delete()
+            }
+            ok
+        }.getOrElse { err ->
+            Log.w(TAG, "model_asset_missing path=$assetPath reason=${err.message?.take(100)}")
+            target.delete()
+            false
+        }
     }
 
     private fun downloadWithFallback(primary: String?, primaryIsTar: Boolean, direct: String?, target: File) {
@@ -495,11 +722,11 @@ class PaddleOcrLocalTextDetector(
         val floats: FloatArray
     )
 
-    private fun detPreprocess(bitmap: Bitmap): DetInput {
+    private fun detPreprocess(bitmap: Bitmap, resizeLong: Float): DetInput {
         val srcW = bitmap.width
         val srcH = bitmap.height
         val longSide = max(srcH, srcW)
-        val ratio = DET_RESIZE_LONG.toFloat() / longSide.toFloat()
+        val ratio = resizeLong / longSide.toFloat()
         val resizeH = max((((srcH * ratio).roundToInt() + 127) / 128) * 128, 32)
         val resizeW = max((((srcW * ratio).roundToInt() + 127) / 128) * 128, 32)
 
@@ -615,7 +842,18 @@ class PaddleOcrLocalTextDetector(
 
             // 顺序化四角：TL, TR, BR, BL
             val quad = orderedCorners(expanded, ratioH, ratioW, srcW, srcH)
-            boxes += quad
+            // 退化兜底：薄/线状组件 minAreaRect 可能给出近零厚度的矩形，
+            // 退化为轴对齐包围盒 quad，避免透视裁剪失败（参考项目 normalize_detection_polygon 同样过滤退化框）。
+            if (quadsRight(quad) - quadsLeft(quad) < 2f || quadsBottom(quad) - quadsTop(quad) < 2f) {
+                boxes += arrayOf(
+                    PointF((x0 / ratioW).toFloat().coerceIn(0f, srcW.toFloat()), (y0 / ratioH).toFloat().coerceIn(0f, srcH.toFloat())),
+                    PointF((x1 / ratioW).toFloat().coerceIn(0f, srcW.toFloat()), (y0 / ratioH).toFloat().coerceIn(0f, srcH.toFloat())),
+                    PointF((x1 / ratioW).toFloat().coerceIn(0f, srcW.toFloat()), (y1 / ratioH).toFloat().coerceIn(0f, srcH.toFloat())),
+                    PointF((x0 / ratioW).toFloat().coerceIn(0f, srcW.toFloat()), (y1 / ratioH).toFloat().coerceIn(0f, srcH.toFloat()))
+                )
+            } else {
+                boxes += quad
+            }
         }
         mask.release()
         maskF.release()
@@ -653,7 +891,13 @@ class PaddleOcrLocalTextDetector(
         return mean.`val`[0].toFloat()
     }
 
-    /** 将 RotatedRect 四点按 TL/TR/BR/BL 顺序还原到原图坐标。 */
+    /**
+     * 将 RotatedRect 四点按 TL/TR/BR/BL 顺序还原到原图坐标。
+     *
+     * 采用参考项目 _order_polygon_points 的角度排序法（按相对中心角度排序 +
+     * 最小 (x+y) 起点 + 叉积定向），避免按象限归类在薄/倾斜矩形上
+     * 出现角点重叠（两个角落在同一象限互相覆盖 → 退化四边形 → 透视裁剪失败）。
+     */
     private fun orderedCorners(
         rect: RotatedRect,
         ratioH: Float,
@@ -665,61 +909,103 @@ class PaddleOcrLocalTextDetector(
         rect.points(raw)
         val cx = rect.center.x
         val cy = rect.center.y
+        val angles = raw.map { atan2(it.y - cy, it.x - cx) }
+        val order = angles.indices.sortedBy { angles[it] }
+        val sorted = order.map { raw[it] }
+        val start = sorted.indices.minByOrNull { sorted[it].x + sorted[it].y } ?: 0
+        val rolled = List(4) { sorted[(it + start) % 4] }
+        val firstEdge = Point(rolled[1].x - rolled[0].x, rolled[1].y - rolled[0].y)
+        val secondEdge = Point(rolled[2].x - rolled[1].x, rolled[2].y - rolled[1].y)
+        val cross = firstEdge.x * secondEdge.y - firstEdge.y * secondEdge.x
+        val orderedPts = if (cross < 0) {
+            listOf(rolled[0], rolled[3], rolled[2], rolled[1])
+        } else {
+            rolled
+        }
         fun toOriginal(p: Point): PointF {
             val x = (p.x / ratioW).toFloat().coerceIn(0f, srcW.toFloat())
             val y = (p.y / ratioH).toFloat().coerceIn(0f, srcH.toFloat())
             return PointF(x, y)
         }
-        // 按相对中心位置归类：TL(x<cx,y<cy) TR(x>cx,y<cy) BR(x>cx,y>cy) BL(x<cx,y>cy)
-        var tl: Point? = null
-        var tr: Point? = null
-        var br: Point? = null
-        var bl: Point? = null
-        for (p in raw) {
-            val left = p.x < cx
-            val top = p.y < cy
-            when {
-                left && top -> tl = p
-                !left && top -> tr = p
-                !left && !top -> br = p
-                else -> bl = p
-            }
-        }
-        // 旋转矩形可能存在退化（点几乎在中心线上），退化时按 minAreaRect 惯例处理
-        val fallback = raw.toList()
-        val ordered = arrayOf(
-            tl ?: fallback[0],
-            tr ?: fallback[1],
-            br ?: fallback[2],
-            bl ?: fallback[3]
+        return arrayOf(
+            toOriginal(orderedPts[0]),
+            toOriginal(orderedPts[1]),
+            toOriginal(orderedPts[2]),
+            toOriginal(orderedPts[3])
         )
-        return arrayOf(toOriginal(ordered[0]), toOriginal(ordered[1]), toOriginal(ordered[2]), toOriginal(ordered[3]))
     }
 
+    /**
+     * 按检测四边形做透视矫正裁剪（参考 C:\homework\translator _deskew_crop_region）：
+     * - 目标宽高取四边形的边（width = max(上边, 下边)、height = max(左边, 右边)），
+     *   避免用轴对齐包围盒导致倾斜/变形文字被拉伸失真；
+     * - 沿中心向外扩展 padding（min(12, max(2, 边长 × 0.06))），给识别模型留出边距；
+     * - 双线性过滤绘制（等价 INTER_CUBIC 的平滑效果）。
+     */
     private fun cropQuad(bitmap: Bitmap, quad: Array<PointF>): Bitmap? {
-        val w = max(1f, quadsRight(quad) - quadsLeft(quad))
-        val h = max(1f, quadsBottom(quad) - quadsTop(quad))
+        val tl = quad[0]
+        val tr = quad[1]
+        val br = quad[2]
+        val bl = quad[3]
+        // 2026-08-27 增强：对明显退化的四边形直接拒绝，避免 polyToPoly 失败或拉伸失真。
+        val health = PaddleQuadGeometry.checkQuadHealth(quad.toPoints())
+        if (!health.healthy) {
+            Log.w(TAG, "paddle_crop_fail reason=${health.reason} quad=${quadSummary(quad)}")
+            return null
+        }
+        val edge = max(dist(tr, tl), dist(bl, tl))
+        // 对倾斜/窄四边形减小 padding，降低角点被压到边界导致失真的风险。
+        val aspect = max(dist(tr, tl), dist(bl, tl)) / max(1f, min(dist(tr, tl), dist(bl, tl)))
+        val paddingBase = if (aspect > 3f) 0.04f else 0.06f
+        val padding = min(10f, max(2f, edge * paddingBase))
+        val cx = (tl.x + tr.x + br.x + bl.x) / 4f
+        val cy = (tl.y + tr.y + br.y + bl.y) / 4f
+        val src = Array(4) { i ->
+            val p = quad[i]
+            val vx = p.x - cx
+            val vy = p.y - cy
+            val len = max(1f, hypot(vx.toDouble(), vy.toDouble()).toFloat())
+            PointF(
+                (p.x + vx / len * padding).coerceIn(0f, bitmap.width - 1f),
+                (p.y + vy / len * padding).coerceIn(0f, bitmap.height - 1f)
+            )
+        }
+        val width = max(1f, max(dist(src[1], src[0]), dist(src[2], src[3])))
+        val height = max(1f, max(dist(src[3], src[0]), dist(src[2], src[1])))
         val srcPts = floatArrayOf(
-            quad[0].x, quad[0].y,
-            quad[1].x, quad[1].y,
-            quad[2].x, quad[2].y,
-            quad[3].x, quad[3].y
+            src[0].x, src[0].y,
+            src[1].x, src[1].y,
+            src[2].x, src[2].y,
+            src[3].x, src[3].y
         )
         val dstPts = floatArrayOf(
             0f, 0f,
-            w, 0f,
-            w, h,
-            0f, h
+            width, 0f,
+            width, height,
+            0f, height
         )
         val m = android.graphics.Matrix()
         if (!m.setPolyToPoly(srcPts, 0, dstPts, 0, 4)) {
+            Log.w(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "paddle_crop_fail reason=poly_to_poly quad=%.1f,%.1f|%.1f,%.1f|%.1f,%.1f|%.1f,%.1f dst=%.1fx%.1f",
+                    src[0].x, src[0].y, src[1].x, src[1].y, src[2].x, src[2].y, src[3].x, src[3].y,
+                    width, height
+                )
+            )
             return null
         }
         return runCatching {
-            Bitmap.createBitmap(w.roundToInt(), h.roundToInt(), Bitmap.Config.ARGB_8888).also { out ->
+            Bitmap.createBitmap(width.roundToInt(), height.roundToInt(), Bitmap.Config.ARGB_8888).also { out ->
                 val canvas = android.graphics.Canvas(out)
                 canvas.drawColor(android.graphics.Color.WHITE)
-                canvas.drawBitmap(bitmap, m, null)
+                val paint = android.graphics.Paint().apply {
+                    isFilterBitmap = true
+                    isAntiAlias = true
+                }
+                canvas.drawBitmap(bitmap, m, paint)
             }
         }.getOrNull()
     }
@@ -827,10 +1113,72 @@ class PaddleOcrLocalTextDetector(
     private fun quadsRight(quad: Array<PointF>) = quad.maxOf { it.x }
     private fun quadsBottom(quad: Array<PointF>) = quad.maxOf { it.y }
 
+    private fun Array<PointF>.toPoints(): List<PaddleQuadGeometry.Point> =
+        map { PaddleQuadGeometry.Point(it.x, it.y) }
+
+    private fun dist(a: PointF, b: PointF): Float =
+        hypot((a.x - b.x).toDouble(), (a.y - b.y).toDouble()).toFloat()
+
+    private fun quadSummary(quad: Array<PointF>): String {
+        return quad.joinToString("|") { "%.1f,%.1f".format(java.util.Locale.US, it.x, it.y) }
+    }
+
+    private fun speedModeConfig(): SpeedModeConfig {
+        val mode = speedModeProvider?.invoke()?.trim()?.lowercase() ?: "balanced"
+        return when (mode) {
+            "fast" -> SpeedModeConfig.FAST
+            "quality" -> SpeedModeConfig.QUALITY
+            else -> SpeedModeConfig.BALANCED
+        }
+    }
+
+    /**
+     * PaddleOCR 速度/质量模式参数配置。
+     * 2026-08-27 新增：首页可选「快速/均衡/质量」，调整检测分辨率与识别变体数量。
+     */
+    data class SpeedModeConfig(
+        val detResizeLong: Float,
+        val recCascadeHighConf: Float,
+        val recCascadeMidConf: Float,
+        val recoveryMinBlocks: Int,
+        val recoveryMinCoverage: Float,
+        val recoveryMaxVariants: Int,
+        val recoveryEarlyStopBoxes: Int
+    ) {
+        companion object {
+            val FAST = SpeedModeConfig(
+                detResizeLong = 768f,
+                recCascadeHighConf = 0.92f,
+                recCascadeMidConf = 0.86f,
+                recoveryMinBlocks = 3,
+                recoveryMinCoverage = 0.008f,
+                recoveryMaxVariants = 1,
+                recoveryEarlyStopBoxes = 1
+            )
+            val BALANCED = SpeedModeConfig(
+                detResizeLong = 960f,
+                recCascadeHighConf = 0.90f,
+                recCascadeMidConf = 0.82f,
+                recoveryMinBlocks = 4,
+                recoveryMinCoverage = 0.005f,
+                recoveryMaxVariants = 3,
+                recoveryEarlyStopBoxes = 2
+            )
+            val QUALITY = SpeedModeConfig(
+                detResizeLong = 960f,
+                recCascadeHighConf = 0.88f,
+                recCascadeMidConf = 0.80f,
+                recoveryMinBlocks = 6,
+                recoveryMinCoverage = 0.004f,
+                recoveryMaxVariants = 3,
+                recoveryEarlyStopBoxes = 3
+            )
+        }
+    }
+
     private companion object {
         const val TAG = "PaddleOcr"
         const val MODEL_DIR_NAME = "paddle_models"
-        const val DET_RESIZE_LONG = 960f
         const val DET_THRESH = 0.3f
         const val DET_BOX_THRESH = 0.6f
         const val DET_UNCLIP_RATIO = 1.2f
@@ -842,11 +1190,6 @@ class PaddleOcrLocalTextDetector(
         const val REC_HEIGHT = 48
         const val REC_REF_WIDTH = 320
         const val REC_MAX_IMG_W = 3200
-        // 原图识别置信度达到该值即跳过其余识别变体（级联快速路径）。
-        const val REC_CASCADE_HIGH_CONF = 0.93f
-        const val RECOVERY_MIN_BLOCKS = 4
-        const val RECOVERY_MIN_COVERAGE = 0.005f
-        const val RECOVERY_MAX_VARIANTS = 3
         const val MERGE_IOU_THRESHOLD = 0.45f
         const val MIN_BOX_SIZE_PX = 2
         val DET_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
@@ -886,6 +1229,12 @@ class PaddleModelCatalog {
     fun recModelFileName(key: RecModelKey): String = key.recModel
 
     fun dictAssetName(key: RecModelKey): String = key.dictAsset
+
+    /** 打包进 APK assets 的 det 模型路径（存在即离线；缺失才回退下载）。 */
+    fun detAssetName(): String = "paddle_models/$detModelFileName"
+
+    /** 打包进 APK assets 的 rec 模型路径（存在即离线；缺失才回退下载）。 */
+    fun recAssetName(key: RecModelKey): String = "paddle_models/${key.recModel}"
 
     fun detModelUrl(): String = "$HF_BASE_URL/PP-OCRv5_mobile_det.onnx"
 

@@ -4,7 +4,7 @@ enum class OcrEngine(
     val id: String,
     val label: String
 ) {
-    ML_KIT("ml_kit", "ML Kit"),
+    ML_KIT("ml_kit", "ML Kit（需 Google Play 服务）"),
     PADDLE("paddle", "PaddleOCR (PP-OCRv5)");
 
     companion object {

@@ -22,6 +22,23 @@ interface LocalTranslator {
         targetLanguageId: String
     ): List<String>
 
+    /** 该语言对的本地模型是否已下载就绪（无需再下载即可直接翻译）。未就绪时 UI 应提示"正在下载模型"。 */
+    fun isModelReady(sourceLanguageId: String, targetLanguageId: String): Boolean = false
+
     /** 后台预加载当前语言对模型，用于预热，避免首次翻译卡顿。默认无操作。 */
     fun prewarm(sourceLanguageId: String, targetLanguageId: String) {}
+
+    /**
+     * 主动下载指定语言对的模型（供 UI 手动触发）。
+     * 返回 null 表示下载成功；返回非空字符串为失败原因（可直接展示给用户）。
+     * 默认实现视为无需下载（成功）。
+     */
+    suspend fun downloadModel(sourceLanguageId: String, targetLanguageId: String): String? = null
+
+    /**
+     * 探测指定语言对的模型是否已在设备本地（磁盘已缓存）。
+     * 与 [isModelReady] 的区别：本方法跨进程重启后仍能正确反映磁盘状态，用于决定是否隐藏下载入口。
+     * 默认实现视为未下载（保守显示下载入口）。
+     */
+    suspend fun isDownloaded(sourceLanguageId: String, targetLanguageId: String): Boolean = false
 }

@@ -83,6 +83,7 @@ import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.GlossaryEntry
 import com.manga.translator.store.OcrEngine
+import com.manga.translator.store.OcrSpeedMode
 import com.manga.translator.store.TranslateEngine
 import com.manga.translator.store.RenameProfileResult
 import com.manga.translator.store.TranslationHistoryEntry
@@ -95,6 +96,15 @@ enum class MainTab(val label: String, val icon: ImageVector) {
     SETTINGS("翻译设置", Icons.Filled.Settings),
     GLOSSARY("术语表", Icons.Filled.List),
     HISTORY("翻译历史", Icons.Filled.Info)
+}
+
+/** ML Kit 本地翻译模型下载状态（首页手动下载入口）。 */
+private sealed interface MlKitDownloadState {
+    data object Checking : MlKitDownloadState
+    data object Idle : MlKitDownloadState
+    data object Downloading : MlKitDownloadState
+    data object Ready : MlKitDownloadState
+    data class Failed(val reason: String) : MlKitDownloadState
 }
 
 
@@ -127,6 +137,7 @@ private fun SimpleConfigScreen(
     var profileNames by remember { mutableStateOf(repo.getProfileNames()) }
     var selectedProfile by remember { mutableStateOf(initialProfile.first) }
     var baseSettings by remember { mutableStateOf(initialForm) }
+    var translateEngine by remember { mutableStateOf(initialForm.translateEngine) }
     var apiProvider by remember {
         mutableStateOf(AiProvider.fromId(initialForm.translateProvider))
     }
@@ -158,6 +169,7 @@ private fun SimpleConfigScreen(
     fun applySettings(s: AppSettings, profileName: String) {
         baseSettings = s
         selectedProfile = profileName
+        translateEngine = s.translateEngine
         apiProvider = AiProvider.fromId(s.translateProvider)
         apiBaseUrl = s.translateBaseUrl
         apiModel = s.translateModel
@@ -268,6 +280,57 @@ private fun SimpleConfigScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.Top
     ) {
+        Text(text = "翻译引擎", style = MaterialTheme.typography.titleLarge)
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = "云端 API：需配置下方翻译 API，联网翻译（大模型质量好，延迟 2~5s）。\n百度翻译：专用接口，整页一次请求最快（<1s）；标准版每月免费 500 万字符，需填写 APP ID/密钥。\nML Kit 本地：首次使用需联网下载模型（入口在首页），之后离线翻译；设备需安装 Google Play 服务。",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        TranslateEngineSelectorRow(
+            selected = TranslateEngine.fromId(translateEngine),
+            onSelected = { engine ->
+                translateEngine = engine.id
+                val updated = baseSettings.copy(translateEngine = engine.id)
+                baseSettings = updated
+                onSave(updated)
+            }
+        )
+        if (TranslateEngine.fromId(translateEngine) == TranslateEngine.BAIDU) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(text = "百度翻译配置", style = MaterialTheme.typography.titleLarge)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "在 fanyi-api.baidu.com 开通「通用文本翻译」标准版（免费）后填写以下两项；未填写时翻译会提示。",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedTextField(
+                value = baseSettings.baiduTranslateAppId,
+                onValueChange = { v ->
+                    val updated = baseSettings.copy(baiduTranslateAppId = v)
+                    baseSettings = updated
+                    onSave(updated)
+                },
+                label = { Text("百度 APP ID") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedTextField(
+                value = baseSettings.baiduTranslateSecretKey,
+                onValueChange = { v ->
+                    val updated = baseSettings.copy(baiduTranslateSecretKey = v)
+                    baseSettings = updated
+                    onSave(updated)
+                },
+                label = { Text("百度密钥（Secret Key）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+
         Text(text = "翻译 API 配置", style = MaterialTheme.typography.titleLarge)
         Spacer(modifier = Modifier.height(12.dp))
 
@@ -971,6 +1034,18 @@ private fun LauncherScreen(
     onClearCache: () -> Unit
 ) {
     val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+
+    var mlKitDownloadState by remember { mutableStateOf<MlKitDownloadState>(MlKitDownloadState.Checking) }
+    LaunchedEffect(settings.sourceLanguage, settings.targetLanguage, settings.translateEngine) {
+        mlKitDownloadState = MlKitDownloadState.Checking
+        // 探测磁盘缓存：已下载则隐藏下载入口；未下载则显示下载按钮。
+        val downloaded = ServiceLocator.localTranslator.isDownloaded(
+            settings.sourceLanguage,
+            settings.targetLanguage
+        )
+        mlKitDownloadState = if (downloaded) MlKitDownloadState.Ready else MlKitDownloadState.Idle
+    }
 
     Column(
         modifier = Modifier
@@ -992,17 +1067,97 @@ LanguageSelectorRow(
             selected = OcrEngine.fromId(settings.ocrEngine),
             onSelected = { onSettingsChange(settings.copy(ocrEngine = it.id)) }
         )
-        Spacer(modifier = Modifier.height(10.dp))
-        TranslateEngineSelectorRow(
-            selected = TranslateEngine.fromId(settings.translateEngine),
-            onSelected = { onSettingsChange(settings.copy(translateEngine = it.id)) }
-        )
+        if (OcrEngine.fromId(settings.ocrEngine) == OcrEngine.PADDLE) {
+            Spacer(modifier = Modifier.height(10.dp))
+            OcrSpeedModeSelectorRow(
+                selected = OcrSpeedMode.fromId(settings.ocrSpeedMode),
+                onSelected = { onSettingsChange(settings.copy(ocrSpeedMode = it.id)) }
+            )
+        }
         Spacer(modifier = Modifier.height(10.dp))
         LanguageSelectorRow(
             label = "目标语言（翻译输出）",
             selected = AppLanguage.fromId(settings.targetLanguage),
             onSelected = { onSettingsChange(settings.copy(targetLanguage = it.id)) }
         )
+
+        if (TranslateEngine.fromId(settings.translateEngine) == TranslateEngine.ML_KIT) {
+            Spacer(modifier = Modifier.height(14.dp))
+            val pairLabel = "${AppLanguage.fromId(settings.sourceLanguage).label} → " +
+                "${AppLanguage.fromId(settings.targetLanguage).label}"
+            when (val st = mlKitDownloadState) {
+                MlKitDownloadState.Checking -> OutlinedButton(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("检查本地翻译模型中…")
+                }
+                MlKitDownloadState.Idle -> Button(
+                    onClick = {
+                        scope.launch {
+                            mlKitDownloadState = MlKitDownloadState.Downloading
+                            val err = ServiceLocator.localTranslator.downloadModel(
+                                settings.sourceLanguage,
+                                settings.targetLanguage
+                            )
+                            mlKitDownloadState = if (err == null) {
+                                MlKitDownloadState.Ready
+                            } else {
+                                MlKitDownloadState.Failed(err)
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("下载 $pairLabel 翻译模型（需联网）")
+                }
+                MlKitDownloadState.Downloading -> OutlinedButton(
+                    onClick = {},
+                    enabled = false,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("正在下载 $pairLabel 翻译模型，可能需要几分钟…")
+                }
+                MlKitDownloadState.Ready -> Text(
+                    text = "$pairLabel 翻译模型已就绪，可离线翻译",
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                is MlKitDownloadState.Failed -> {
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                mlKitDownloadState = MlKitDownloadState.Downloading
+                                val err = ServiceLocator.localTranslator.downloadModel(
+                                    settings.sourceLanguage,
+                                    settings.targetLanguage
+                                )
+                                mlKitDownloadState = if (err == null) {
+                                    MlKitDownloadState.Ready
+                                } else {
+                                    MlKitDownloadState.Failed(err)
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("重试下载 $pairLabel 翻译模型")
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = st.reason,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(14.dp))
         Button(onClick = onOpenOverlayPermission, modifier = Modifier.fillMaxWidth()) { Text("授予悬浮窗权限") }
@@ -1041,6 +1196,44 @@ private fun OcrEngineSelectorRow(
             onDismissRequest = { expanded = false }
         ) {
             OcrEngine.entries.forEach { item ->
+                DropdownMenuItem(
+                    text = { Text(item.label) },
+                    onClick = {
+                        expanded = false
+                        onSelected(item)
+                    }
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OcrSpeedModeSelectorRow(
+    selected: OcrSpeedMode,
+    onSelected: (OcrSpeedMode) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded }
+    ) {
+        OutlinedTextField(
+            value = selected.label,
+            onValueChange = {},
+            label = { Text("PaddleOCR 速度模式") },
+            readOnly = true,
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth()
+        )
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            OcrSpeedMode.entries.forEach { item ->
                 DropdownMenuItem(
                     text = { Text(item.label) },
                     onClick = {

@@ -33,7 +33,8 @@ class TranslationLockGesturePolicyTest {
     }
 
     @Test
-    fun decide_blocksMultiPointer() {
+    fun decide_releasesMultiPointer() {
+        // 2026-08-27：多指（双指缩放/翻页）同样释放锁定，避免阅读器"屏幕动不了"。
         val decision = TranslationLockGesturePolicy.decide(
             maxDistancePx = 6f,
             durationMs = 80L,
@@ -42,7 +43,7 @@ class TranslationLockGesturePolicyTest {
             tapTimeoutMs = 100L
         )
 
-        assertEquals(TranslationLockGestureOutcome.BLOCKED, decision.outcome)
+        assertEquals(TranslationLockGestureOutcome.RELEASE, decision.outcome)
         assertEquals("multi_pointer", decision.reason)
     }
 }
