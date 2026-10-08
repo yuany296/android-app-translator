@@ -1,5 +1,7 @@
 # ===== Gradle / Android =====
 .gradle/
+# 沙箱内构建用的本地 GRADLE_USER_HOME（含 gradle 发行版与依赖缓存，体积大，不入库）
+.gradle-home/
 **/build/
 /local.properties
 .cxx/
@@ -33,6 +35,31 @@ Thumbs.db
 bg1_screen.png
 screen_current.png
 verify_*.png
+
+# ===== 真机验证目录（2026-10-03 起整体忽略）=====
+#
+# 为什么整目录忽略，而不是只忽略日志：
+#   1. `.verify/` 里既有真机截图/logcat/dump（可随时重跑生成），
+#      也有**漫画面板素材**（用户的测试用图）—— 本仓库是公开仓库，
+#      把漫画页面与站点会话日志提交上去不合适；
+#   2. 夹具与生成脚本就在同一目录里（`.verify/web/*.html`、`make_*.py`），
+#      它们在 `Todolist.md` / `HumanTODO.md` 里有完整的复现说明，
+#      需要时本地重跑即可。
+/.verify/
+
+# ===== 崩溃转储 / 误命名的临时文件 =====
+*.hprof
+window_dump.xml
+screen_*.png
+screenshot.png
+# 某次 PowerShell 重定向把 PNG 写成了这个文件名（路径被当成文件名）
+/System.Drawing.Drawing2D.GraphicsPath
+
+# ===== 协作 / 代理工具的本地目录 =====
+/.workbuddy/
+
+# ===== 图标设计草稿（正式资源在 app/src/main/res/mipmap-*）=====
+/app-icon-*.png
 
 # ===== 工具链临时文件 =====
 .codex/*.html

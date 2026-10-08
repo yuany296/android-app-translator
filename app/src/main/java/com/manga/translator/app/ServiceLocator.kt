@@ -8,6 +8,8 @@ import com.manga.translator.overlay.OverlayController
 import com.manga.translator.overlay.erase.CleanedImageProcessor
 import com.manga.translator.overlay.erase.TieredEraseProcessor
 import com.manga.translator.store.GlossaryRepository
+import com.manga.translator.store.BrowserFavoriteRepository
+import com.manga.translator.store.BrowserHistoryRepository
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.PageOverlayAdjustmentRepository
 import com.manga.translator.store.SentenceTranslationRepository
@@ -41,6 +43,10 @@ object ServiceLocator {
         private set
     lateinit var translationHistoryRepository: TranslationHistoryRepository
         private set
+    lateinit var browserHistoryRepository: BrowserHistoryRepository
+        private set
+    lateinit var browserFavoriteRepository: BrowserFavoriteRepository
+        private set
     lateinit var pageOverlayAdjustmentRepository: PageOverlayAdjustmentRepository
         private set
     lateinit var captureSessionStateStore: CaptureSessionStateStore
@@ -72,6 +78,8 @@ object ServiceLocator {
         sentenceTranslationRepository = SentenceTranslationRepository(appContext)
         glossaryRepository = GlossaryRepository(appContext)
         translationHistoryRepository = TranslationHistoryRepository(appContext)
+        browserHistoryRepository = BrowserHistoryRepository(appContext)
+        browserFavoriteRepository = BrowserFavoriteRepository(appContext)
         pageOverlayAdjustmentRepository = PageOverlayAdjustmentRepository(appContext)
         captureSessionStateStore = CaptureSessionStateStore(appContext)
         visionClient = OpenAiVisionClient()

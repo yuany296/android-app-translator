@@ -21,5 +21,8 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // 与 core-store / core-overlay / core-translate 保持一致的既有测试依赖（同版本）。
+    testImplementation("junit:junit:4.13.2")
 }
 

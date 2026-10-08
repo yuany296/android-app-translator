@@ -45,10 +45,16 @@ class PaddleQuadGeometryTest {
 
     @Test
     fun verticalCropDetection() {
-        assertTrue(PaddleQuadGeometry.isConfidentVerticalCrop(100, 141))
-        assertTrue(PaddleQuadGeometry.isConfidentVerticalCrop(60, 300))
-        assertFalse(PaddleQuadGeometry.isConfidentVerticalCrop(141, 100))
-        assertFalse(PaddleQuadGeometry.isConfidentVerticalCrop(100, 139))
+        // 阈值 2026-09-30 由 1.4 收紧到 1.8：这个判定决定**要不要把整块转 90° 去识别**，
+        // 判错的代价是识别结果整体错乱（用户反馈：横排三行韩文被当成竖排）。
+        // 真竖排一列的高宽比通常 ≥ 2，1.8 仍留足余量。
+        assertTrue("明显竖长（5 倍）应判竖排", PaddleQuadGeometry.isConfidentVerticalCrop(60, 300))
+        assertTrue("刚好 1.8 倍应判竖排", PaddleQuadGeometry.isConfidentVerticalCrop(100, 180))
+        // 旧阈值 1.4 会把这些判成竖排 —— 正是要挡掉的「多行横排偏高」形态。
+        assertFalse("1.41 倍：旧阈值会误判，现在必须拒绝", PaddleQuadGeometry.isConfidentVerticalCrop(100, 141))
+        assertFalse("1.7 倍：仍不够竖", PaddleQuadGeometry.isConfidentVerticalCrop(100, 170))
+        assertFalse("宽扁不该判竖排", PaddleQuadGeometry.isConfidentVerticalCrop(141, 100))
+        assertFalse("略低于阈值", PaddleQuadGeometry.isConfidentVerticalCrop(100, 179))
     }
 
     @Test
@@ -113,6 +119,73 @@ class PaddleQuadGeometryTest {
     @Test
     fun selectionHandlesEmptyResults() {
         assertNull(PaddleQuadGeometry.selectBestOrientation(-90f, emptyList(), "ja"))
+    }
+
+    // ------------------------------------------------------------------
+    // 质量闸门 isAcceptableResult（2026-09-30 用户反馈 `cYa` 噪声）
+    //
+    // 用例形状直接来自真实截图：空白/纹理区域被误检成**零散拉丁字母**。
+    // 守两件事：噪声要挡住、正常短文本不能误杀。
+    // ------------------------------------------------------------------
+
+    @Test
+    fun acceptableResult_rejectsLatinNoiseOnKoreanPage() {
+        // 用户截图里的三种形态：都是纯拉丁、一个韩文字都没有。
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("cYa", 0.91f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("a c", 0.85f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("c Y", 0.80f, "ko"))
+        // 高分数也不行：「韩文页面上没有一个韩文字」本身就是判据，不看分数。
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("XYZ", 0.99f, "ko"))
+    }
+
+    @Test
+    fun acceptableResult_acceptsRealKoreanEvenWhenShort() {
+        // 一个韩文字也要放过：韩漫里 `얼음`、`큭` 这类短台词很常见。
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("얼음", 0.7f, "ko"))
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("큭", 0.6f, "ko"))
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("햇빛을 받으면", 0.95f, "ko"))
+        // 韩文 + 拉丁混排（外来语/拟声词）也要过。
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("OK 좋아", 0.9f, "ko"))
+    }
+
+    @Test
+    fun acceptableResult_rejectsLowScoreRegardlessOfLanguage() {
+        // 分数下限对所有语言生效：正常文字普遍 > 0.85。
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("안녕", 0.4f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("오늘", 0.0f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("Hello", 0.3f, "en"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("こんにちは", Float.NaN, "ja"))
+    }
+
+    @Test
+    fun acceptableResult_neverKillsJaLatinOnomatopoeia() {
+        // ⚠️ 刻意不对日语/英语要求「目标文字」：日漫拟声词常是拉丁/片假名混排，
+        // 按脚本过滤会误杀。分数够就放行 —— 宁可漏过滤，不可误杀。
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("BANG", 0.9f, "ja"))
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("ドドド", 0.88f, "ja"))
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("cYa", 0.9f, "en"))
+    }
+
+    @Test
+    fun acceptableResult_rejectsPunctuationOnlyAndBlank() {
+        // 纯标点/符号翻不出东西，且不属于任何目标文字。
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("…", 0.99f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("?!", 0.99f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("   ", 0.99f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("", 0.99f, "ko"))
+    }
+
+    @Test
+    fun weakResultAndAcceptableResultAreDifferentGates() {
+        // 两个闸门职责不同，不能互相替代：
+        // `isWeakResult` 决定「要不要再试一次」，`isAcceptableResult` 决定「要不要采纳」。
+        // 一条**高分噪声**只被后者挡住 —— 这正是原来漏掉 `cYa` 的原因：
+        // 只靠 isWeakResult 时，它重试完照样被原样返回。
+        assertTrue(PaddleQuadGeometry.isWeakResult("cYa", 0.91f, "ko"))
+        assertFalse(PaddleQuadGeometry.isAcceptableResult("cYa", 0.91f, "ko"))
+        // 真实长句：不弱、也可采纳。
+        assertFalse(PaddleQuadGeometry.isWeakResult("햇빛을 받으면", 0.95f, "ko"))
+        assertTrue(PaddleQuadGeometry.isAcceptableResult("햇빛을 받으면", 0.95f, "ko"))
     }
 
     private fun p(x: Float, y: Float): Point = Point(x, y)

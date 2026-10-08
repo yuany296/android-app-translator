@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  仅 debug 构建生效（release 不受影响，targetSdk 34 默认禁止明文 HTTP）。
+
+  用途：内嵌浏览器要能打开本机测试页（`.verify/web` + `python -m http.server`，
+  配合 `adb reverse tcp:8899 tcp:8899` 走 localhost）。2026-09-28 排障时发现：
+  走 `http://10.0.2.2:8899/...` 会被 Chromium 拒成 `net::ERR_CLEARTEXT_NOT_PERMITTED`
+  （系统 HTTP 代理也会把 10.0.2.2 的请求转给宿主代理，连不通）；
+  改用 localhost + adb reverse 后仍需要放行明文，所以在这里给本机地址开口子。
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

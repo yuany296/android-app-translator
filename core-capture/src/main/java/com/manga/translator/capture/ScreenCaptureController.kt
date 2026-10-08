@@ -216,7 +216,7 @@ class ScreenCaptureController(private val context: Context) {
                 Log.i(TAG, "trace=$traceId stage=hard_recreate done")
             }
             delay(120)
-            val retryTimeoutMs = timeoutMs.coerceAtMost(RECOVERY_RETRY_TIMEOUT_MS).coerceAtLeast(600L)
+            val retryTimeoutMs = CaptureFailurePolicy.retryTimeoutMs(timeoutMs)
             try {
                 captureBitmap(retryTimeoutMs, traceId).also {
                     Log.i(TAG, "trace=$traceId capture_recover_success retryTimeoutMs=$retryTimeoutMs")
@@ -293,17 +293,15 @@ class ScreenCaptureController(private val context: Context) {
     fun getLastCaptureFailureType(): CaptureFailureType? = lastCaptureFailureType
 
     fun toJpegDataUrl(bitmap: Bitmap, quality: Int = 75, maxWidth: Int = 1024): String {
-        val source = if (bitmap.width > maxWidth && maxWidth > 0) {
-            val targetHeight = ((maxWidth.toFloat() / bitmap.width.toFloat()) * bitmap.height)
-                .toInt()
-                .coerceAtLeast(1)
+        val source = if (FramePolicy.shouldScale(bitmap.width, maxWidth)) {
+            val targetHeight = FramePolicy.scaledHeight(bitmap.width, bitmap.height, maxWidth)
             Bitmap.createScaledBitmap(bitmap, maxWidth, targetHeight, true)
         } else {
             bitmap
         }
 
         val stream = ByteArrayOutputStream()
-        source.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(40, 95), stream)
+        source.compress(Bitmap.CompressFormat.JPEG, FramePolicy.clampedQuality(quality), stream)
         if (source !== bitmap) {
             source.recycle()
         }
@@ -435,7 +433,7 @@ class ScreenCaptureController(private val context: Context) {
             return null
         }
         val ageMs = SystemClock.elapsedRealtime() - snapshot.capturedAtMs
-        if (ageMs > RECENT_FRAME_MAX_AGE_MS) {
+        if (!FramePolicy.snapshotUsable(ageMs)) {
             Log.d(TAG, "trace=$traceId stage=use_cached_frame skip=expired ageMs=$ageMs")
             return null
         }
@@ -461,8 +459,8 @@ class ScreenCaptureController(private val context: Context) {
         if (bitmap.width <= 0 || bitmap.height <= 0) {
             return FrameQuality(0f, 0f, 1f, 1f, suspicious = true)
         }
-        val stepX = maxOf(1, bitmap.width / FRAME_SAMPLE_GRID)
-        val stepY = maxOf(1, bitmap.height / FRAME_SAMPLE_GRID)
+        val stepX = maxOf(1, bitmap.width / FramePolicy.SAMPLE_GRID)
+        val stepY = maxOf(1, bitmap.height / FramePolicy.SAMPLE_GRID)
         var samples = 0
         var lumaSum = 0.0
         var lumaSqSum = 0.0
@@ -479,8 +477,8 @@ class ScreenCaptureController(private val context: Context) {
                 val luma = 0.299 * r + 0.587 * g + 0.114 * b
                 lumaSum += luma
                 lumaSqSum += luma * luma
-                if (luma <= FRAME_DARK_LUMA_THRESHOLD) darkCount += 1
-                if (luma >= FRAME_LIGHT_LUMA_THRESHOLD) lightCount += 1
+                if (luma <= FramePolicy.DARK_LUMA_THRESHOLD) darkCount += 1
+                if (luma >= FramePolicy.LIGHT_LUMA_THRESHOLD) lightCount += 1
                 samples += 1
                 x += stepX
             }
@@ -495,8 +493,15 @@ class ScreenCaptureController(private val context: Context) {
         val stddev = kotlin.math.sqrt(variance).toFloat()
         val darkRatio = darkCount.toFloat() / samples.toFloat()
         val lightRatio = lightCount.toFloat() / samples.toFloat()
-        val suspicious = stddev < FRAME_MIN_STDDEV_LUMA &&
-            (darkRatio >= FRAME_DOMINANT_RATIO || lightRatio >= FRAME_DOMINANT_RATIO)
+        val suspicious = FramePolicy.isSuspicious(
+            FrameLumaStats(
+                samples = samples,
+                meanLuma = mean,
+                stddevLuma = stddev,
+                darkRatio = darkRatio,
+                lightRatio = lightRatio
+            )
+        )
         return FrameQuality(
             meanLuma = mean,
             stddevLuma = stddev,
@@ -506,27 +511,8 @@ class ScreenCaptureController(private val context: Context) {
         )
     }
 
-    private fun resolveFailureType(error: Throwable): CaptureFailureType {
-        if (error is CaptureException) return error.type
-        val message = error.message.orEmpty().lowercase()
-        if ((error is SecurityException && message.contains("media projection")) ||
-            message.contains("don't re-use the resultdata") ||
-            message.contains("projection token expired") ||
-            message.contains("token is no longer valid") ||
-            message.contains("media projection stopped") ||
-            message.contains("projection has been stopped") ||
-            message.contains("non-current mediaprojection")
-        ) {
-            return CaptureFailureType.PROJECTION_EXPIRED
-        }
-        if (message.contains("timeout")) {
-            return CaptureFailureType.TIMEOUT
-        }
-        if (message.contains("not started")) {
-            return CaptureFailureType.NOT_STARTED
-        }
-        return CaptureFailureType.UNKNOWN
-    }
+    private fun resolveFailureType(error: Throwable): CaptureFailureType =
+        CaptureFailurePolicy.classify(error)
 
     private fun asCaptureException(error: Throwable, type: CaptureFailureType): CaptureException {
         if (error is CaptureException) return error
@@ -568,14 +554,12 @@ class ScreenCaptureController(private val context: Context) {
 
     private companion object {
         const val TAG = "ScreenCaptureCtrl"
+
+        /** 首帧等待超时：管线刚重建完时给它的额外缓冲。 */
         const val FIRST_FRAME_WAIT_TIMEOUT_MS = 2000L
-        const val RECENT_FRAME_MAX_AGE_MS = 1200L
-        const val RECOVERY_RETRY_TIMEOUT_MS = 2200L
-        const val FRAME_SAMPLE_GRID = 24
-        const val FRAME_DARK_LUMA_THRESHOLD = 24f
-        const val FRAME_LIGHT_LUMA_THRESHOLD = 245f
-        const val FRAME_MIN_STDDEV_LUMA = 9f
-        const val FRAME_DOMINANT_RATIO = 0.985f
+
+        // 帧质量判定、最近帧可复用性、JPEG 编码参数与失败分类的常量
+        // 已抽到 FramePolicy / CaptureFailurePolicy，便于 JVM 单测。
     }
 }
 

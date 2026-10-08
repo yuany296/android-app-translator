@@ -20,5 +20,7 @@ data class BubbleRenderState(
     var lineSpacingMultiplier: Float = 1f,
     var bgType: String = "",
     var hasErasePatch: Boolean = false,
+    /** 原文对齐（left/center/right）：译文沿用原排版，别一律居中（2026-09-28 用户要求）。 */
+    var alignment: String = com.manga.translator.translate.TextAlignment.CENTER,
     var baseRect: RectF = RectF()
 )

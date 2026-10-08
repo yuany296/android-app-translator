@@ -26,11 +26,43 @@ object PaddleQuadGeometry {
     /** 竖排 crop 的最小宽高比（参考项目 VERTICAL_CROP_MIN_ASPECT_RATIO = 1.4）。 */
     const val VERTICAL_CROP_MIN_ASPECT_RATIO = 1.4f
 
+    /**
+     * 判定「这个 crop 是竖排、应该旋转 ±90° 再识别」时要求的最小宽高比。
+     *
+     * 比 [VERTICAL_CROP_MIN_ASPECT_RATIO] 更严（1.4 → 1.8），因为两者用途不同：
+     * - [VERTICAL_CROP_MIN_ASPECT_RATIO] 只用于 [rotationDeg] 里**选哪条边做主轴**，
+     *   判错只是倾角估计略有偏差；
+     * - 本阈值决定**要不要把整块转 90° 去识别**，判错的代价是识别结果整体错乱
+     *   （2026-09-30 用户反馈：横排三行韩文被当成竖排，译文变「捕, 追术教导技将它NPC唯一的那」）。
+     *
+     * 真竖排一列的高宽比通常 ≥ 2（一列字）；1.8 留出余量，同时挡掉
+     * 「多行横排且整体偏高」这种约 1.4~1.8 的形态。
+     */
+    const val VERTICAL_CROP_DECISION_ASPECT_RATIO = 1.8f
+
     /** 方向平局判定容差（参考项目 VERTICAL_ORIENTATION_TIE_MARGIN = 0.08）。 */
     const val VERTICAL_ORIENTATION_TIE_MARGIN = 0.08f
 
     /** 弱识别分数阈值（参考项目 180° 重试条件 0.72）。 */
     const val WEAK_RECOGNITION_SCORE = 0.72f
+
+    /**
+     * 采纳一条识别结果的**最低分数**。
+     *
+     * 低于它的直接丢弃，不再进入分组/翻译。0.55 的取值依据：正常气泡文字普遍 > 0.85，
+     * 而 PaddleOCR 在**空白/纹理区域**的误检（用户 2026-09-30 截图里的 `cYa`、`a c`、`c Y`
+     * 那种零散拉丁字母）分数集中在 0.3~0.5。
+     */
+    const val MIN_ACCEPT_SCORE = 0.55f
+
+    /**
+     * 目标语言为韩文时，一条结果至少要有几个韩文字符才采纳。
+     *
+     * 为什么用「至少 1 个」而不是比例：韩漫里的拟声词/外来语可能是纯拉丁（`Bang!`、`OK`），
+     * 设比例会误杀它们；但**一个韩文字都没有**却出现在韩文页面上，基本就是噪声 ——
+     * 这正是 `cYa` 的形态（3 个拉丁字母，0 个韩文）。
+     */
+    const val MIN_SCRIPT_CHARS_KO = 1
 
     /** 识别方向候选：对 deskew crop 施加的旋转角（0 / 90 / -90 / 180）。 */
     data class OrientedResult(val orientation: Int, val text: String, val score: Float)
@@ -58,9 +90,14 @@ object PaddleQuadGeometry {
         return angle
     }
 
-    /** 竖排 crop 判定：高 ≥ 宽 × 1.4（参考 is_confident_vertical_crop）。 */
+    /**
+     * 竖排 crop 判定：是否该把整块**旋转 ±90° 再识别**。
+     *
+     * 阈值用 [VERTICAL_CROP_DECISION_ASPECT_RATIO]（1.8，比主轴选择的 1.4 更严）——
+     * 理由见该常量的注释：判错的代价是识别结果整体错乱，不是倾角略有偏差。
+     */
     fun isConfidentVerticalCrop(width: Int, height: Int): Boolean =
-        height >= max(1, width) * VERTICAL_CROP_MIN_ASPECT_RATIO
+        height >= max(1, width) * VERTICAL_CROP_DECISION_ASPECT_RATIO
 
     /** 目标语言文字字符数（参考 count_target_script_chars）。 */
     fun countScriptChars(text: String, lang: String): Int {
@@ -83,6 +120,43 @@ object PaddleQuadGeometry {
     /** 弱识别：分数低于阈值或完全没有目标文字（参考 180° 重试条件）。 */
     fun isWeakResult(text: String, score: Float, lang: String): Boolean =
         score < WEAK_RECOGNITION_SCORE || countScriptChars(text, lang) == 0
+
+    /**
+     * 质量闸门：这条识别结果**要不要采纳**。不采纳则整条丢弃（不进入分组、不翻译、不贴覆盖层）。
+     *
+     * ## 为什么需要它（2026-09-30 用户反馈）
+     *
+     * 用户截图里出现了 `cYa` 这种零散拉丁字母 —— PaddleOCR 在**空白/纹理区域**的典型误检。
+     * 原来只有 [isWeakResult]，而它**仅用于判断「要不要再转 180° 重试」**，
+     * 重试完不管好坏都照样返回 → 噪声一路流到分组、翻译、覆盖层。
+     *
+     * ## 判据（针对「噪声」而不是「短文本」，这点很关键）
+     *
+     * 1. **分数下限** [MIN_ACCEPT_SCORE]：误检普遍低分。
+     * 2. **必须是目标语言文字**：韩文页面上一个韩文字都没有 → 丢弃。
+     *    这一条专门杀 `cYa`；而纯数字（页脚 `12`）、纯标点（`…`、`?!`）
+     *    本来也翻不出东西，一并挡掉。
+     *
+     * ⚠️ **刻意不像 [isWeakResult] 那样对日语/英语也要求目标文字**：日漫里大量
+     * 拟声词是片假名/拉丁混排，按脚本过滤会误杀；只有韩文这一条是安全且高收益的
+     * （韩文漫画正文不会出现「一个韩文字都没有」的句子）。拿不准的语言一律放行 ——
+     * **宁可漏过滤，不可误杀**。
+     */
+    fun isAcceptableResult(
+        text: String,
+        score: Float,
+        lang: String,
+        minScore: Float = MIN_ACCEPT_SCORE
+    ): Boolean {
+        if (text.isBlank()) return false
+        if (!score.isFinite() || score < minScore) return false
+        // 纯标点/符号（没有任何字母数字）：翻不出东西，丢弃。
+        if (text.none { it.isLetterOrDigit() }) return false
+        val normalized = lang.lowercase()
+        val requiresScript = normalized in setOf("ko", "kor", "korean", "韩文")
+        if (requiresScript && countScriptChars(text, lang) < MIN_SCRIPT_CHARS_KO) return false
+        return true
+    }
 
     /**
      * 从多个方向候选中选择最优（参考 select_best_recognition）：

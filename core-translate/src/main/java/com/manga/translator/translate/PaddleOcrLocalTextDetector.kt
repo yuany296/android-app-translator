@@ -20,6 +20,11 @@ import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.nio.FloatBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.abs
@@ -52,23 +57,33 @@ class PaddleOcrLocalTextDetector(
     private var modelDir: File? = null
     private var opencvReady: Boolean? = null
 
-    @Volatile
-    private var recCascadeHits = 0
+    private val recCascadeHits = AtomicInteger()
 
-    @Volatile
-    private var recCascadeFull = 0
+    private val recCascadeFull = AtomicInteger()
 
-    @Volatile
-    private var verticalCrops = 0
+    private val verticalCrops = AtomicInteger()
 
-    @Volatile
-    private var verticalOrient90 = 0
+    private val verticalOrient90 = AtomicInteger()
 
-    @Volatile
-    private var verticalOrientNeg90 = 0
+    private val verticalOrientNeg90 = AtomicInteger()
 
-    @Volatile
-    private var rot180Retries = 0
+    private val rot180Retries = AtomicInteger()
+
+    /**
+     * 2026-09-15 新增：文字框识别并行池。
+     *
+     * 原先 `allQuads.forEachIndexed { ... }` 串行执行，每个文字框都是一次独立的 rec 推理，
+     * 一张漫画页 30+ 个框只能用一个核跑，是 `paddle_total_ms` 的主要来源（实测约 87%）。
+     * 这里改为多线程并行，每个线程处理一个文字框，结果按下标回填，输出顺序与串行一致。
+     * ONNX Runtime 的 `OrtSession.run` 官方声明线程安全，可被多线程并发调用。
+     */
+    private val recPool: ExecutorService by lazy {
+        Executors.newFixedThreadPool(recParallelism(), object : ThreadFactory {
+            private val seq = AtomicInteger(0)
+            override fun newThread(r: Runnable): Thread =
+                Thread(r, "paddle-rec-${seq.incrementAndGet()}").apply { isDaemon = true }
+        })
+    }
 
     override fun detect(bitmap: Bitmap, sourceLanguageId: String): List<TextBlock> {
         if (!ensureOpenCvLoaded()) {
@@ -102,10 +117,16 @@ class PaddleOcrLocalTextDetector(
         val ready = ensureModelsLoaded(recKey)
         if (ready) {
             if (detSession == null) {
-                detSession = createSession(modelDir!!.resolve(catalog.detModelFileName).absolutePath)
+                detSession = createSession(
+                    modelDir!!.resolve(catalog.detModelFileName).absolutePath,
+                    detIntraOpThreads()
+                )
             }
             if (!recSessions.containsKey(recKey)) {
-                recSessions[recKey] = createSession(modelDir!!.resolve(catalog.recModelFileName(recKey)).absolutePath)
+                recSessions[recKey] = createSession(
+                    modelDir!!.resolve(catalog.recModelFileName(recKey)).absolutePath,
+                    recIntraOpThreads()
+                )
             }
         }
         return ready
@@ -115,10 +136,10 @@ class PaddleOcrLocalTextDetector(
         val startedAt = System.currentTimeMillis()
         val srcW = bitmap.width
         val srcH = bitmap.height
-        verticalCrops = 0
-        verticalOrient90 = 0
-        verticalOrientNeg90 = 0
-        rot180Retries = 0
+        verticalCrops.set(0)
+        verticalOrient90.set(0)
+        verticalOrientNeg90.set(0)
+        rot180Retries.set(0)
 
         // 2026-08-27 新增：按首页选择的 OCR 速度模式调整检测/识别参数。
         val config = speedModeConfig()
@@ -193,73 +214,53 @@ class PaddleOcrLocalTextDetector(
 
         // 3. 对每个候选框在原图上做透视矫正裁剪，再按方向（横排 0° / 竖排 ±90° / 弱结果 180°）识别，
         //    多个识别变体投票选出最可信结果。
+        //    2026-09-15：改为多线程并行识别（每个文字框一个任务），结果按下标回填，输出顺序与串行一致。
         val recSession = recSessions[recKey] ?: return emptyList()
         val alphabet = loadDict(recKey)
         val lang = recKey.id
-        val rawBlocks = mutableListOf<TextBlock>()
-        var cropFailures = 0
-        var degenerateQuads = 0
-        allQuads.forEachIndexed { index, quad ->
-            val rotation = PaddleQuadGeometry.rotationDeg(quad.toPoints())
-            val geometryCheck = PaddleQuadGeometry.checkQuadHealth(quad.toPoints())
-            if (!geometryCheck.healthy) {
-                degenerateQuads++
-                Log.w(
-                    TAG,
-                    String.format(
-                        java.util.Locale.US,
-                        "paddle_quad_degenerate quad_idx=%d rot=%d reason=%s",
-                        index, rotation.roundToInt(), geometryCheck.reason
-                    )
-                )
-            }
-            val cropOriginal = cropQuad(bitmap, quad) ?: run {
-                cropFailures++
-                Log.w(
-                    TAG,
-                    String.format(
-                        java.util.Locale.US,
-                        "paddle_crop_fail quad_idx=%d rot=%d",
-                        index, rotation.roundToInt()
-                    )
-                )
-                return@forEachIndexed
-            }
-            if (cropOriginal.width < MIN_BOX_SIZE_PX || cropOriginal.height < MIN_BOX_SIZE_PX) {
-                cropFailures++
-                cropOriginal.recycle()
-                return@forEachIndexed
-            }
-            val (text, score) = recognizeWithOrientation(
-                cropOriginal, rotation, recSession, alphabet, lang, config
-            )
-            cropOriginal.recycle()
-            if (text.isBlank()) return@forEachIndexed
-            val left = quadsLeft(quad).coerceIn(0f, srcW.toFloat())
-            val top = quadsTop(quad).coerceIn(0f, srcH.toFloat())
-            val right = quadsRight(quad).coerceIn(left + 1f, srcW.toFloat())
-            val bottom = quadsBottom(quad).coerceIn(top + 1f, srcH.toFloat())
-            rawBlocks += TextBlock(
-                id = index,
-                text = text.trim(),
-                left = left,
-                top = top,
-                right = right,
-                bottom = bottom,
-                confidence = score
+        val recStartedAt = System.currentTimeMillis()
+        val slots = arrayOfNulls<TextBlock>(allQuads.size)
+        val cropFailures = AtomicInteger()
+        val degenerateQuads = AtomicInteger()
+        val parallelism = if (allQuads.size > 1) recParallelism() else 1
+        val recognizeOne: (Int) -> Unit = { index ->
+            slots[index] = recognizeQuad(
+                index = index,
+                quad = allQuads[index],
+                bitmap = bitmap,
+                recSession = recSession,
+                alphabet = alphabet,
+                lang = lang,
+                config = config,
+                srcW = srcW,
+                srcH = srcH,
+                cropFailures = cropFailures,
+                degenerateQuads = degenerateQuads
             )
         }
+        if (parallelism <= 1) {
+            allQuads.indices.forEach(recognizeOne)
+        } else {
+            val futures = allQuads.indices.map { index -> recPool.submit { recognizeOne(index) } }
+            futures.forEach { future ->
+                runCatching { future.get(REC_TASK_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
+                    .onFailure { err -> Log.w(TAG, "paddle_rec_task_fail reason=${err.message?.take(80)}") }
+            }
+        }
+        val rawBlocks = slots.filterNotNull().sortedBy { it.id }
+        val recMs = System.currentTimeMillis() - recStartedAt
 
         // 4. 后聚合：把同一行/同一段落的碎片合并成完整句子（参考 translator 的 ocr-lines）
         val merged = PaddleOcrBlockMerger.mergeBlocks(rawBlocks, srcW, srcH)
         val totalMs = System.currentTimeMillis() - startedAt
         Log.d(
             TAG,
-            "paddle_total_ms=${totalMs} primary=${primaryQuads.size} total_quads=${allQuads.size} " +
+            "paddle_total_ms=${totalMs} rec_ms=${recMs} rec_threads=$parallelism " +
+                "primary=${primaryQuads.size} total_quads=${allQuads.size} " +
                 "raw_blocks=${rawBlocks.size} merged=${merged.size} recovery=$needRecovery coverage=${"%.4f".format(coverage)} " +
-                "rec_cascade_hit=$recCascadeHits rec_cascade_full=$recCascadeFull " +
-                "vertical=$verticalCrops orient90=$verticalOrient90 orient-90=$verticalOrientNeg90 rot180=$rot180Retries " +
-                "crop_fail=$cropFailures degenerate=$degenerateQuads speed_mode=${speedModeProvider?.invoke() ?: "balanced"} " +
+                "rec_cascade_hit=${recCascadeHits.get()} rec_cascade_full=${recCascadeFull.get()} " +
+                "vertical=${verticalCrops.get()} orient90=${verticalOrient90.get()} orient-90=${verticalOrientNeg90.get()} rot180=${rot180Retries.get()} " +
+                "crop_fail=${cropFailures.get()} degenerate=${degenerateQuads.get()} speed_mode=${speedModeProvider?.invoke() ?: "balanced"} " +
                 "lang=${recKey.id}"
         )
         return merged
@@ -309,6 +310,112 @@ class PaddleOcrLocalTextDetector(
         return quads
     }
 
+    /**
+     * 单个文字框的完整识别流程（透视裁剪 → 按方向识别 → 生成 TextBlock）。
+     * 2026-09-15：从 `runDetect` 的串行循环中抽出，供并行池调用；线程内只读 `bitmap`，不共享可变状态。
+     */
+    private fun recognizeQuad(
+        index: Int,
+        quad: Array<PointF>,
+        bitmap: Bitmap,
+        recSession: OrtSession,
+        alphabet: List<String>,
+        lang: String,
+        config: SpeedModeConfig,
+        srcW: Int,
+        srcH: Int,
+        cropFailures: AtomicInteger,
+        degenerateQuads: AtomicInteger
+    ): TextBlock? {
+        val rotation = PaddleQuadGeometry.rotationDeg(quad.toPoints())
+        val geometryCheck = PaddleQuadGeometry.checkQuadHealth(quad.toPoints())
+        if (!geometryCheck.healthy) {
+            degenerateQuads.incrementAndGet()
+            Log.w(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "paddle_quad_degenerate quad_idx=%d rot=%d reason=%s",
+                    index, rotation.roundToInt(), geometryCheck.reason
+                )
+            )
+        }
+        val cropOriginal = cropQuad(bitmap, quad) ?: run {
+            cropFailures.incrementAndGet()
+            Log.w(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "paddle_crop_fail quad_idx=%d rot=%d",
+                    index, rotation.roundToInt()
+                )
+            )
+            return null
+        }
+        if (cropOriginal.width < MIN_BOX_SIZE_PX || cropOriginal.height < MIN_BOX_SIZE_PX) {
+            cropFailures.incrementAndGet()
+            cropOriginal.recycle()
+            return null
+        }
+        val (text, score) = recognizeWithOrientation(
+            cropOriginal, rotation, recSession, alphabet, lang, config
+        )
+        cropOriginal.recycle()
+        if (text.isBlank()) return null
+        // 质量闸门（2026-09-30）：不达标就整条丢弃。
+        //
+        // 为什么必须有：`isWeakResult` 只用来决定「要不要再转 180° 重试」，重试完照样返回，
+        // 于是 PaddleOCR 在空白/纹理区域的误检（用户截图里的 `cYa`）会一路流到分组、翻译、
+        // 覆盖层。这里把它挡在入口，并**记下丢弃原因**——不然「某些噪声莫名消失/出现」
+        // 又会变成无线索排查（排障规则：关键决策要有日志）。
+        if (!PaddleQuadGeometry.isAcceptableResult(text, score, lang)) {
+            Log.d(
+                TAG,
+                String.format(
+                    java.util.Locale.US,
+                    "paddle_quad_reject quad_idx=%d lang=%s score=%.3f script=%d text=%s",
+                    index,
+                    lang,
+                    score,
+                    PaddleQuadGeometry.countScriptChars(text, lang),
+                    text.take(24)
+                )
+            )
+            return null
+        }
+        val left = quadsLeft(quad).coerceIn(0f, srcW.toFloat())
+        val top = quadsTop(quad).coerceIn(0f, srcH.toFloat())
+        val right = quadsRight(quad).coerceIn(left + 1f, srcW.toFloat())
+        val bottom = quadsBottom(quad).coerceIn(top + 1f, srcH.toFloat())
+        return TextBlock(
+            id = index,
+            text = text.trim(),
+            left = left,
+            top = top,
+            right = right,
+            bottom = bottom,
+            confidence = score,
+            // 语义四边形（TL/TR/BR/BL，原图像素）随块带出：渲染层用它把遮罩/译文
+            // 一起倾斜，轴对齐外框做不到（2026-09-29）。退化四边形同样带出——
+            // 渲染层有 |倾角|≥60° 且框宽>框高 的自洽检查，不会把多行横排转 90°。
+            polygon = quad.toPoints().map { QuadPoint(it.x, it.y) },
+            // 单框识别结果就是一行；多行块的行数由 `PaddleOcrBlockMerger` 在合并时写入。
+            lineCount = 1
+        )
+    }
+
+    /** 识别并行度：留一个核给 UI/检测，上限 [REC_MAX_PARALLELISM]。 */
+    private fun recParallelism(): Int =
+        Runtime.getRuntime().availableProcessors().minus(1).coerceIn(1, REC_MAX_PARALLELISM)
+
+    /** det 单次调用可用的线程数。 */
+    private fun detIntraOpThreads(): Int =
+        Runtime.getRuntime().availableProcessors().coerceIn(1, DET_MAX_INTRA_OP_THREADS)
+
+    /** rec 单次调用的线程数：并行度>1 时压低，避免与框级并行叠加成线程超订。 */
+    private fun recIntraOpThreads(): Int =
+        if (recParallelism() > 1) REC_INTRA_OP_THREADS_WHEN_PARALLEL else REC_INTRA_OP_THREADS_WHEN_SERIAL
+
     private fun recognizeBest(
         crop: Bitmap,
         recSession: OrtSession,
@@ -319,10 +426,10 @@ class PaddleOcrLocalTextDetector(
         // 清晰文字是绝大多数场景，能省 ~7/8 的识别耗时；低置信度框仍走全变体投票。
         val raw = runCatching { recognizeCrop(crop, recSession, alphabet) }.getOrDefault("" to 0f)
         if (raw.first.isNotBlank() && raw.second >= config.recCascadeHighConf) {
-            recCascadeHits++
+            recCascadeHits.incrementAndGet()
             return raw
         }
-        recCascadeFull++
+        recCascadeFull.incrementAndGet()
         // 中等置信度档：只跑灰度/反色两个增强变体（共 3 次识别），
         // 跳过 2x 放大等高成本变体，兼顾速度与召回。
         if (raw.first.isNotBlank() && raw.second >= config.recCascadeMidConf) {
@@ -400,7 +507,7 @@ class PaddleOcrLocalTextDetector(
         config: SpeedModeConfig
     ): Pair<String, Float> {
         if (PaddleQuadGeometry.isConfidentVerticalCrop(crop.width, crop.height)) {
-            verticalCrops++
+            verticalCrops.incrementAndGet()
             val cw = runCatching { rotate90(crop, clockwise = true) }.getOrNull()
             val ccw = runCatching { rotate90(crop, clockwise = false) }.getOrNull()
             val cwRaw = cw?.let { recognizeCrop(it, recSession, alphabet) } ?: ("" to 0f)
@@ -427,7 +534,7 @@ class PaddleOcrLocalTextDetector(
             ccw?.recycle()
             val chosen = PaddleQuadGeometry.selectBestOrientation(rotation, results, lang)
             if (chosen == null || chosen.text.isBlank()) return "" to 0f
-            if (chosen.orientation == 90) verticalOrient90++ else verticalOrientNeg90++
+            if (chosen.orientation == 90) verticalOrient90.incrementAndGet() else verticalOrientNeg90.incrementAndGet()
             Log.d(
                 TAG,
                 String.format(
@@ -452,7 +559,7 @@ class PaddleOcrLocalTextDetector(
                     PaddleQuadGeometry.recognitionQuality(retry.first, retry.second, lang) >
                     PaddleQuadGeometry.recognitionQuality(raw.first, raw.second, lang)
                 ) {
-                    rot180Retries++
+                    rot180Retries.incrementAndGet()
                     Log.d(
                         TAG,
                         String.format(
@@ -682,10 +789,19 @@ class PaddleOcrLocalTextDetector(
         return String(bytes, start, i - start, Charsets.UTF_8)
     }
 
-    private fun createSession(modelPath: String): OrtSession {
+    /**
+     * 创建推理会话。
+     *
+     * 2026-09-15 调整：
+     * - 优化级别从 `BASIC_OPT` 提到 `ALL_OPT`（图融合/常量折叠更彻底，纯加速、不改计算结果）。
+     * - det 是单次大输入调用，给它多线程；rec 是「多线程跑多个小框」的模式，
+     *   单次调用只给小量线程，避免线程数超订（8 核上开 3×4=12 线程反而变慢）。
+     */
+    private fun createSession(modelPath: String, intraOpThreads: Int): OrtSession {
         val options = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(4)
-            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+            setIntraOpNumThreads(intraOpThreads)
+            setInterOpNumThreads(1)
+            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
         }
         return runCatching { ortEnv.createSession(modelPath, options) }
             .getOrElse { err ->
@@ -1028,12 +1144,20 @@ class PaddleOcrLocalTextDetector(
             resizedW = ceil(REC_HEIGHT * ratio).toInt()
             if (resizedW > targetW) resizedW = targetW
         }
-        val scaled = Bitmap.createScaledBitmap(crop, resizedW.coerceAtLeast(1), REC_HEIGHT, false)
+        val safeW = resizedW.coerceAtLeast(1)
+        val scaled = Bitmap.createScaledBitmap(crop, safeW, REC_HEIGHT, false)
         val floats = FloatArray(3 * REC_HEIGHT * targetW)
         val pixels = IntArray(REC_HEIGHT * targetW)
-        val padded = Bitmap.createBitmap(targetW, REC_HEIGHT, Bitmap.Config.ARGB_8888)
-        android.graphics.Canvas(padded).drawBitmap(scaled, 0f, 0f, null)
-        padded.getPixels(pixels, 0, targetW, 0, 0, targetW, REC_HEIGHT)
+        // 2026-09-15：宽度已等于目标宽度时直接读 scaled，省掉一次「建位图 + 画一次」的开销。
+        // rec 是整页最热的路径（每页几十~上百次），这里的省法是乘出来的。
+        if (safeW == targetW) {
+            scaled.getPixels(pixels, 0, targetW, 0, 0, targetW, REC_HEIGHT)
+        } else {
+            val padded = Bitmap.createBitmap(targetW, REC_HEIGHT, Bitmap.Config.ARGB_8888)
+            android.graphics.Canvas(padded).drawBitmap(scaled, 0f, 0f, null)
+            padded.getPixels(pixels, 0, targetW, 0, 0, targetW, REC_HEIGHT)
+            padded.recycle()
+        }
 
         var idx = 0
         for (c in 0 until 3) {
@@ -1051,7 +1175,6 @@ class PaddleOcrLocalTextDetector(
             }
         }
         if (scaled !== crop) scaled.recycle()
-        padded.recycle()
         return RecInput(targetW, floats)
     }
 
@@ -1192,6 +1315,21 @@ class PaddleOcrLocalTextDetector(
         const val REC_MAX_IMG_W = 3200
         const val MERGE_IOU_THRESHOLD = 0.45f
         const val MIN_BOX_SIZE_PX = 2
+
+        /** 文字框识别的最大并行度（框级并行）。 */
+        const val REC_MAX_PARALLELISM = 4
+
+        /** 单个文字框识别任务的超时上限，超时只丢该框结果、不阻塞整页。 */
+        const val REC_TASK_TIMEOUT_MS = 20_000L
+
+        /** det 单次推理最大 intra-op 线程数。 */
+        const val DET_MAX_INTRA_OP_THREADS = 4
+
+        /** rec 并行度>1（框级并行已占满核）时，单次推理给 2 线程。 */
+        const val REC_INTRA_OP_THREADS_WHEN_PARALLEL = 2
+
+        /** rec 并行度=1（单核/单框）时，单次推理用满 4 线程。 */
+        const val REC_INTRA_OP_THREADS_WHEN_SERIAL = 4
         val DET_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f)
         val DET_STD = floatArrayOf(0.229f, 0.224f, 0.225f)
     }

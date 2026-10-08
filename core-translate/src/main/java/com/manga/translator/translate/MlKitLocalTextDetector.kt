@@ -43,7 +43,11 @@ class MlKitLocalTextDetector : LocalTextDetector {
                         top = (box.top / scale).toFloat(),
                         right = (box.right / scale).toFloat(),
                         bottom = (box.bottom / scale).toFloat(),
-                        confidence = 0f
+                        confidence = 0f,
+                        // ML Kit 的 `block` 是**段落级**多行块：行数必须带出来，否则
+                        // 「行高 = 框高 ÷ 行数」会退化成「整块高度」→ 合并阈值放大数倍
+                        // （2026-10-03 两个独立气泡被并成一句的真机事故）。
+                        lineCount = block.lines.count { it.text.isNotBlank() }.coerceAtLeast(1)
                     )
                 }
             }.getOrElse { err ->

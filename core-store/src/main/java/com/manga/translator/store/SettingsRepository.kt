@@ -3,6 +3,7 @@ package com.manga.translator.store
 import android.content.Context
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
+import org.json.JSONArray
 import org.json.JSONObject
 import java.time.YearMonth
 
@@ -107,6 +108,25 @@ class SettingsRepository(context: Context) {
             .apply()
     }
 
+    /**
+     * 记住「厂商 → API Key」。
+     *
+     * 用户要求 API Key 跟随厂商：换厂商时把各自的 key 带回来，而不是所有厂商共用一把
+     * （2026-09-18 反馈「只要填写一次，就都是那个相同的 key」）。
+     */
+    fun getProviderApiKey(providerId: String): String {
+        val id = AiProvider.fromId(providerId).id
+        return loadProviderApiKeysJson().optString(id, "").trim()
+    }
+
+    fun saveProviderApiKey(providerId: String, apiKey: String) {
+        val id = AiProvider.fromId(providerId).id
+        val root = loadProviderApiKeysJson()
+        val trimmed = apiKey.trim()
+        if (trimmed.isEmpty()) root.remove(id) else root.put(id, trimmed)
+        prefs.edit().putString(KEY_PROVIDER_API_KEYS, root.toString()).apply()
+    }
+
     fun renameProfile(oldName: String, newName: String): RenameProfileResult {
         val source = oldName.trim()
         val target = newName.trim()
@@ -153,6 +173,92 @@ class SettingsRepository(context: Context) {
         }
         editor.apply()
         return getProfileNames()
+    }
+
+    /**
+     * 内嵌浏览器「inpaint 清理图」开关（2026-09-28）。
+     *
+     * 独立于 [AppSettings]：它只影响浏览器渲染观感，不属于翻译 API 档案，
+     * 放在档案里会被「切换配置档案 → saveSettings」连带重置。
+     */
+    fun isBrowserInpaintCleanEnabled(): Boolean {
+        return prefs.getBoolean(KEY_BROWSER_INPAINT_CLEAN, true)
+    }
+
+    fun setBrowserInpaintCleanEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_BROWSER_INPAINT_CLEAN, enabled).apply()
+    }
+
+    /**
+     * 内嵌浏览器「覆盖层渲染」开关（2026-09-29，默认开）。
+     *
+     * 开 = 译文画在 WebView 的 DOM 覆盖层上（对齐 C:\homework\translator 扩展：
+     * 百分比场景 + cover/text 分层 + 清理图补丁，滚动零抖动）；
+     * 关 = 旧的整图替换（成图 PNG 原位贴上）。场景下发失败时会话内自动回退整图，
+     * 这个开关是给用户手动兜底的。
+     */
+    fun isBrowserDomOverlayEnabled(): Boolean {
+        return prefs.getBoolean(KEY_BROWSER_DOM_OVERLAY, true)
+    }
+
+    fun setBrowserDomOverlayEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_BROWSER_DOM_OVERLAY, enabled).apply()
+    }
+
+    /**
+     * 内嵌浏览器默认搜索引擎（2026-09-28 用户反馈：写死 Google，国内用不了）。
+     * 同样是独立 pref（不属于翻译 API 档案），默认 [BrowserSearchEngine.DEFAULT] = 必应。
+     */
+    fun getBrowserSearchEngine(): BrowserSearchEngine {
+        return BrowserSearchEngine.fromId(prefs.getString(KEY_BROWSER_SEARCH_ENGINE, null))
+    }
+
+    fun setBrowserSearchEngine(engine: BrowserSearchEngine) {
+        prefs.edit().putString(KEY_BROWSER_SEARCH_ENGINE, engine.id).apply()
+    }
+
+    /**
+     * 内嵌浏览器「站点适配」总开关（2026-09-30，默认开）。
+     *
+     * 开 = 按当前站点套用 [BrowserSiteAdapterRegistry] 里的规则（额外选择器 /
+     * 排除区 / 更合适的尺寸阈值），换取「更多站点能扫到漫画页图」；
+     * 关 = 只跑通用层（懒加载属性 / srcset / 背景图 / 滚动容器坐标仍然生效），
+     * 用于「某个站适配后反而更糟」时快速回退。
+     */
+    fun isBrowserSiteAdapterEnabled(): Boolean {
+        return prefs.getBoolean(KEY_BROWSER_SITE_ADAPTER, true)
+    }
+
+    fun setBrowserSiteAdapterEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_BROWSER_SITE_ADAPTER, enabled).apply()
+    }
+
+    /**
+     * 单独关掉的站点适配 id 集合。
+     *
+     * 为什么要「逐站关闭」而不只留总开关：某个站的选择器失效时，用户不该被迫
+     * 为了这一个站牺牲其它站。落盘为 JSON 数组，解析失败一律当空集（宁可多套用
+     * 规则，也不要因为坏数据把所有适配都废掉）。
+     */
+    fun browserDisabledSiteAdapters(): Set<String> {
+        val raw = prefs.getString(KEY_BROWSER_DISABLED_SITES, null)?.trim().orEmpty()
+        if (raw.isEmpty()) return emptySet()
+        return runCatching {
+            val array = JSONArray(raw)
+            (0 until array.length()).mapNotNull { index ->
+                array.optString(index).trim().lowercase().takeIf { it.isNotEmpty() }
+            }.toSet()
+        }.getOrDefault(emptySet())
+    }
+
+    /** 逐站开/关；返回操作后的完整集合（调用方直接拿去更新 UI 状态）。 */
+    fun setBrowserSiteAdapterDisabled(adapterId: String, disabled: Boolean): Set<String> {
+        val id = adapterId.trim().lowercase()
+        if (id.isEmpty() || id == BrowserSiteAdapter.GENERIC.id) return browserDisabledSiteAdapters()
+        val next = browserDisabledSiteAdapters().toMutableSet()
+        if (disabled) next += id else next -= id
+        prefs.edit().putString(KEY_BROWSER_DISABLED_SITES, JSONArray(next.toList()).toString()).apply()
+        return next
     }
 
     fun getLastProfileName(): String {
@@ -214,6 +320,11 @@ class SettingsRepository(context: Context) {
 
     private fun loadProfilesJson(): JSONObject {
         val raw = prefs.getString(KEY_PROFILES_JSON, "{}").orEmpty()
+        return runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
+    }
+
+    private fun loadProviderApiKeysJson(): JSONObject {
+        val raw = prefs.getString(KEY_PROVIDER_API_KEYS, "{}").orEmpty()
         return runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
     }
 
@@ -294,6 +405,7 @@ class SettingsRepository(context: Context) {
         const val KEY_ENABLE_THINKING = "enable_thinking"
         const val KEY_THINKING_BUDGET = "thinking_budget"
         const val KEY_PROFILES_JSON = "profiles_json"
+        const val KEY_PROVIDER_API_KEYS = "provider_api_keys_json"
         const val KEY_LAST_PROFILE_NAME = "last_profile_name"
         const val KEY_LAST_OCR_PROFILE_NAME = "last_ocr_profile_name"
         const val KEY_LAST_TRANSLATE_PROFILE_NAME = "last_translate_profile_name"
@@ -304,6 +416,11 @@ class SettingsRepository(context: Context) {
         const val KEY_TRANSLATE_ENGINE = "translate_engine"
         const val KEY_BAIDU_TRANSLATE_APP_ID = "baidu_translate_app_id"
         const val KEY_BAIDU_TRANSLATE_SECRET_KEY = "baidu_translate_secret_key"
+        const val KEY_BROWSER_INPAINT_CLEAN = "browser_inpaint_clean"
+        const val KEY_BROWSER_DOM_OVERLAY = "browser_dom_overlay"
+        const val KEY_BROWSER_SEARCH_ENGINE = "browser_search_engine"
+        const val KEY_BROWSER_SITE_ADAPTER = "browser_site_adapter"
+        const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }

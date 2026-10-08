@@ -52,7 +52,12 @@ class OpenAiVisionClient(
 
         val endpoint = normalizeBaseUrl(baseUrl) + "/chat/completions"
         val traceId = "ocr-" + SystemClock.elapsedRealtime().toString()
-        val thinkingEnabled = enableThinking && (providerId == "qwen" || providerId == "glm")
+        // 思考参数三态（2026-10-02）：不支持的厂商完全不发（OMIT）；支持但用户关掉时**显式发 false**，
+        // 否则 Qwen3 这类默认开思考的模型会一直拖着不下结论（用户反馈「有思考功能会慢很多」）。
+        val initialThinking = ThinkingSupport.initialMode(
+            providerSupportsThinking = ThinkingSupport.providerSupportsThinking(providerId),
+            enableThinking = enableThinking
+        )
         val normalizedThinkingBudget = thinkingBudget.coerceIn(1024, 131072)
         val prompt = buildOcrPrompt(ignoreSimplifiedChinese, imageWidth, imageHeight)
 
@@ -61,15 +66,14 @@ class OpenAiVisionClient(
             model = model,
             apiKey = apiKey,
             traceId = traceId,
-            includeThinking = thinkingEnabled,
-            thinkingBudget = normalizedThinkingBudget
-        ) { useJsonFormat, useThinking ->
+            initialThinking = initialThinking
+        ) { useJsonFormat, thinking ->
             buildVisionBody(
                 model = model,
                 prompt = prompt,
                 dataUrl = dataUrl,
                 useJsonResponseFormat = useJsonFormat,
-                includeThinking = useThinking,
+                thinking = thinking,
                 thinkingBudget = normalizedThinkingBudget,
                 systemPrompt = "You are a manga OCR engine. Return JSON only."
             )
@@ -162,7 +166,10 @@ class OpenAiVisionClient(
         val endpoint = normalizeBaseUrl(baseUrl) + "/chat/completions"
         val traceId = "tr-" + SystemClock.elapsedRealtime().toString()
         val providerId = provider.trim().lowercase()
-        val thinkingEnabled = enableThinking && (providerId == "qwen" || providerId == "glm")
+        val initialThinking = ThinkingSupport.initialMode(
+            providerSupportsThinking = ThinkingSupport.providerSupportsThinking(providerId),
+            enableThinking = enableThinking
+        )
         val normalizedThinkingBudget = thinkingBudget.coerceIn(1024, 131072)
         val prompt = buildTranslatePrompt(texts.size, targetLanguageId, glossary)
 
@@ -175,15 +182,14 @@ class OpenAiVisionClient(
             model = model,
             apiKey = apiKey,
             traceId = traceId,
-            includeThinking = thinkingEnabled,
-            thinkingBudget = normalizedThinkingBudget
-        ) { useJsonFormat, useThinking ->
+            initialThinking = initialThinking
+        ) { useJsonFormat, thinking ->
             buildTextTranslateBody(
                 model = model,
                 prompt = prompt,
                 inputTextsJson = inputArray.toString(),
                 useJsonResponseFormat = useJsonFormat,
-                includeThinking = useThinking,
+                thinking = thinking,
                 thinkingBudget = normalizedThinkingBudget
             )
         }
@@ -210,7 +216,10 @@ class OpenAiVisionClient(
         val endpoint = normalizeBaseUrl(baseUrl) + "/chat/completions"
         val traceId = "grp-" + SystemClock.elapsedRealtime().toString()
         val providerId = provider.trim().lowercase()
-        val thinkingEnabled = enableThinking && (providerId == "qwen" || providerId == "glm")
+        val initialThinking = ThinkingSupport.initialMode(
+            providerSupportsThinking = ThinkingSupport.providerSupportsThinking(providerId),
+            enableThinking = enableThinking
+        )
         val normalizedThinkingBudget = thinkingBudget.coerceIn(1024, 131072)
         val prompt = buildGroupPrompt(blocks)
 
@@ -219,15 +228,14 @@ class OpenAiVisionClient(
             model = model,
             apiKey = apiKey,
             traceId = traceId,
-            includeThinking = thinkingEnabled,
-            thinkingBudget = normalizedThinkingBudget
-        ) { useJsonFormat, useThinking ->
+            initialThinking = initialThinking
+        ) { useJsonFormat, thinking ->
             buildTextTranslateBody(
                 model = model,
                 prompt = prompt,
                 inputTextsJson = "[]",
                 useJsonResponseFormat = useJsonFormat,
-                includeThinking = useThinking,
+                thinking = thinking,
                 thinkingBudget = normalizedThinkingBudget
             )
         }
@@ -864,67 +872,71 @@ return parseGroups(result, blocks)
         return ratio >= 0.45f
     }
 
+    /**
+     * 请求重试阶梯（2026-10-02 改为「思考三态 + 有界阶梯」）。
+     *
+     * 两条独立的降级理由：
+     * 1. 端点不接受思考参数 → `ENABLED → DISABLED_EXPLICIT → OMIT` 逐级降级
+     *    （最后一级是给「连 `enable_thinking:false` 都拒绝」的端点兜底，退回到旧行为：完全不发该字段）；
+     * 2. 端点不接受 `response_format` → 同一思考模式下换 `json_format=false` 重发。
+     *
+     * 用 `attempted` 去重 + 次数上限，避免两条降级理由互相触发导致死循环。
+     */
     private fun requestWithFallback(
         endpoint: String,
         model: String,
         apiKey: String,
         traceId: String,
-        includeThinking: Boolean,
-        thinkingBudget: Int,
-        bodyBuilder: (useJsonFormat: Boolean, useThinking: Boolean) -> JSONObject
+        initialThinking: ThinkingMode,
+        bodyBuilder: (useJsonFormat: Boolean, thinking: ThinkingMode) -> JSONObject
     ): String {
-        Log.d(TAG, "[$traceId] request_prepare model=$model endpoint=$endpoint")
-
-        val firstTry = executeRequest(
-            endpoint = endpoint,
-            apiKey = apiKey,
-            body = bodyBuilder(true, includeThinking),
-            traceId = traceId,
-            jsonFormat = true,
-            thinking = includeThinking
+        Log.d(
+            TAG,
+            "[$traceId] request_prepare model=$model endpoint=$endpoint thinking=${initialThinking.name}"
         )
-        if (firstTry.isSuccess) return firstTry.raw
 
-        val firstError = firstTry.error.orEmpty()
-        if (includeThinking && isThinkingUnsupported(firstError)) {
-            val noThinkingTry = executeRequest(
-                endpoint = endpoint,
-                apiKey = apiKey,
-                body = bodyBuilder(true, false).put("thinking_budget", thinkingBudget),
-                traceId = traceId,
-                jsonFormat = true,
-                thinking = false
-            )
-            if (noThinkingTry.isSuccess) return noThinkingTry.raw
-            if (isResponseFormatUnsupported(noThinkingTry.error.orEmpty())) {
-                val noThinkingNoFormat = executeRequest(
-                    endpoint = endpoint,
-                    apiKey = apiKey,
-                    body = bodyBuilder(false, false),
-                    traceId = traceId,
-                    jsonFormat = false,
-                    thinking = false
-                )
-                if (noThinkingNoFormat.isSuccess) return noThinkingNoFormat.raw
-                throw IOException("OpenAI-compatible API error: ${noThinkingNoFormat.error ?: noThinkingTry.error}")
+        val attempted = mutableSetOf<Pair<ThinkingMode, Boolean>>()
+        var mode = initialThinking
+        var jsonFormat = true
+        var lastError = ""
+
+        repeat(MAX_REQUEST_ATTEMPTS) {
+            val rung = mode to jsonFormat
+            if (!attempted.add(rung)) {
+                throw IOException("OpenAI-compatible API error: ${lastError.ifBlank { "unknown error" }}")
             }
-            throw IOException("OpenAI-compatible API error: ${noThinkingTry.error ?: firstError}")
-        }
-
-        if (isResponseFormatUnsupported(firstError)) {
-            val secondTry = executeRequest(
+            val result = executeRequest(
                 endpoint = endpoint,
                 apiKey = apiKey,
-                body = bodyBuilder(false, includeThinking),
+                body = bodyBuilder(jsonFormat, mode),
                 traceId = traceId,
-                jsonFormat = false,
-                thinking = includeThinking
+                jsonFormat = jsonFormat,
+                thinking = mode
             )
-            if (secondTry.isSuccess) return secondTry.raw
-            throw IOException("OpenAI-compatible API error: ${secondTry.error ?: firstError}")
-        }
+            if (result.isSuccess) return result.raw
+            lastError = result.error.orEmpty()
 
-        throw IOException("OpenAI-compatible API error: ${firstError.ifBlank { "unknown error" }}")
+            val next = when {
+                isThinkingUnsupported(lastError) ->
+                    ThinkingSupport.nextDegrade(mode)?.let { it to jsonFormat }
+
+                isResponseFormatUnsupported(lastError) ->
+                    if (jsonFormat) mode to false else null
+
+                else -> null
+            }
+            if (next == null) {
+                throw IOException("OpenAI-compatible API error: ${lastError.ifBlank { "unknown error" }}")
+            }
+            Log.d(
+                TAG,
+                "[$traceId] request_retry from=${mode.name}/json=$jsonFormat " +
+                    "to=${next.first.name}/json=${next.second} reason=${lastError.take(120)}"
+            )
+            mode = next.first
+            jsonFormat = next.second
+        }
+        throw IOException("OpenAI-compatible API error: ${lastError.ifBlank { "unknown error" }}")
     }
 
     private fun buildVisionBody(
@@ -932,7 +944,7 @@ return parseGroups(result, blocks)
         prompt: String,
         dataUrl: String,
         useJsonResponseFormat: Boolean,
-        includeThinking: Boolean,
+        thinking: ThinkingMode,
         thinkingBudget: Int,
         systemPrompt: String
     ): JSONObject {
@@ -958,13 +970,7 @@ return parseGroups(result, blocks)
                             )
                     )
             )
-        if (includeThinking) {
-            body.put("enable_thinking", true)
-            body.put("thinking_budget", thinkingBudget)
-        } else {
-            // 非思考模式限制最大输出，避免模型输出失控导致响应时间暴涨（日志曾观测到 2 句译文返回 18KB）。
-            body.put("max_tokens", MAX_OUTPUT_TOKENS)
-        }
+        ThinkingSupport.applyTo(body, thinking, thinkingBudget, MAX_OUTPUT_TOKENS)
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
         }
@@ -976,7 +982,7 @@ return parseGroups(result, blocks)
         prompt: String,
         inputTextsJson: String,
         useJsonResponseFormat: Boolean,
-        includeThinking: Boolean,
+        thinking: ThinkingMode,
         thinkingBudget: Int
     ): JSONObject {
         val body = JSONObject()
@@ -999,12 +1005,7 @@ return parseGroups(result, blocks)
                             )
                     )
             )
-        if (includeThinking) {
-            body.put("enable_thinking", true)
-            body.put("thinking_budget", thinkingBudget)
-        } else {
-            body.put("max_tokens", MAX_OUTPUT_TOKENS)
-        }
+        ThinkingSupport.applyTo(body, thinking, thinkingBudget, MAX_OUTPUT_TOKENS)
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
         }
@@ -1017,7 +1018,7 @@ return parseGroups(result, blocks)
         body: JSONObject,
         traceId: String,
         jsonFormat: Boolean,
-        thinking: Boolean
+        thinking: ThinkingMode
     ): ApiResult {
         val requestBody = body.toString()
         val req = Request.Builder()
@@ -1028,7 +1029,7 @@ return parseGroups(result, blocks)
             .build()
 
         val started = SystemClock.elapsedRealtime()
-        Log.d(TAG, "[$traceId] request_send json_format=$jsonFormat thinking=$thinking bytes=${requestBody.length}")
+        Log.d(TAG, "[$traceId] request_send json_format=$jsonFormat thinking=${thinking.name} bytes=${requestBody.length}")
         client.newCall(req).execute().use { resp ->
             val raw = resp.body?.string().orEmpty()
             val cost = SystemClock.elapsedRealtime() - started
@@ -1204,13 +1205,24 @@ return parseGroups(result, blocks)
             (lower.contains("not supported") || lower.contains("not valid") || lower.contains("unsupported"))
     }
 
+    /**
+     * 判断错误是否为「端点不接受思考参数」。
+     *
+     * 第一判据：错误文本点名了 `enable_thinking` / `thinking_budget`（原来的行为）。
+     * 第二判据（2026-10-02 新增）：文本只泛泛地说「unknown/unsupported/invalid parameter」，
+     * 没有回显字段名。因为「关思考」路径现在会**主动发** `enable_thinking:false`，
+     * 万一某个端点连这个字段都拒绝（且不回显名字），不给降级机会就会把本来能用的翻译打挂。
+     * 该判据只会让请求在阶梯里多走一级（最终退到 OMIT，即旧行为），代价有上限。
+     */
     private fun isThinkingUnsupported(errorText: String): Boolean {
         val lower = errorText.lowercase()
-        if (!(lower.contains("enable_thinking") || lower.contains("thinking_budget"))) return false
-        return lower.contains("not supported") ||
+        val mentionsField = lower.contains("enable_thinking") || lower.contains("thinking_budget")
+        val rejected = lower.contains("not supported") ||
             lower.contains("not valid") ||
             lower.contains("unsupported") ||
             lower.contains("unknown")
+        if (mentionsField) return rejected
+        return lower.contains("parameter") && rejected
     }
 
     private fun parseModelJson(
@@ -1614,6 +1626,8 @@ private companion object {
         const val TAG = "VisionClient"
         const val READ_TIMEOUT_SECONDS = 120L
         const val MAX_OUTPUT_TOKENS = 2048
+        /** 单次请求最多尝试几轮（思考降级 + response_format 降级共用这个上限）。 */
+        const val MAX_REQUEST_ATTEMPTS = 4
         const val BAIDU_PROVIDER_ID = "baidu"
         const val BAIDU_DEFAULT_HOST = "https://aip.baidubce.com"
         const val BAIDU_DEFAULT_LANGUAGE = "JAP"
@@ -1629,4 +1643,75 @@ private companion object {
             '\u5BF9', '\u6C14', '\u52A8', '\u4F1A'
         )
     }
+}
+
+/**
+ * 思考参数的发送模式（2026-10-02 新增，用户要求「加一个参数表示是否开启思考功能」）。
+ *
+ * - [ENABLED]：显式打开（`enable_thinking:true` + `thinking_budget`）。
+ * - [DISABLED_EXPLICIT]：**显式关闭**（`enable_thinking:false` + `max_tokens`）。
+ *   这一态是本次新增的关键：千问 Qwen3 / qwen3-vl 这类模型默认就开思考，
+ *   以前「关」只是不发字段，等于没关，用户会一直等模型思考完。
+ * - [OMIT]：完全不发思考字段（厂商不支持该参数时保持旧行为）。
+ */
+enum class ThinkingMode { ENABLED, DISABLED_EXPLICIT, OMIT }
+
+/**
+ * 思考参数的唯一事实来源：谁支持、发哪种模式、字段怎么落。
+ *
+ * 纯 Kotlin（不碰 Android API），因此可以 JVM 单测；`app` 模块的一致性测试
+ * （`ThinkingProviderConsistencyTest`）会核对这里的厂商集合与
+ * `com.manga.translator.store.AiProvider.supportsThinking` 一致，避免两处各自漂移。
+ */
+object ThinkingSupport {
+    /** 与 `AiProvider.QWEN` / `AiProvider.GLM` 对应（注意同步修改两边）。 */
+    private val PROVIDER_IDS = setOf("qwen", "glm")
+
+    fun providerSupportsThinking(providerId: String): Boolean {
+        return providerId.trim().lowercase() in PROVIDER_IDS
+    }
+
+    fun initialMode(providerSupportsThinking: Boolean, enableThinking: Boolean): ThinkingMode {
+        return when {
+            !providerSupportsThinking -> ThinkingMode.OMIT
+            enableThinking -> ThinkingMode.ENABLED
+            else -> ThinkingMode.DISABLED_EXPLICIT
+        }
+    }
+
+    /** 端点拒绝当前思考参数时的下一级（没有下一级返回 null）。 */
+    fun nextDegrade(mode: ThinkingMode): ThinkingMode? {
+        return when (mode) {
+            ThinkingMode.ENABLED -> ThinkingMode.DISABLED_EXPLICIT
+            ThinkingMode.DISABLED_EXPLICIT -> ThinkingMode.OMIT
+            ThinkingMode.OMIT -> null
+        }
+    }
+
+    /**
+     * 把思考相关字段（以及非思考模式下的 `max_tokens` 输出上限）写进请求体。
+     *
+     * 非思考模式限制最大输出，避免模型输出失控导致响应时间暴涨
+     * （日志曾观测到 2 句译文返回 18KB）。
+     */
+    fun applyTo(body: JSONObject, mode: ThinkingMode, budget: Int, maxOutputTokens: Int) {
+        when (mode) {
+            ThinkingMode.ENABLED -> {
+                body.put("enable_thinking", true)
+                body.put("thinking_budget", budget.coerceIn(MIN_THINKING_BUDGET, MAX_THINKING_BUDGET))
+            }
+
+            ThinkingMode.DISABLED_EXPLICIT -> {
+                body.put("enable_thinking", false)
+                body.put("max_tokens", maxOutputTokens)
+            }
+
+            ThinkingMode.OMIT -> {
+                body.put("max_tokens", maxOutputTokens)
+            }
+        }
+    }
+
+    const val MIN_THINKING_BUDGET = 1024
+    const val MAX_THINKING_BUDGET = 131072
 }

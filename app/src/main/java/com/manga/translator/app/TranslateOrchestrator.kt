@@ -3,7 +3,6 @@ package com.manga.translator.app
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
-import android.util.Base64
 import android.util.Log
 import com.manga.translator.capture.ScreenCaptureController
 import com.manga.translator.overlay.BubbleAdjustment
@@ -14,25 +13,20 @@ import com.manga.translator.overlay.OverlayRenderConfig
 import com.manga.translator.overlay.WritableAreaRefiner
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.PageOverlayAdjustment
-import com.manga.translator.store.TranslationHistoryEntry
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.BubbleGeometry
-import com.manga.translator.translate.BubbleMergeHeuristics
-import com.manga.translator.translate.BubbleMergeScenario
 import com.manga.translator.translate.BubbleRegion
 import com.manga.translator.translate.BubbleRegionType
+import com.manga.translator.translate.NonTranslatableText
+import com.manga.translator.translate.OcrBlockMergeRules
 import com.manga.translator.translate.TextBlock
 import com.manga.translator.translate.TranslationResult
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.IOException
-import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
@@ -45,6 +39,9 @@ class TranslateOrchestrator(
 ) {
     private val writableAreaRefiner = WritableAreaRefiner()
     private val bubbleFirstRegionPlanner = BubbleFirstRegionPlanner()
+
+    /** 缓存查找 + 引擎分发（本地/百度/云端）+ 缓存回写，2026-09-28 抽出供浏览器链路复用。 */
+    private val translationResolver = PageTranslationResolver(ioDispatcher)
 
     suspend fun runOnce(onStageChanged: ((FloatingState) -> Unit)? = null): RunOnceOutcome {
         val timer = TranslationTimer()
@@ -98,11 +95,38 @@ class TranslateOrchestrator(
             return RunOnceOutcome(hasOverlay = false, baselineHash = null, warningMessage = null)
         }
 
+        // 「读不出就别动」（2026-09-30 用户要求）：OCR 读不出可覆盖内容的区域（空 /
+        // 极短纯符号 / 极短混合文字系统碎片，判据见 EraseTargets.kt）在这里**整块丢弃** ——
+        // 不擦（白块）、不翻译（垃圾进垃圾出）、不渲染（没擦却盖字 = 双重污染）。
+        // 必须在源头丢，而不是只跳过擦除：擦除与渲染本来共用这份列表，源头一致才能
+        // 保证「要么擦掉并盖上译文，要么原样保留」，没有中间态。
+        val handledBubbles = ocrResult.bubbles.filter { isWorthErasing(it) }
+        val droppedBubbles = ocrResult.bubbles.filterNot { isWorthErasing(it) }
+        if (droppedBubbles.isNotEmpty()) {
+            timer.mark(
+                "erase_skip",
+                "dropped=${droppedBubbles.size} kept=${handledBubbles.size} " +
+                    "skipped_text=" + droppedBubbles.joinToString(separator = " ") { "[${it.originalText}]" }
+            )
+        }
+        val effectiveOcrResult = if (droppedBubbles.isEmpty()) {
+            ocrResult
+        } else {
+            ocrResult.copy(bubbles = handledBubbles)
+        }
+        if (effectiveOcrResult.bubbles.isEmpty()) {
+            // 全部区域都读不出：整屏保持原样，不做任何覆盖。
+            bitmap.recycle()
+            overlayController.clearTranslationLayer()
+            timer.mark("render_done", "bubbles=0 all_skipped_unreadable")
+            return RunOnceOutcome(hasOverlay = false, baselineHash = null, warningMessage = null)
+        }
+
         // 擦除/颜色/布局计算只依赖气泡与截图，与翻译请求并行，减少总等待时间
         val prepDeferred = coroutineScope {
             async(ioDispatcher) {
                 prepareVisuals(
-                    result = ocrResult,
+                    result = effectiveOcrResult,
                     screenshotBitmap = bitmap,
                     pageHash = pageHash,
                     timer = timer
@@ -111,8 +135,8 @@ class TranslateOrchestrator(
         }
 
         val glossaryEntries = ServiceLocator.glossaryRepository.activeGlossaryEntries()
-        val translateKey = buildTranslateKey(
-            texts = ocrResult.bubbles.map { it.originalText },
+        val translateKey = translationResolver.buildTranslateKey(
+            texts = effectiveOcrResult.bubbles.map { it.originalText },
             settings = settings,
             glossaryRevision = ServiceLocator.glossaryRepository.activeRevision()
         )
@@ -127,13 +151,13 @@ class TranslateOrchestrator(
             warningMessage = "仅OCR（未配置翻译API）"
             timer.mark("translate_response", "skipped=missing_translate_api")
             TranslationResult(
-                ocrResult.bubbles.map { bubble ->
+                effectiveOcrResult.bubbles.map { bubble ->
                     bubble.copy(translatedText = bubble.originalText)
                 }
             )
         } else {
-            resolveTranslations(
-                bubbles = ocrResult.bubbles,
+            translationResolver.resolveTranslations(
+                bubbles = effectiveOcrResult.bubbles,
                 settings = settings,
                 translateKey = translateKey,
                 pageHash = pageHash,
@@ -164,241 +188,6 @@ class TranslateOrchestrator(
         )
     }
 
-    private suspend fun resolveTranslations(
-        bubbles: List<Bubble>,
-        settings: com.manga.translator.store.AppSettings,
-        translateKey: String,
-        pageHash: String,
-        glossaryEntries: List<com.manga.translator.store.GlossaryEntry>,
-        timer: TranslationTimer,
-        onTranslatorDownloading: ((Boolean) -> Unit)? = null
-    ): TranslationOutcome {
-        val sentenceRepo = ServiceLocator.sentenceTranslationRepository
-        val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
-            val map = hashMapOf<String, String>()
-            val miss = mutableListOf<Bubble>()
-            var exactHits = 0
-            var compactHits = 0
-            var fuzzyHits = 0
-            var skipped = 0
-            bubbles.forEach { bubble ->
-                val original = bubble.originalText
-                if (isNonTranslatableText(original)) {
-                    // URL 片段/纯噪声字符不调用 LLM，原样展示且不入缓存。
-                    map[original] = original
-                    skipped += 1
-                    return@forEach
-                }
-                val lookup = sentenceRepo.lookup(settings.sourceLanguage, settings.targetLanguage, original)
-                when (lookup.matchKind) {
-                    com.manga.translator.store.SentenceCacheMatchKind.EXACT -> {
-                        map[original] = lookup.translatedText!!
-                        exactHits += 1
-                    }
-
-                    com.manga.translator.store.SentenceCacheMatchKind.COMPACT -> {
-                        map[original] = lookup.translatedText!!
-                        compactHits += 1
-                    }
-
-                    com.manga.translator.store.SentenceCacheMatchKind.FUZZY -> {
-                        map[original] = lookup.translatedText!!
-                        fuzzyHits += 1
-                    }
-
-                    null -> miss += bubble
-                }
-            }
-            Triple(
-                map,
-                miss,
-                TranslationCacheStats(exactHits, compactHits, fuzzyHits, skipped, bubbles.size)
-            )
-        }
-        timer.mark(
-            "sentence_cache",
-            "exact=${cacheStats.exact} compact=${cacheStats.compact} fuzzy=${cacheStats.fuzzy} " +
-                "skipped=${cacheStats.skipped} missing=${missing.size} total=${cacheStats.total}"
-        )
-        if (missing.isEmpty()) {
-            timer.mark("translate_response", "sentence_cache_hit=true cached=${translatedByOriginal.size}")
-            return TranslationOutcome(
-                result = TranslationResult(
-                    bubbles.map { bubble ->
-                        bubble.copy(translatedText = translatedByOriginal[bubble.originalText] ?: bubble.originalText)
-                    }
-                ),
-                warningMessage = null,
-                cacheStats = cacheStats
-            )
-        }
-
-        val fresh = runCatching {
-            timer.mark("request_send", "stage=translate missing=${missing.size} total=${bubbles.size}")
-            val (translated, fallbackHint) = withContext(ioDispatcher) {
-                translateMissing(
-                    settings = settings,
-                    texts = missing.map { it.originalText.replace(Regex("\\s+"), " ").trim() },
-                    glossaryEntries = glossaryEntries,
-                    timer = timer,
-                    onTranslatorDownloading = onTranslatorDownloading
-                )
-            }
-            timer.mark("response_ok", "stage=translate count=${translated.size}")
-            timer.mark("translate_response", "count=${translated.size}")
-            val result = withContext(ioDispatcher) {
-                missing.forEachIndexed { index, bubble ->
-                    // 译文归一化空白（\n/多余空格→单空格），避免 LLM 返回的换行
-                    // 残留到渲染显示（如「超越……留下深刻印象\n以至于」）。
-                    val value = translated.getOrElse(index) { bubble.originalText }
-                        .ifBlank { bubble.originalText }
-                        .replace(Regex("\\s+"), " ").trim()
-                    translatedByOriginal[bubble.originalText] = value
-                    sentenceRepo.put(settings.sourceLanguage, settings.targetLanguage, bubble.originalText, value)
-                }
-                TranslationResult(
-                    bubbles.map { bubble ->
-                        bubble.copy(translatedText = translatedByOriginal[bubble.originalText] ?: bubble.originalText)
-                    }
-                )
-            }
-            // 历史记录仅用于展示：异步写入并隔离失败，绝不能影响翻译结果或缓存读取。
-            val historySnapshot = result
-            ServiceLocator.appScope.launch {
-                runCatching {
-                    val now = System.currentTimeMillis()
-                    ServiceLocator.translationHistoryRepository.add(
-                        TranslationHistoryEntry(
-                            id = "h${now}_${translateKey.take(8)}",
-                            timestampMs = now,
-                            pageHash = pageHash,
-                            sourceLanguage = settings.sourceLanguage,
-                            targetLanguage = settings.targetLanguage,
-                            translateFingerprint = translateKey,
-                            bubblesJson = serializeResult(historySnapshot)
-                        )
-                    )
-                }
-            }
-            TranslationOutcome(result = result, warningMessage = fallbackHint, cacheStats = cacheStats)
-        }.getOrElse { err ->
-            timer.mark("response_fail", "stage=translate reason=${err.message?.take(80)}")
-            timer.mark("translate_response", "failed=${err.message?.take(80)}")
-            TranslationOutcome(
-                result = TranslationResult(
-                    bubbles.map { bubble ->
-                        bubble.copy(translatedText = bubble.originalText)
-                    }
-                ),
-                warningMessage = "翻译失败，已显示原文",
-                cacheStats = cacheStats
-            )
-        }
-        return fresh
-    }
-
-    private suspend fun translateMissing(
-        settings: com.manga.translator.store.AppSettings,
-        texts: List<String>,
-        glossaryEntries: List<com.manga.translator.store.GlossaryEntry>,
-        timer: TranslationTimer,
-        onTranslatorDownloading: ((Boolean) -> Unit)? = null
-    ): Pair<List<String>, String?> {
-        // 本地引擎优先：离线、无网络往返，显著提速。
-        // 2026-08-27 用户要求：选择 ML Kit 引擎时失败**不回退云端**，直接显示原文并提示原因。
-        val engine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine)
-        if (engine == com.manga.translator.store.TranslateEngine.ML_KIT) {
-            val local = ServiceLocator.localTranslator
-            if (local.isSupported(settings.sourceLanguage, settings.targetLanguage)) {
-                // 通知 UI：正在下载/加载本地翻译模型（悬浮球显示"正在下载翻译模型"）。
-                // 回调会触发悬浮球动画（View.animate 等），必须回到主线程，否则抛
-                // "Animators may only be run on Looper threads" 导致整个翻译失败显示原文。
-                withContext(Dispatchers.Main) { onTranslatorDownloading?.invoke(true) }
-                val outcome = runCatching {
-                    local.translate(texts, settings.sourceLanguage, settings.targetLanguage)
-                }
-                withContext(Dispatchers.Main) { onTranslatorDownloading?.invoke(false) }
-                outcome.onSuccess { result ->
-                    if (result.size == texts.size) {
-                        timer.mark("translate_local", "ok=mlkit count=${result.size} engine=${engine.label}")
-                        // 部分失败时失败句为原文，直接返回（缓存层有"译文==原文"保护）。
-                        val failedCount = result.zip(texts).count { (t, s) -> t == s && s.isNotBlank() }
-                        return result to if (failedCount > 0) {
-                            "本地翻译部分句子未生效（$failedCount/${texts.size} 句已显示原文）"
-                        } else {
-                            null
-                        }
-                    }
-                    timer.mark("translate_local", "ok=mlkit size_mismatch count=${result.size}")
-                    return result to "本地翻译返回数量不符，已显示原文"
-                }.onFailure { err ->
-                    timer.mark("translate_local_fallback", "reason=${err.message?.take(80)}")
-                    return texts to "本地翻译不可用（${err.message?.takeIf { it.isNotBlank() } ?: "无 GMS 或模型下载失败"}），已显示原文"
-                }
-            } else {
-                timer.mark("translate_local_skip", "reason=unsupported_pair ${settings.sourceLanguage}->${settings.targetLanguage}")
-                return texts to "本地翻译不支持该语言对（${settings.sourceLanguage}→${settings.targetLanguage}），已显示原文"
-            }
-        }
-
-        // 百度翻译引擎：专用接口，整页多句一次请求（<1s），标准版每月免费 500 万字符。
-        // 2026-08-27 新增：满足"免费 + 快"诉求；失败直接显示原文并提示，不回退云端。
-        if (engine == com.manga.translator.store.TranslateEngine.BAIDU) {
-            val appId = settings.baiduTranslateAppId.trim()
-            val secretKey = settings.baiduTranslateSecretKey.trim()
-            if (appId.isBlank() || secretKey.isBlank()) {
-                timer.mark("translate_response", "skipped=missing_baidu_credentials")
-                return texts to "百度翻译未配置 APP ID/密钥，请在翻译设置页填写"
-            }
-            timer.mark("request_send", "stage=translate mode=baidu count=${texts.size}")
-            val translated = runCatching {
-                ServiceLocator.baiduTranslateClient.translate(
-                    appId = appId,
-                    secretKey = secretKey,
-                    texts = texts,
-                    sourceLanguageId = settings.sourceLanguage,
-                    targetLanguageId = settings.targetLanguage
-                )
-            }.getOrElse { err ->
-                timer.mark("response_fail", "stage=translate mode=baidu reason=${err.message?.take(80)}")
-                return texts to "百度翻译失败（${err.message?.takeIf { it.isNotBlank() } ?: "网络错误"}），已显示原文"
-            }
-            timer.mark("response_ok", "stage=translate mode=baidu count=${translated.size}")
-            return translated to null
-        }
-
-        // 云端引擎：走 OpenAI 兼容 API；未配置云端 API 时直接回显原文。
-        if (settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()) {
-            timer.mark("translate_response", "skipped=missing_translate_api")
-            return texts to null
-        }
-        timer.mark("request_send", "stage=translate mode=cloud count=${texts.size}")
-        val cloud = ServiceLocator.visionClient.translateTexts(
-            provider = settings.translateProvider,
-            baseUrl = settings.translateBaseUrl,
-            model = settings.translateModel,
-            apiKey = settings.translateApiKey,
-            texts = texts,
-            targetLanguageId = settings.targetLanguage,
-            enableThinking = settings.enableThinking,
-            thinkingBudget = settings.thinkingBudget,
-            glossary = glossaryEntries.map { it.source to it.target }
-        )
-        return cloud to null
-    }
-
-    private fun isNonTranslatableText(text: String): Boolean {
-        val compact = text.filterNot { it.isWhitespace() }.lowercase()
-        if (compact.isEmpty()) return false
-        if (compact.contains("http") || compact.contains("www.") ||
-            compact.contains(".com") || compact.contains(".net") || compact.contains(".org")
-        ) {
-            return true
-        }
-        if (compact.length <= 4 && compact.all { it == compact[0] }) return true
-        return false
-    }
-
     private suspend fun detectBubblesBubbleFirst(
         bitmap: Bitmap,
         settings: AppSettings,
@@ -421,13 +210,22 @@ class TranslateOrchestrator(
         }
         timer.mark("bubble_region_stats", "detected=${bubbleRegions.size}")
         val separatedByWhitespace = buildWhitespaceSeparatorDetector(bitmap)
-        val routing = bubbleFirstRegionPlanner.route(
-            bubbleRegions = bubbleRegions,
-            textBlocks = structureBlocks,
-            imageWidth = bitmap.width,
-            imageHeight = bitmap.height,
-            separatedByWhitespace = separatedByWhitespace
-        )
+        // 合并判决诊断（2026-10-03）：把「接近但被拒」的出对汇总成一行，
+        // 排查「两个气泡被并成一段 / 被拆开」时不必再从最终气泡数反推。
+        val mergeRejects = mutableListOf<BlockMergeReject>()
+        bubbleFirstRegionPlanner.setMergeDiagnostics(mergeRejects)
+        val routing = try {
+            bubbleFirstRegionPlanner.route(
+                bubbleRegions = bubbleRegions,
+                textBlocks = structureBlocks,
+                imageWidth = bitmap.width,
+                imageHeight = bitmap.height,
+                separatedByWhitespace = separatedByWhitespace
+            )
+        } catch (err: Throwable) {
+            bubbleFirstRegionPlanner.setMergeDiagnostics(null)
+            throw err
+        }
         val promotedAssignments = promoteBubbleLikeOutsideAssignments(
             bitmap = bitmap,
             outsideAssignments = routing.outsideAssignments.filter { it.blocks.isNotEmpty() },
@@ -442,12 +240,19 @@ class TranslateOrchestrator(
         )
         timer.mark("outside_region_stats", "regions=${outsideAssignments.size} blocks=${routing.outsideBlocks.size}")
 
-        val bubbles = buildBubblesFromAssignments(
-            assignments = bubbleAssignments + outsideAssignments,
-            imageWidth = bitmap.width,
-            imageHeight = bitmap.height,
-            separatedByWhitespace = separatedByWhitespace
-        )
+        val bubbles = try {
+            buildBubblesFromAssignments(
+                assignments = bubbleAssignments + outsideAssignments,
+                imageWidth = bitmap.width,
+                imageHeight = bitmap.height,
+                separatedByWhitespace = separatedByWhitespace
+            )
+        } finally {
+            bubbleFirstRegionPlanner.setMergeDiagnostics(null)
+        }
+        BubbleFirstRegionPlanner.mergeRejectDiag(mergeRejects)?.let { diag ->
+            timer.mark("block_merge_reject", diag)
+        }
         timer.mark(
             "bubble_first_result_stats",
             "bubble_regions=${bubbleAssignments.size} outside_regions=${outsideAssignments.size} final=${bubbles.size}"
@@ -738,9 +543,15 @@ private data class VisualPrep(
     ): VisualPrep {
         // 有非 solid（旁白/透明文字块）时构建整页清理图：inpaint 去字原图按气泡位置裁切贴回，
         // 纹理来自原图背景，观感对齐参考项目 local-ocr-service 的 cleanedImage。
-        val needsCleanedImage = result.bubbles.any { !it.bgType.equals("solid", ignoreCase = true) }
+        // 只擦「有内容可覆盖」的区域：OCR 读不出原文的区域擦了只会留下白块（2026-09-30 用户
+        // 要求「读不出就别擦」）。判据与理由见 EraseTargets.kt。读不出的区域已在上游
+        // （runOnce 的 erase_skip）整块丢弃，这里再过滤一遍是兜底 —— 理论上全部通过。
+        val eraseTargets = result.bubbles.filter { isWorthErasing(it) }
+        timer.mark("erase_targets", eraseTargetsDiag(result.bubbles))
+        result.bubbles.forEachIndexed { i, b -> timer.mark("erase_target", eraseTargetDetailDiag(i, b)) }
+        val needsCleanedImage = eraseTargets.any { !it.bgType.equals("solid", ignoreCase = true) }
         val cleanedImage = if (needsCleanedImage) {
-            ServiceLocator.cleanedImageProcessor.buildCleanedImage(screenshotBitmap, result.bubbles, pageHash)
+            ServiceLocator.cleanedImageProcessor.buildCleanedImage(screenshotBitmap, eraseTargets, pageHash)
         } else {
             null
         }
@@ -756,7 +567,7 @@ private data class VisualPrep(
         )
         val sourcePatches = ServiceLocator.eraseProcessor.erasePage(
             source = screenshotBitmap,
-            bubbles = result.bubbles,
+            bubbles = eraseTargets,
             pageHash = pageHash,
             policy = EraseStrategyPolicy.OPENCV_WHEN_AVAILABLE,
             onPerf = { tag, extra -> timer.mark(tag, extra) },
@@ -1025,13 +836,9 @@ private suspend fun groupLocalBlocks(
         separatedByWhitespace: ((TextBlock, TextBlock) -> Boolean)? = null
     ): Boolean {
         if (separatedByWhitespace?.invoke(a, b) == true) return false
-        return BubbleMergeHeuristics.shouldMerge(
-            a = BubbleGeometry.mergeCandidate(a),
-            b = BubbleGeometry.mergeCandidate(b),
-            imageWidth = imageWidth,
-            imageHeight = imageHeight,
-            scenario = BubbleMergeScenario.GENERIC_TEXT
-        ).merge
+        // 2026-10-03：与 planner 同源，用收严后的行高判据（阈值以**行高**为单位）。
+        // 旧判据以块高为单位，多行段落块会把间距上限放大数倍 → 两个独立气泡被并成一句。
+        return OcrBlockMergeRules.shouldMerge(a, b).merge
     }
 
     private fun buildLocalBubbleFromGroup(
@@ -1127,54 +934,6 @@ private suspend fun groupLocalBlocks(
         }
     }
 
-    private fun buildTranslateKey(
-        texts: List<String>,
-        settings: com.manga.translator.store.AppSettings,
-        glossaryRevision: Int
-    ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        val normalizedTexts = texts
-            .map { it.trim().replace(Regex("\\s+"), " ") }
-            .filter { it.isNotEmpty() }
-            .sorted()
-        val source = listOf(
-            "translate_v2",
-            normalizedTexts.joinToString("\u0001"),
-            settings.targetLanguage,
-            settings.translateProvider,
-            settings.translateBaseUrl,
-            settings.translateModel,
-            settings.translateApiKey,
-            settings.enableThinking.toString(),
-            settings.thinkingBudget.toString(),
-            glossaryRevision.toString()
-        ).joinToString("|")
-        val bytes = digest.digest(source.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
-    }
-
-private fun serializeResult(result: TranslationResult): String {
-        val array = JSONArray()
-        result.bubbles.forEach { bubble ->
-            array.put(
-                JSONObject()
-                    .put("x", bubble.x)
-                    .put("y", bubble.y)
-                    .put("w", bubble.w)
-                    .put("h", bubble.h)
-                    .put("contentX", bubble.contentX)
-                    .put("contentY", bubble.contentY)
-                    .put("contentW", bubble.contentW)
-                    .put("contentH", bubble.contentH)
-                    .put("bgType", bubble.bgType)
-                    .put("originalText", bubble.originalText)
-                    .put("translatedText", bubble.translatedText)
-                    .put("layout", bubble.layout)
-            )
-        }
-return JSONObject().put("bubbles", array).toString()
-    }
-
     companion object {
         private const val DENSE_CHAR_THRESHOLD = 180
         private const val DENSE_BUBBLE_THRESHOLD = 8
@@ -1195,22 +954,6 @@ return JSONObject().put("bubbles", array).toString()
         private const val WHITESPACE_CLEAN_DARK_RATIO = 0.06f
         private const val WHITESPACE_MIN_SAMPLE_COUNT = 10
     }
-}
-
-private data class TranslationOutcome(
-    val result: TranslationResult,
-    val warningMessage: String?,
-    val cacheStats: TranslationCacheStats = TranslationCacheStats(0, 0, 0, 0, 0)
-)
-
-data class TranslationCacheStats(
-    val exact: Int,
-    val compact: Int,
-    val fuzzy: Int,
-    val skipped: Int,
-    val total: Int
-) {
-    val hitCount: Int get() = exact + compact + fuzzy
 }
 
 private data class BrightnessStats(

@@ -49,6 +49,17 @@ class CaptureForegroundService : Service() {
     private var captureAvailabilityJob: Job? = null
     private var accessibilityMonitorJob: Job? = null
 
+    /**
+     * OCR 模型加载状态（2026-09-15 新增，解决「第一次用点不动」）：
+     * 加载期间用户按下悬浮球时不再静默吞掉——用 [pendingTapAfterOcrLoad] 记住这一下，
+     * 加载结束后由 [finishOcrLoad] 自动补做，用户不需要重新点。
+     */
+    private var ocrLoadInFlight = false
+    private var pendingTapAfterOcrLoad = false
+
+    /** 本次 OCR 加载是否把悬浮球置灰过；只有置灰过才需要在收尾时恢复，避免误清「翻译中」状态。 */
+    private var ocrLoadBlockedUi = false
+
     private var captureTimeoutStreak = 0
     private var projectionUnavailable = false
     private var lastUnavailableToastAt = 0L
@@ -178,125 +189,191 @@ class CaptureForegroundService : Service() {
         prewarmOcrModel()
         prewarmTranslateModel()
 
-        overlayController?.showFloatingButton {
-            if (translateJob?.isActive == true) {
-                return@showFloatingButton
-            }
-            // 2026-08-27 新增：译文层显示/锁定时点击悬浮球 = 恢复原文（清除译文层），
-            // 不触发新翻译，避免出现"应该点不动/恢复原文，结果却显示翻译中"。
-            if (overlayController?.hasActiveTranslationLayer() == true) {
-                Log.d("TranslationPerf", "floating_tap_restore_original")
-                overlayController?.unlockTranslationLayer()
-                overlayController?.clearTranslationLayer()
-                overlayController?.setFloatingState(FloatingState.IDLE, null)
-                clearOverlayTracking()
-                return@showFloatingButton
-            }
+        overlayController?.showFloatingButton { handleFloatingTap() }
+    }
+
+    /**
+     * 悬浮球点击的完整处理流程。
+     *
+     * 独立成函数（而不是内联在 [showFloatingButton] 的 lambda 里）是为了支持「OCR 模型加载完成后
+     * 自动补做这次点击」：加载期间用户按下的那一下会被 [pendingTapAfterOcrLoad] 记住，
+     * 加载结束后重新调用本函数走一遍正常流程，用户不必再点第二次。
+     */
+    private fun handleFloatingTap() {
+        if (translateJob?.isActive == true) {
+            return
+        }
+        // 2026-08-27 新增：译文层显示/锁定时点击悬浮球 = 恢复原文（清除译文层），
+        // 不触发新翻译，避免出现"应该点不动/恢复原文，结果却显示翻译中"。
+        if (overlayController?.hasActiveTranslationLayer() == true) {
+            Log.d("TranslationPerf", "floating_tap_restore_original")
             overlayController?.unlockTranslationLayer()
+            overlayController?.clearTranslationLayer()
+            overlayController?.setFloatingState(FloatingState.IDLE, null)
+            clearOverlayTracking()
+            return
+        }
+        overlayController?.unlockTranslationLayer()
 
-            val settings = ServiceLocator.settingsRepository.getSettings()
-            if (!settings.enabled) {
-                Toast.makeText(this, "翻译已关闭", Toast.LENGTH_SHORT).show()
-                overlayController?.clearTranslationLayer()
-                return@showFloatingButton
-            }
-            if (projectionUnavailable) {
-                Log.d("TranslationPerf", "skipped=projection_unavailable")
-                showUnavailableToast("请切回已投射应用")
-                return@showFloatingButton
-            }
+        val settings = ServiceLocator.settingsRepository.getSettings()
+        if (!settings.enabled) {
+            Toast.makeText(this, "翻译已关闭", Toast.LENGTH_SHORT).show()
+            overlayController?.clearTranslationLayer()
+            return
+        }
+        if (projectionUnavailable) {
+            Log.d("TranslationPerf", "skipped=projection_unavailable")
+            showUnavailableToast("请切回已投射应用")
+            return
+        }
 
-            // OCR 模型未就绪：悬浮球置灰不可用 + 旁白提示"OCR模型加载中"，后台预热完成后恢复可用。
-            val detector = ServiceLocator.localTextDetector
-            if (!detector.isReady(settings.sourceLanguage)) {
-                Log.d("TranslationPerf", "model_loading_prewarm lang=${settings.sourceLanguage}")
-                overlayController?.setFloatingEnabled(false)
-                overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "OCR模型加载中")
-                serviceScope.launch {
-                    withContext(Dispatchers.IO) { detector.prewarm(settings.sourceLanguage) }
-                    Log.d("TranslationPerf", "model_prewarm_done lang=${settings.sourceLanguage}")
-                    overlayController?.setFloatingEnabled(true)
-                    overlayController?.setFloatingState(FloatingState.IDLE, null)
+        // OCR 模型未就绪：明确告知 + 记住这次点击，加载完成后自动补做（用户不必再点一次）。
+        if (!ServiceLocator.localTextDetector.isReady(settings.sourceLanguage)) {
+            requestOcrLoadThenReplayTap(settings.sourceLanguage)
+            return
+        }
+
+        overlayController?.setFloatingVisible(true)
+        overlayController?.setInteractionMode(InteractionMode.BROWSE)
+        val current = orchestrator ?: return
+        translateJob = serviceScope.launch {
+            var keepDoneStateUntilTap = false
+            try {
+                overlayController?.setFloatingState(FloatingState.CAPTURING, "截图中")
+                val outcome = current.runOnce { state ->
+                    when (state) {
+                        FloatingState.MODEL_LOADING ->
+                            overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "正在下载翻译模型")
+                        FloatingState.TRANSLATING ->
+                            overlayController?.setFloatingState(FloatingState.TRANSLATING, "翻译中")
+                        else -> {}
+                    }
                 }
-                return@showFloatingButton
-            }
+                onCaptureSuccess()
 
-            overlayController?.setFloatingVisible(true)
-            overlayController?.setInteractionMode(InteractionMode.BROWSE)
-            val current = orchestrator ?: return@showFloatingButton
-            translateJob = serviceScope.launch {
-                var keepDoneStateUntilTap = false
-                try {
-                    overlayController?.setFloatingState(FloatingState.CAPTURING, "截图中")
-                    val outcome = current.runOnce { state ->
-                        when (state) {
-                            FloatingState.MODEL_LOADING ->
-                                overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "正在下载翻译模型")
-                            FloatingState.TRANSLATING ->
-                                overlayController?.setFloatingState(FloatingState.TRANSLATING, "翻译中")
-                            else -> {}
-                        }
+                if (outcome.hasOverlay) {
+                    val doneText = when {
+                        outcome.cacheTotalCount > 0 ->
+                            "完成·缓存${outcome.cacheHitCount}/${outcome.cacheTotalCount}"
+                        else -> outcome.warningMessage ?: "完成"
                     }
-                    onCaptureSuccess()
-
-                    if (outcome.hasOverlay) {
-                        val doneText = when {
-                            outcome.cacheTotalCount > 0 ->
-                                "完成·缓存${outcome.cacheHitCount}/${outcome.cacheTotalCount}"
-                            else -> outcome.warningMessage ?: "完成"
-                        }
-                        overlayController?.setFloatingState(FloatingState.DONE, doneText)
-                        outcome.warningMessage?.let {
-                            Toast.makeText(this@CaptureForegroundService, it, Toast.LENGTH_SHORT).show()
-                        }
-                        activeContentPackage = resolveActiveContentPackage()
-                        currentBaselineHash = outcome.baselineHash
-                        keepDoneStateUntilTap = true
-                        overlayController?.lockTranslationUntilTap {
-                            clearOverlayForReason("tap_restore")
-                            overlayController?.setFloatingState(FloatingState.IDLE, null)
-                        }
-                    } else {
-                        overlayController?.setFloatingState(FloatingState.DONE, "无文本")
-                        clearOverlayTracking()
-                        overlayController?.unlockTranslationLayer()
+                    overlayController?.setFloatingState(FloatingState.DONE, doneText)
+                    outcome.warningMessage?.let {
+                        Toast.makeText(this@CaptureForegroundService, it, Toast.LENGTH_SHORT).show()
                     }
-                    delay(1200)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (err: Throwable) {
-                    diag("runOnce failed: ${err.javaClass.simpleName}: ${err.message}")
-                    Log.d("TranslationPerf", "capture_failure_type=${err.javaClass.simpleName}")
-                    overlayController?.unlockTranslationLayer()
-                    clearOverlayForReason("translate_failed")
-                    if (isProjectionExpiredError(err)) {
-                        enterProjectionUnavailable(reason = "projection_expired")
-                        Toast.makeText(
-                            this@CaptureForegroundService,
-                            "请重新启动服务并授权录屏",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    } else if (isCaptureTimeoutError(err)) {
-                        onCaptureTimeoutFailure()
-                    } else {
-                        captureTimeoutStreak = 0
-                        overlayController?.setFloatingState(FloatingState.ERROR, "失败")
-                        Toast.makeText(this@CaptureForegroundService, err.message ?: "翻译失败", Toast.LENGTH_SHORT).show()
-                    }
-                    delay(1200)
-                } finally {
-                    if (!projectionUnavailable && !keepDoneStateUntilTap) {
+                    activeContentPackage = resolveActiveContentPackage()
+                    currentBaselineHash = outcome.baselineHash
+                    keepDoneStateUntilTap = true
+                    overlayController?.lockTranslationUntilTap {
+                        clearOverlayForReason("tap_restore")
                         overlayController?.setFloatingState(FloatingState.IDLE, null)
                     }
+                } else {
+                    overlayController?.setFloatingState(FloatingState.DONE, "无文本")
+                    clearOverlayTracking()
+                    overlayController?.unlockTranslationLayer()
                 }
-            }.also { launched ->
-                launched.invokeOnCompletion {
-                    if (translateJob === launched) {
-                        translateJob = null
-                    }
+                delay(1200)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (err: Throwable) {
+                diag("runOnce failed: ${err.javaClass.simpleName}: ${err.message}")
+                Log.d("TranslationPerf", "capture_failure_type=${err.javaClass.simpleName}")
+                overlayController?.unlockTranslationLayer()
+                clearOverlayForReason("translate_failed")
+                if (isProjectionExpiredError(err)) {
+                    enterProjectionUnavailable(reason = "projection_expired")
+                    Toast.makeText(
+                        this@CaptureForegroundService,
+                        "请重新启动服务并授权录屏",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else if (isCaptureTimeoutError(err)) {
+                    onCaptureTimeoutFailure()
+                } else {
+                    captureTimeoutStreak = 0
+                    overlayController?.setFloatingState(FloatingState.ERROR, "失败")
+                    Toast.makeText(this@CaptureForegroundService, err.message ?: "翻译失败", Toast.LENGTH_SHORT).show()
+                }
+                delay(1200)
+            } finally {
+                if (!projectionUnavailable && !keepDoneStateUntilTap) {
+                    overlayController?.setFloatingState(FloatingState.IDLE, null)
+                }
+            }
+        }.also { launched ->
+            launched.invokeOnCompletion {
+                if (translateJob === launched) {
+                    translateJob = null
                 }
             }
         }
+    }
+
+    /**
+     * OCR 模型尚未就绪时被点击的处理。
+     *
+     * 2026-09-15 新增（用户反馈「第一次用的时候一直点不动」）：
+     * 旧逻辑是 `setFloatingEnabled(false)` + `return`，而 `OverlayController` 的点击回调里
+     * `if (!floatingEnabled) return` 会把点击**静默吞掉**（悬浮球是独立 overlay 窗口，
+     * 点击也不会穿透给底下的漫画 App），用户看到的就是「点了毫无反应」，分不清是坏了还是在忙。
+     *
+     * 现在：明确弹提示说明在加载，并记住这次点击，加载完成后自动补做。
+     * 重复点击只提示、不重复排队。
+     */
+    private fun requestOcrLoadThenReplayTap(sourceLanguage: String) {
+        val detector = ServiceLocator.localTextDetector
+        // 竞态兜底：可能恰好在本次点击前加载完成，直接放行走正常流程，不打扰用户。
+        if (detector.isReady(sourceLanguage)) {
+            handleFloatingTap()
+            return
+        }
+        // 无论加载是本函数发起的还是服务启动预热发起的，都要把这次点击记下来等待补做。
+        pendingTapAfterOcrLoad = true
+        if (ocrLoadInFlight) {
+            // 加载已在跑（多半是服务启动预热）：只提示，等它结束自动补做，不重复排队。
+            Toast.makeText(this, "OCR 模型加载中，加载完成后会自动翻译", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Log.d("TranslationPerf", "model_loading_prewarm lang=$sourceLanguage")
+        Toast.makeText(this, "OCR 模型加载中，加载完成后会自动翻译", Toast.LENGTH_SHORT).show()
+        overlayController?.setFloatingEnabled(false)
+        overlayController?.setFloatingState(FloatingState.MODEL_LOADING, "OCR模型加载中")
+        ocrLoadInFlight = true
+        ocrLoadBlockedUi = true
+        serviceScope.launch {
+            withContext(Dispatchers.IO) { detector.prewarm(sourceLanguage) }
+            Log.d("TranslationPerf", "model_prewarm_done lang=$sourceLanguage")
+            finishOcrLoad(sourceLanguage)
+        }
+    }
+
+    /**
+     * OCR 加载收尾：恢复悬浮球（仅当本次加载禁用过它），并在用户加载期间点过球时自动补做那次翻译。
+     * 启动预热（[prewarmOcrModel]）与点击兜底（[requestOcrLoadThenReplayTap]）共用。
+     *
+     * 注意：只有 [ocrLoadBlockedUi] 为真时才动悬浮球状态——否则启动预热完成会把
+     * 正在进行的「截图中/翻译中」指示误清成 IDLE。
+     */
+    private fun finishOcrLoad(sourceLanguage: String) {
+        ocrLoadInFlight = false
+        val ready = ServiceLocator.localTextDetector.isReady(sourceLanguage)
+        if (ocrLoadBlockedUi) {
+            ocrLoadBlockedUi = false
+            overlayController?.setFloatingEnabled(true)
+            overlayController?.setFloatingState(FloatingState.IDLE, null)
+        }
+        val replay = pendingTapAfterOcrLoad
+        pendingTapAfterOcrLoad = false
+        if (!replay) return
+        if (!ready) {
+            // 加载失败（assets 缺失且无网络等）：给出明确失败反馈，不再排队，避免死循环。
+            Log.w("TranslationPerf", "model_load_failed_no_replay lang=$sourceLanguage")
+            Toast.makeText(this, "OCR 模型加载失败，请检查网络后重试", Toast.LENGTH_LONG).show()
+            return
+        }
+        Log.d("TranslationPerf", "model_load_replay_tap lang=$sourceLanguage")
+        handleFloatingTap()
     }
 
     /** 服务启动后后台预热 OCR 模型，减少首次点击等待（模型下载/加载在 IO 线程）。 */
@@ -306,9 +383,12 @@ class CaptureForegroundService : Service() {
         val detector = ServiceLocator.localTextDetector
         if (detector.isReady(settings.sourceLanguage)) return
         Log.d("TranslationPerf", "model_prewarm_start lang=${settings.sourceLanguage}")
+        ocrLoadInFlight = true
         serviceScope.launch {
             withContext(Dispatchers.IO) { detector.prewarm(settings.sourceLanguage) }
             Log.d("TranslationPerf", "model_prewarm_done lang=${settings.sourceLanguage}")
+            // 预热期间用户若已点过球，这里会顺手补做那次点击。
+            finishOcrLoad(settings.sourceLanguage)
         }
     }
 

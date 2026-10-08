@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      改版主题：去掉系统自带的 ActionBar（页面自己画顶部栏），
+      状态栏 / 导航栏跟随设计稿的纯白背景（2026-09-17 由 #F4F6FA 改为 #FFFFFF），并使用深色图标。
+    -->
+    <style name="Theme.MangaTranslator" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FFFFFF</item>
+        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

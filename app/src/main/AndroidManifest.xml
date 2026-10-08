@@ -9,9 +9,10 @@
     <application
         android:name=".TranslatorApplication"
         android:allowBackup="true"
-        android:icon="@drawable/ic_launcher_foreground"
+        android:icon="@mipmap/ic_launcher"
         android:label="Manga Translator"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MangaTranslator">
 
         <activity
             android:name=".MainActivity"

@@ -57,19 +57,24 @@ class TieredEraseProcessor(
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
+    /**
+     * @param cleanedForAllBubbles true 时 solid 气泡也从 [cleanedImage] 裁切（浏览器链路
+     *   「inpaint 清理图」选项）：整页 inpaint 出来的背景纹理连续一致，不会留下贴片色差。
+     */
     fun erasePage(
         source: Bitmap,
         bubbles: List<Bubble>,
         pageHash: String,
         policy: EraseStrategyPolicy,
         onPerf: ((tag: String, extra: String?) -> Unit)? = null,
-        cleanedImage: Bitmap? = null
+        cleanedImage: Bitmap? = null,
+        cleanedForAllBubbles: Boolean = false
     ): List<ErasePatch> {
         if (bubbles.isEmpty()) return emptyList()
-        val key = buildCacheKey(pageHash, bubbles, policy, cleanedImage != null)
+        val key = buildCacheKey(pageHash, bubbles, policy, cleanedImage != null, cleanedForAllBubbles)
         val cached = cache.get(key)
         if (cached != null) {
-            onPerf?.invoke("erase_apply", "cache_hit=true patches=${cached.size}")
+            onPerf?.invoke("erase_apply", "cache_hit=true policy=${policy.name} patches=${cached.size}")
             return cached.map { patch ->
                 ErasePatch(
                     bitmap = patch.bitmap.copy(Bitmap.Config.ARGB_8888, false),
@@ -86,6 +91,7 @@ class TieredEraseProcessor(
         var replacedPixels = 0L
         var candidatePixels = 0L
         var narrationPatched = 0
+        var cleanedPatched = 0
         val startedAt = SystemClock.elapsedRealtime()
 
         bubbles.forEachIndexed { index, bubble ->
@@ -96,11 +102,17 @@ class TieredEraseProcessor(
 
             // 非 solid（旁白/透明面板）：优先从整页清理图（inpaint 去字原图）裁切贴片，
             // 纹理直接来自原图背景，避免纯色块/墨色替换带来的色差，观感接近参考项目。
-            if (!isSolid && cleanedImage != null && !cleanedImage.isRecycled) {
-                val cleanedPatch = createCleanedPatch(cleanedImage, bubble, index)
+            // solid 气泡在「inpaint 清理图」开启（cleanedForAllBubbles）时同样走这条路。
+            val useCleanedPatch = cleanedImage != null && !cleanedImage.isRecycled &&
+                (!isSolid || cleanedForAllBubbles)
+            if (useCleanedPatch) {
+                val cleanedPatch = createCleanedPatch(cleanedImage!!, bubble, index)
                 if (cleanedPatch != null) {
                     patches += cleanedPatch
-                    narrationPatched++
+                    if (!isSolid) {
+                        narrationPatched++
+                    }
+                    cleanedPatched++
                     return@forEachIndexed
                 }
             }
@@ -169,7 +181,7 @@ class TieredEraseProcessor(
         }
         onPerf?.invoke(
             "erase_apply",
-            "cache_hit=false fast=$fast edge=$edge opencv=$cv patches=${patches.size} narration_patched=$narrationPatched erase_dark_replace_ratio=${"%.3f".format(ratio)} cleaned=${cleanedImage != null}"
+            "cache_hit=false policy=${policy.name} fast=$fast edge=$edge opencv=$cv patches=${patches.size} narration_patched=$narrationPatched erase_dark_replace_ratio=${"%.3f".format(ratio)} cleaned=${cleanedImage != null} cleaned_patched=$cleanedPatched"
         )
 
         cache.put(
@@ -216,7 +228,8 @@ class TieredEraseProcessor(
             bitmap = bitmap,
             srcRect = srcRect,
             renderRect = RectF(srcRect),
-            bubbleId = bubbleId
+            bubbleId = bubbleId,
+            fromCleanedImage = true
         )
     }
 
@@ -583,13 +596,15 @@ class TieredEraseProcessor(
         pageHash: String,
         bubbles: List<Bubble>,
         policy: EraseStrategyPolicy,
-        hasCleanedImage: Boolean = false
+        hasCleanedImage: Boolean = false,
+        cleanedForAllBubbles: Boolean = false
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update(CACHE_KEY_VERSION.toByteArray(Charsets.UTF_8))
         digest.update(pageHash.toByteArray(Charsets.UTF_8))
         digest.update(policy.name.toByteArray(Charsets.UTF_8))
         digest.update("cleaned=$hasCleanedImage".toByteArray(Charsets.UTF_8))
+        digest.update("cleaned_all=$cleanedForAllBubbles".toByteArray(Charsets.UTF_8))
         bubbles.forEachIndexed { index, bubble ->
             val keyPart =
                 "$index,${bubble.x},${bubble.y},${bubble.w},${bubble.h}," +
@@ -652,6 +667,6 @@ private const val DARK_LUMA_THRESHOLD = 190f
         // OpenCV inpaint 单气泡约 50-150ms；预算过小会在首个气泡后就全部降级为 EDGE_AWARE_FILL。
         // 提高到 3000ms，让一页（约 10-20 个气泡）都能走整块背景纹理恢复，接近参考项目 cleaned image 观感。
         private const val ERASE_BUDGET_MS = 3000L
-        private const val CACHE_KEY_VERSION = "erase_v4|opencv_enabled|cleaned_image"
+        private const val CACHE_KEY_VERSION = "erase_v5|opencv_enabled|cleaned_image|cleaned_all"
     }
 }

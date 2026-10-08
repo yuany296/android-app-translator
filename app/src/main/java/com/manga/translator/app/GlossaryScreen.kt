@@ -1,28 +1,45 @@
 ﻿package com.manga.translator.app
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -30,7 +47,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
@@ -45,31 +64,48 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.manga.translator.app.ui.MtDropdownItem
+import com.manga.translator.app.ui.theme.MtColors
+import com.manga.translator.store.GlossaryCollectionInfo
+import com.manga.translator.store.GlossaryConflict
 import com.manga.translator.store.GlossaryEntry
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun GlossaryCollectionsScreen(
-    collections: List<String>,
-    entryCounts: Map<String, Int>,
-    activeCollections: List<String>,
+    collections: List<GlossaryCollectionInfo>,
+    conflicts: List<GlossaryConflict>,
     onOpenCollection: (String) -> Unit,
-    onActiveChange: (List<String>) -> Unit,
+    onToggleActive: (String, Boolean) -> Unit,
+    onMoveActive: (String, Int) -> Unit,
     onCreateCollection: (String) -> Unit,
     onImport: () -> Unit,
     onDeleteCollection: (String) -> Unit,
+    onDuplicateCollection: (String, String) -> Boolean,
+    onMergeCollection: (String, String) -> Boolean,
     onRenameCollection: (String, String) -> Boolean,
     onRefresh: () -> Unit
 ) {
     var creating by remember { mutableStateOf(false) }
     var deletingName by remember { mutableStateOf<String?>(null) }
     var renamingName by remember { mutableStateOf<String?>(null) }
+    var duplicatingName by remember { mutableStateOf<String?>(null) }
+    var mergingFrom by remember { mutableStateOf<String?>(null) }
+    var showConflicts by remember { mutableStateOf(false) }
+    var showRules by remember { mutableStateOf(false) }
+    var reordering by remember { mutableStateOf(false) }
     val pullState = rememberPullToRefreshState()
     LaunchedEffect(pullState.isRefreshing) {
         if (pullState.isRefreshing) {
@@ -78,83 +114,186 @@ fun GlossaryCollectionsScreen(
         }
     }
 
+    val activeList = remember(collections) {
+        collections.filter { it.active }.sortedBy { it.priority }
+    }
+    val inactiveList = remember(collections) {
+        collections.filterNot { it.active }.sortedBy { it.name }
+    }
+    val totalEntries = remember(collections) { collections.sumOf { it.entryCount } }
+    val conflictsByCollection = remember(conflicts) {
+        conflicts.flatMap { conflict -> conflict.variants.map { it.collection } }
+            .groupingBy { it }
+            .eachCount()
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .background(MtColors.PageBackground)
     ) {
-        Text(text = "术语表", style = MaterialTheme.typography.titleLarge)
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = "点击术语表进入术语管理；左划可露出右侧删除按钮；开关控制翻译时是否生效（可全部关闭）",
-            style = MaterialTheme.typography.bodySmall
+        GlossaryAppBar(
+            subtitle = "${collections.size} 张术语表 · ${activeList.size} 张生效 · " +
+                "$totalEntries 条术语",
+            onShowRules = { showRules = true }
         )
-        Spacer(modifier = Modifier.height(10.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(onClick = { creating = true }, modifier = Modifier.weight(1f)) { Text("新建术语表") }
-            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text("导入") }
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Box(
+        Column(
             modifier = Modifier
-                .fillMaxSize()
-                .nestedScroll(pullState.nestedScrollConnection)
+                .fillMaxWidth()
+                .weight(1f)
+                .padding(start = 20.dp, end = 20.dp, top = 10.dp, bottom = 24.dp)
         ) {
-            if (collections.isEmpty()) {
-                Column(modifier = Modifier.fillMaxSize().padding(top = 16.dp)) {
-                    Text(text = "暂无术语表。新建一个术语表或导入 JSON 开始整理术语。")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Button(
+                    onClick = { creating = true },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    elevation = ButtonDefaults.buttonElevation(
+                        defaultElevation = 0.dp,
+                        pressedElevation = 0.dp,
+                        focusedElevation = 0.dp,
+                        hoveredElevation = 0.dp,
+                        disabledElevation = 0.dp
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Add,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(text = "新建术语表", style = MaterialTheme.typography.labelLarge)
                 }
-            } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(collections, key = { it }) { name ->
-                        SwipeRevealRow(onDelete = { deletingName = name }) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onOpenCollection(name) }
-                                    .padding(vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(text = name, style = MaterialTheme.typography.bodyLarge)
-                                    Text(
-                                        text = "${entryCounts[name] ?: 0} 条",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                IconButton(onClick = { renamingName = name }) {
-                                    Icon(
-                                        Icons.Filled.Edit,
-                                        contentDescription = "重命名",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Switch(
-                                    checked = activeCollections.contains(name),
-                                    onCheckedChange = {
-                                        val next = if (activeCollections.contains(name)) {
-                                            activeCollections.filterNot { it == name }
-                                        } else {
-                                            activeCollections + name
-                                        }
-                                        onActiveChange(next)
+                OutlinedButton(
+                    onClick = onImport,
+                    modifier = Modifier
+                        .width(96.dp)
+                        .height(44.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, MtColors.BorderStrong),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MtColors.TextOnBrandButton
+                    )
+                ) {
+                    Text(text = "导入", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .nestedScroll(pullState.nestedScrollConnection)
+            ) {
+                if (collections.isEmpty()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 56.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_empty_box),
+                            contentDescription = null,
+                            modifier = Modifier.size(120.dp)
+                        )
+                        Text(
+                            text = "还没有术语表",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MtColors.TextPrimary
+                        )
+                        Text(
+                            text = "新建一个术语表，或从 JSON 导入已有的术语表。",
+                            fontSize = 12.sp,
+                            color = MtColors.TextTertiary
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        contentPadding = PaddingValues(bottom = 8.dp)
+                    ) {
+                        if (activeList.isNotEmpty()) {
+                            item(key = "__section_active") {
+                                GlossarySectionHeader(
+                                    title = "生效中",
+                                    hint = "序号小的优先注入翻译",
+                                    onSort = if (activeList.size > 1) {
+                                        { reordering = true }
+                                    } else {
+                                        null
                                     }
                                 )
                             }
+                            item(key = "__card_active") {
+                                GlossaryListCard {
+                                    activeList.forEachIndexed { index, info ->
+                                        if (index > 0) ListRowDivider()
+                                        GlossaryCollectionRow(
+                                            info = info,
+                                            conflictCount = conflictsByCollection[info.name] ?: 0,
+                                            canMoveUp = index > 0,
+                                            canMoveDown = index < activeList.size - 1,
+                                            onOpen = { onOpenCollection(info.name) },
+                                            onToggle = { checked -> onToggleActive(info.name, checked) },
+                                            onMoveUp = { onMoveActive(info.name, -1) },
+                                            onMoveDown = { onMoveActive(info.name, 1) },
+                                            onRename = { renamingName = info.name },
+                                            onDuplicate = { duplicatingName = info.name },
+                                            onMerge = { mergingFrom = info.name },
+                                            onDelete = { deletingName = info.name },
+                                            onShowConflicts = { showConflicts = true }
+                                        )
+                                    }
+                                }
+                            }
                         }
-                        HorizontalDivider()
+                        if (inactiveList.isNotEmpty()) {
+                            item(key = "__section_inactive") {
+                                GlossarySectionHeader(
+                                    title = "未生效",
+                                    hint = "保持关闭，不会注入翻译"
+                                )
+                            }
+                            item(key = "__card_inactive") {
+                                GlossaryListCard {
+                                    inactiveList.forEachIndexed { index, info ->
+                                        if (index > 0) ListRowDivider()
+                                        GlossaryCollectionRow(
+                                            info = info,
+                                            conflictCount = conflictsByCollection[info.name] ?: 0,
+                                            canMoveUp = false,
+                                            canMoveDown = false,
+                                            onOpen = { onOpenCollection(info.name) },
+                                            onToggle = { checked -> onToggleActive(info.name, checked) },
+                                            onMoveUp = {},
+                                            onMoveDown = {},
+                                            onRename = { renamingName = info.name },
+                                            onDuplicate = { duplicatingName = info.name },
+                                            onMerge = { mergingFrom = info.name },
+                                            onDelete = { deletingName = info.name },
+                                            onShowConflicts = { showConflicts = true }
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                PullToRefreshDefaults.Indicator(
+                    state = pullState,
+                    modifier = Modifier.align(Alignment.TopCenter)
+                )
             }
-            PullToRefreshDefaults.Indicator(
-                state = pullState,
-                modifier = Modifier.align(Alignment.TopCenter)
-            )
         }
     }
 
@@ -181,6 +320,34 @@ fun GlossaryCollectionsScreen(
         )
     }
 
+    val duplicating = duplicatingName
+    if (duplicating != null) {
+        DuplicateCollectionDialog(
+            sourceName = duplicating,
+            existingNames = collections.map { it.name },
+            onConfirm = { next ->
+                val ok = onDuplicateCollection(duplicating, next)
+                if (ok) duplicatingName = null
+                ok
+            },
+            onDismiss = { duplicatingName = null }
+        )
+    }
+
+    val merging = mergingFrom
+    if (merging != null) {
+        MergeCollectionDialog(
+            sourceName = merging,
+            targets = collections.filter { it.name != merging },
+            onConfirm = { target ->
+                val ok = onMergeCollection(merging, target)
+                if (ok) mergingFrom = null
+                ok
+            },
+            onDismiss = { mergingFrom = null }
+        )
+    }
+
     val deleting = deletingName
     if (deleting != null) {
         AlertDialog(
@@ -199,6 +366,715 @@ fun GlossaryCollectionsScreen(
                 TextButton(onClick = { deletingName = null }) { Text("取消") }
             }
         )
+    }
+
+    if (showConflicts && conflicts.isNotEmpty()) {
+        GlossaryConflictDialog(conflicts = conflicts, onDismiss = { showConflicts = false })
+    }
+
+    if (showRules) {
+        GlossaryRulesDialog(onDismiss = { showRules = false })
+    }
+
+    if (reordering) {
+        ReorderActiveDialog(
+            activeList = activeList,
+            onMove = { name, delta -> onMoveActive(name, delta) },
+            onDismiss = { reordering = false }
+        )
+    }
+}
+
+/** 顶部栏：标题 22 / 副标题 12，右侧「?」承载规则说明（原页面顶部那段灰字）。 */
+@Composable
+private fun GlossaryAppBar(subtitle: String, onShowRules: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .padding(horizontal = 20.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Text(
+                text = "术语表",
+                style = MaterialTheme.typography.titleLarge,
+                color = MtColors.TextPrimary
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MtColors.TextTertiary
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .background(MtColors.Surface, RoundedCornerShape(12.dp))
+                .border(1.dp, MtColors.Border, RoundedCornerShape(12.dp))
+                .clickable { onShowRules() },
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Info,
+                contentDescription = "规则说明",
+                tint = MtColors.TextSecondary,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+    }
+}
+
+/** 分组头：标题 15 / 说明 12，右侧可选「排序」胶囊。 */
+@Composable
+private fun GlossarySectionHeader(
+    title: String,
+    hint: String,
+    onSort: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MtColors.TextPrimary
+            )
+            Text(
+                text = hint,
+                style = MaterialTheme.typography.bodySmall,
+                color = MtColors.TextTertiary
+            )
+        }
+        if (onSort != null) {
+            Box(
+                modifier = Modifier
+                    .height(32.dp)
+                    .background(MtColors.BrandTint, RoundedCornerShape(10.dp))
+                    .clickable { onSort() }
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "排序",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MtColors.Brand
+                )
+            }
+        }
+    }
+}
+
+/** 列表卡：白底 + 直角 + 1px 描边，行与行之间用内缩细线分隔（2026-09-18 用户要求改直角）。 */
+@Composable
+private fun GlossaryListCard(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MtColors.Surface, RoundedCornerShape(0.dp))
+            .border(1.dp, MtColors.Border, RoundedCornerShape(0.dp)),
+        content = content
+    )
+}
+
+@Composable
+private fun ListRowDivider() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .height(1.dp)
+            .background(MtColors.Divider)
+    )
+}
+
+@Composable
+private fun GlossaryCollectionRow(
+    info: GlossaryCollectionInfo,
+    conflictCount: Int,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onOpen: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onRename: () -> Unit,
+    onDuplicate: () -> Unit,
+    onMerge: () -> Unit,
+    onDelete: () -> Unit,
+    onShowConflicts: () -> Unit
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    SwipeRevealRow(onDelete = onDelete) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(76.dp)
+                .clickable { onOpen() }
+                .padding(start = 12.dp, end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            RankBadge(info = info)
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = info.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = if (info.active) MtColors.TextPrimary else MtColors.TextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = "${info.entryCount} 条术语",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MtColors.TextTertiary
+                    )
+                    if (conflictCount > 0) {
+                        ConflictTag(count = conflictCount, onClick = onShowConflicts)
+                    }
+                }
+            }
+            if (info.active) {
+                Spacer(modifier = Modifier.width(12.dp))
+                PriorityStepper(
+                    canMoveUp = canMoveUp,
+                    canMoveDown = canMoveDown,
+                    onMoveUp = onMoveUp,
+                    onMoveDown = onMoveDown
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Switch(
+                checked = info.active,
+                onCheckedChange = onToggle,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = MtColors.Brand,
+                    checkedBorderColor = Color.Transparent,
+                    uncheckedThumbColor = Color.White,
+                    uncheckedTrackColor = MtColors.SwitchOff,
+                    uncheckedBorderColor = Color.Transparent
+                )
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Box {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clickable { menuOpen = true },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.MoreVert,
+                        contentDescription = "更多操作",
+                        tint = MtColors.TextTertiary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    if (conflictCount > 0) {
+                        MtDropdownItem(
+                            text = "查看冲突（$conflictCount）",
+                            onClick = {
+                                menuOpen = false
+                                onShowConflicts()
+                            }
+                        )
+                        HorizontalDivider()
+                    }
+                    MtDropdownItem(
+                        text = "重命名",
+                        onClick = {
+                            menuOpen = false
+                            onRename()
+                        }
+                    )
+                    MtDropdownItem(
+                        text = "复制为新术语表",
+                        onClick = {
+                            menuOpen = false
+                            onDuplicate()
+                        }
+                    )
+                    MtDropdownItem(
+                        text = "合并到其他术语表…",
+                        onClick = {
+                            menuOpen = false
+                            onMerge()
+                        }
+                    )
+                    HorizontalDivider()
+                    MtDropdownItem(
+                        text = "删除",
+                        onClick = {
+                            menuOpen = false
+                            onDelete()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 序号徽标：生效中显示优先级数字，未生效显示占位横杠（没有优先级语义）。 */
+@Composable
+private fun RankBadge(info: GlossaryCollectionInfo) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .background(
+                color = if (info.active) MtColors.BrandTint else MtColors.SurfaceMuted,
+                shape = RoundedCornerShape(10.dp)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = if (info.active) "${info.priority}" else "–",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (info.active) MtColors.Brand else MtColors.TextTertiary
+        )
+    }
+}
+
+/** 行内冲突标签：点击即可跳到冲突详情。 */
+@Composable
+private fun ConflictTag(count: Int, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .height(18.dp)
+            .background(MtColors.DangerTint, RoundedCornerShape(6.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "$count 处冲突",
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            color = MtColors.DangerText
+        )
+    }
+}
+
+/**
+ * 序号调整控件。视觉上是两枚 32×22 的浅底圆角块，外面套 40×34 的透明点击区，
+ * 让手指能舒服点到（视觉与设计稿 1:1，命中区放大）。
+ */
+@Composable
+private fun PriorityStepper(
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit
+) {
+    Column(
+        modifier = Modifier.width(40.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        StepperButton(
+            icon = Icons.Filled.KeyboardArrowUp,
+            contentDescription = "提高优先级",
+            enabled = canMoveUp,
+            onClick = onMoveUp
+        )
+        StepperButton(
+            icon = Icons.Filled.KeyboardArrowDown,
+            contentDescription = "降低优先级",
+            enabled = canMoveDown,
+            onClick = onMoveDown
+        )
+    }
+}
+
+@Composable
+private fun StepperButton(
+    icon: ImageVector,
+    contentDescription: String,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(width = 40.dp, height = 34.dp)
+            .clickable(enabled = enabled) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(width = 32.dp, height = 22.dp)
+                .background(MtColors.StepperBg, RoundedCornerShape(8.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = if (enabled) MtColors.TextSecondary else MtColors.StepperDisabled,
+                modifier = Modifier.size(12.dp)
+            )
+        }
+    }
+}
+
+/** 规则说明：从页面顶部那段灰字挪到「?」里，避免占用第一屏。 */
+@Composable
+private fun GlossaryRulesDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("规则说明") },
+        text = {
+            Text(
+                text = "生效中的术语表会合并注入翻译；同一原文有多个译文时，序号小的获胜。\n\n" +
+                    "点击条目进入管理，左划删除，⋮ 可重命名、复制、合并或删除。"
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("知道了") }
+        }
+    )
+}
+
+/** 生效顺序集中调整：入口是分组头右侧的「排序」。 */
+@Composable
+private fun ReorderActiveDialog(
+    activeList: List<GlossaryCollectionInfo>,
+    onMove: (String, Int) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("调整生效顺序") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "序号小的先被采用。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MtColors.TextTertiary
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                activeList.forEachIndexed { index, info ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RankBadge(info = info)
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = info.name,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MtColors.TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        PriorityStepper(
+                            canMoveUp = index > 0,
+                            canMoveDown = index < activeList.size - 1,
+                            onMoveUp = { onMove(info.name, -1) },
+                            onMoveDown = { onMove(info.name, 1) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("完成") }
+        }
+    )
+}
+
+@Composable
+private fun GlossaryConflictDialog(
+    conflicts: List<GlossaryConflict>,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("术语冲突（${conflicts.size}）") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "这些原文在多张生效术语表里译文不一致。翻译时只有「生效」那一行会被采用；" +
+                        "想换一个，就到列表里调整生效顺序。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                conflicts.forEach { conflict ->
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = conflict.source,
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium
+                    )
+                    conflict.variants.forEach { variant ->
+                        val effective = variant.collection == conflict.effectiveCollection &&
+                            variant.target == conflict.effectiveTarget
+                        Text(
+                            text = (if (effective) "生效  " else "忽略  ") +
+                                "${variant.collection}：${variant.target}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (effective) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            fontWeight = if (effective) FontWeight.Medium else FontWeight.Normal
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("知道了") }
+        }
+    )
+}
+
+@Composable
+private fun DuplicateCollectionDialog(
+    sourceName: String,
+    existingNames: List<String>,
+    onConfirm: (String) -> Boolean,
+    onDismiss: () -> Unit
+) {
+    var name by remember(sourceName) {
+        mutableStateOf(
+            com.manga.translator.store.GlossaryRepository.uniqueCollectionName(
+                existingNames,
+                "$sourceName 副本"
+            )
+        )
+    }
+    val trimmed = name.trim()
+    val duplicated = existingNames.contains(trimmed)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("复制术语表") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("新术语表名称") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    isError = duplicated
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = if (duplicated) {
+                        "名称已存在，换一个。"
+                    } else {
+                        "会连同「$sourceName」的所有术语一起复制；副本默认不生效。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (duplicated) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(trimmed) },
+                enabled = trimmed.isNotEmpty() && !duplicated
+            ) { Text("复制") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun MergeCollectionDialog(
+    sourceName: String,
+    targets: List<GlossaryCollectionInfo>,
+    onConfirm: (String) -> Boolean,
+    onDismiss: () -> Unit
+) {
+    var selected by remember(sourceName, targets) {
+        mutableStateOf(targets.firstOrNull()?.name.orEmpty())
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 32.dp)
+                .background(MtColors.Surface, RoundedCornerShape(22.dp))
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                text = "合并术语表",
+                style = MaterialTheme.typography.titleMedium,
+                color = MtColors.TextPrimary
+            )
+            Text(
+                text = "把「$sourceName」的术语并入下面选中的术语表。合并后「$sourceName」会被删除；" +
+                    "两边都有的原文会跳过，保留目标表原来的译文。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MtColors.TextSecondary
+            )
+            if (targets.isEmpty()) {
+                Text(
+                    text = "至少要有两张术语表才能合并。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MtColors.Danger
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .heightIn(max = 320.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    targets.forEach { target ->
+                        MergeTargetOption(
+                            target = target,
+                            selected = target.name == selected,
+                            onSelect = { selected = target.name }
+                        )
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(width = 92.dp, height = 44.dp)
+                        .background(MtColors.SurfaceMuted, RoundedCornerShape(12.dp))
+                        .clickable { onDismiss() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "取消",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MtColors.TextOnMutedButton
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(width = 104.dp, height = 44.dp)
+                        .background(
+                            color = if (selected.isNotEmpty()) MtColors.Brand else MtColors.SwitchOff,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        .clickable(enabled = selected.isNotEmpty()) {
+                            if (onConfirm(selected)) onDismiss()
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "合并",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Color.White
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 合并目标选项：56 高、14 圆角，选中时浅蓝底 + 蓝描边 + 蓝色单选框。 */
+@Composable
+private fun MergeTargetOption(
+    target: GlossaryCollectionInfo,
+    selected: Boolean,
+    onSelect: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .background(
+                color = if (selected) MtColors.BrandTint else MtColors.Surface,
+                shape = RoundedCornerShape(14.dp)
+            )
+            .border(
+                width = 1.dp,
+                color = if (selected) MtColors.BrandBorder else MtColors.Border,
+                shape = RoundedCornerShape(14.dp)
+            )
+            .clickable { onSelect() }
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(20.dp)
+                .border(
+                    width = 1.6.dp,
+                    color = if (selected) MtColors.Brand else MtColors.SwitchOff,
+                    shape = CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .background(MtColors.Brand, CircleShape)
+                )
+            }
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            Text(
+                text = target.name,
+                fontSize = 15.sp,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (selected) MtColors.BrandDeep else MtColors.TextOnMutedButton,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "${target.entryCount} 条术语 · " +
+                    if (target.active) "序号 ${target.priority}" else "未生效",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (selected) MtColors.BrandTextSoft else MtColors.TextTertiary
+            )
+        }
     }
 }
 
@@ -326,15 +1202,15 @@ fun GlossaryCollectionScreen(
                         expanded = exportMenuExpanded,
                         onDismissRequest = { exportMenuExpanded = false }
                     ) {
-                        DropdownMenuItem(
-                            text = { Text("导出 JSON") },
+                        MtDropdownItem(
+                            text = "导出 JSON",
                             onClick = {
                                 exportMenuExpanded = false
                                 onExportJson()
                             }
                         )
-                        DropdownMenuItem(
-                            text = { Text("导出 CSV") },
+                        MtDropdownItem(
+                            text = "导出 CSV",
                             onClick = {
                                 exportMenuExpanded = false
                                 onExportCsv()

@@ -430,6 +430,7 @@ val isNarration = isNarrationBubble(bubble)
             state.bubbleId = indexed.index
             state.solidPatched = isSolidPatched
             state.verticalLayout = useVerticalLayout
+            state.alignment = com.manga.translator.translate.TextAlignment.normalize(bubble.alignment)
             state.displayText = normalizedTranslatedText
             state.baseRect = RectF(baseRect)
 
@@ -443,7 +444,12 @@ val tv = if (useVerticalLayout) {
                         if (!isSolidPatched) kakaopageStrokeWidthPx(baseTextSp) else 0f
                     )
                     setBackgroundColor(bubbleViewBackgroundFill(indexed.index, isSolidPatched, state.hasErasePatch))
-                    gravity = Gravity.CENTER
+                    // 对齐沿用原排版（左/居中/右）；竖排是按列居中，保持 CENTER。
+                    gravity = Gravity.CENTER_VERTICAL or when (state.alignment) {
+                        com.manga.translator.translate.TextAlignment.LEFT -> Gravity.START
+                        com.manga.translator.translate.TextAlignment.RIGHT -> Gravity.END
+                        else -> Gravity.CENTER_HORIZONTAL
+                    }
                     setPadding(dp(1), dp(1), dp(1), dp(1))
                 }
             } else {
@@ -456,7 +462,12 @@ val tv = if (useVerticalLayout) {
                         if (!isSolidPatched) kakaopageStrokeWidthPx(baseTextSp) else 0f
                     )
                     setBackgroundColor(bubbleViewBackgroundFill(indexed.index, isSolidPatched, state.hasErasePatch))
-                    gravity = Gravity.CENTER
+                    // 对齐沿用原排版（左/居中/右），不再一律居中（2026-09-28）。
+                    gravity = Gravity.CENTER_VERTICAL or when (state.alignment) {
+                        com.manga.translator.translate.TextAlignment.LEFT -> Gravity.START
+                        com.manga.translator.translate.TextAlignment.RIGHT -> Gravity.END
+                        else -> Gravity.CENTER_HORIZONTAL
+                    }
                     layoutDirection = View.LAYOUT_DIRECTION_LTR
                     textDirection = View.TEXT_DIRECTION_FIRST_STRONG_LTR
                     setPadding(dp(1), dp(1), dp(1), dp(1))
@@ -987,7 +998,8 @@ val tv = if (useVerticalLayout) {
             lineSpacingMultiplier = state.lineSpacingMultiplier,
             bgType = state.bgType,
             bgColor = bubbleBgColor(state.bubbleId),
-            hasErasePatch = state.hasErasePatch
+            hasErasePatch = state.hasErasePatch,
+            alignment = state.alignment
         )
     }
 
@@ -1269,15 +1281,16 @@ private fun computeFontSp(boxHeightPx: Float): Float {
             null
         }
         val contentWidth = (spec.rect.width() - dpF(2f)).toInt().coerceAtLeast(1)
+        val layoutAlignment = patchLayoutAlignment(spec.alignment)
         val layoutFill = StaticLayout.Builder.obtain(text, 0, text.length, fillPaint, contentWidth)
             .setIncludePad(false)
-            .setAlignment(Layout.Alignment.ALIGN_CENTER)
+            .setAlignment(layoutAlignment)
             .setLineSpacing(0f, spec.lineSpacingMultiplier)
             .build()
         val layoutStroke = strokePaint?.let {
             StaticLayout.Builder.obtain(text, 0, text.length, it, contentWidth)
                 .setIncludePad(false)
-                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setAlignment(layoutAlignment)
                 .setLineSpacing(0f, spec.lineSpacingMultiplier)
                 .build()
         }
@@ -1341,6 +1354,15 @@ private fun computeFontSp(boxHeightPx: Float): Float {
         }
     }
 
+    /** 对齐方式 → StaticLayout 对齐（左/居中/右，非左即中。2026-09-28）。 */
+    private fun patchLayoutAlignment(alignment: String): Layout.Alignment {
+        return when (com.manga.translator.translate.TextAlignment.normalize(alignment)) {
+            com.manga.translator.translate.TextAlignment.LEFT -> Layout.Alignment.ALIGN_NORMAL
+            com.manga.translator.translate.TextAlignment.RIGHT -> Layout.Alignment.ALIGN_OPPOSITE
+            else -> Layout.Alignment.ALIGN_CENTER
+        }
+    }
+
     private fun computeHorizontalTextRect(spec: PatchTextSpec, layout: StaticLayout): RectF {
         var maxLineWidth = 0f
         for (line in 0 until layout.lineCount) {
@@ -1348,7 +1370,12 @@ private fun computeFontSp(boxHeightPx: Float): Float {
         }
         val width = (maxLineWidth + dpF(2f)).coerceAtMost(spec.rect.width()).coerceAtLeast(1f)
         val height = layout.height.toFloat().coerceAtLeast(1f)
-        val left = spec.rect.left + ((spec.rect.width() - width) / 2f).coerceAtLeast(0f)
+        // 左/右对齐时整块贴着内容框对应边；居中才居中（与浏览器链路同口径）。
+        val left = when (com.manga.translator.translate.TextAlignment.normalize(spec.alignment)) {
+            com.manga.translator.translate.TextAlignment.LEFT -> spec.rect.left
+            com.manga.translator.translate.TextAlignment.RIGHT -> spec.rect.right - width
+            else -> spec.rect.left + ((spec.rect.width() - width) / 2f).coerceAtLeast(0f)
+        }.coerceIn(spec.rect.left, (spec.rect.right - width).coerceAtLeast(spec.rect.left))
         val top = spec.rect.top + ((spec.rect.height() - height) / 2f).coerceAtLeast(0f)
         return RectF(left, top, left + width, top + height)
     }
@@ -1378,7 +1405,7 @@ private fun computeFontSp(boxHeightPx: Float): Float {
             val contentWidth = (spec.rect.width() - dpF(2f)).toInt().coerceAtLeast(1)
             val layout = StaticLayout.Builder.obtain(spec.text, 0, spec.text.length, fillPaint, contentWidth)
                 .setIncludePad(false)
-                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setAlignment(patchLayoutAlignment(spec.alignment))
                 .setLineSpacing(0f, spec.lineSpacingMultiplier)
                 .build()
             computeHorizontalTextRect(spec, layout)
@@ -2039,7 +2066,8 @@ private inner class ErasePatchLayerView(context: Context) : View(context) {
         val lineSpacingMultiplier: Float,
         val bgType: String = "",
         val bgColor: Int = Color.WHITE,
-        val hasErasePatch: Boolean = false
+        val hasErasePatch: Boolean = false,
+        val alignment: String = com.manga.translator.translate.TextAlignment.CENTER
     )
 
     private enum class DockSide {
