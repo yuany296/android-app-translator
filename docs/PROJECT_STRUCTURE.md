@@ -1,5 +1,8 @@
 # 项目结构说明
 
+> 配套文档：[CODE_MAP.md](CODE_MAP.md) —— **逐文件一句话职责 + 对应日志 + 死代码清单**。
+> 本文件讲模块与主链路入口（宏观），那份讲每个文件在链路里的位置（微观）。
+
 - 日期：2026-03-26
 - 执行者：Codex
 - 工程根路径：`C:\homework\AI_work\translator\android-app`
