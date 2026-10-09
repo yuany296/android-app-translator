@@ -244,7 +244,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `HistoryScreen.kt` | 翻译历史列表：展开看气泡、下拉刷新、清空 | `HistoryScreen` / `parseHistoryBubbles` | 清空历史 = 失去该页复用能力（会重新调 API） |
 | `ui/MtUi.kt` | 全应用共用按钮/卡片/列表行/自绘图标 | `MtCard` / `MtPrimaryButton` / `MtListRow` | 规格取设计稿「14-配色与组件规范」；⚠️ `MtOutlineButton`/`MtTextButton` **无调用方 = 死代码** |
 | `ui/theme/Color.kt` | 全应用色板常量 | `MtColors` | 改配色只改这里 |
-| `ui/theme/Theme.kt` | 色板 + 字号阶梯 + 圆角 → MaterialTheme | `MangaTranslatorTheme` | 全应用最外层；刻意关掉 M3 高程染色；字号 22/18/15/13/12/11 |
+| `app/ui/theme/Theme.kt` | 把色板、字号阶梯与圆角组装成 MaterialTheme（App 自己界面的设计令牌总闸） | `MangaTranslatorTheme` / `MtTypography` / `MtShapes` | 只在 [MainActivity:250](app/src/main/java/com/manga/translator/app/MainActivity.kt#L250) `setContent` 里用一次，包住全部 Compose 界面；只做**浅色**（`lightColorScheme`）；`surfaceTint = Surface` 刻意**关掉 M3 高程染色**（设计稿弹窗是纯白）；字号全 `letterSpacing = 0`（中文排版）⚠️ `MtShapes` 无消费方（见 §7） |
 | `SwipeRevealRow.kt` | 通用「左滑露出删除」列表行 | `SwipeRevealRow` | 仅 GlossaryScreen 两处使用；行高 72dp、右侧 80dp 删除键 |
 | `SiteFaviconLoader.kt` | 抓网站 favicon 并做内存 LRU 缓存 | `load` / `cached` | 浏览器收藏/历史格子用；只试 `/favicon.ico|.png`，失败也缓存「无图标」 |
 
@@ -352,6 +352,7 @@ node app/src/test/js/mt-overlay-acceptance.test.js   # 渲染层（node）
 | `core-store/AppSettings.kt` + `BaiduOcrLanguage.kt` | `baiduOcrLanguage` 只被**已下线的百度 OCR 路径**读，且不持久化 | 运行时恒为默认值 `JAP` |
 | `app/FrameHash.kt` | `hammingDistance` **无调用方** | `centerDHash` 仍在用（`baselineHash`） |
 | `app/ui/MtUi.kt` | `MtOutlineButton` / `MtTextButton` **无调用方** | 纯 UI 组件 |
+| `app/ui/theme/Theme.kt` | `MtShapes`（五档圆角令牌 6/8/14/18/22dp）**无消费方** | 全仓无人读 `MaterialTheme.shapes`；各屏幕直接硬写 `RoundedCornerShape(x.dp)`（`MtUi.kt`、`GlossaryScreen.kt` 等）—— 想收口就把硬写换成 `MaterialTheme.shapes.*` |
 | `core-overlay/EraseStrategy.kt` | `RenderQualityProfile` 枚举 **无读取方** | 连同 `OverlayRenderConfig.qualityProfile` 一起是死代码 |
 | `core-overlay/OverlayRenderConfig.kt` | `qualityProfile` / `erasePolicy` **只写不读** | 配置载体本身仍在用（`denseMode`/`touchEnabled` 等被读） |
 | `app/SeamBubbleMerger.kt` | `SeamConfig.minVisibleFraction` 字段**不再参与判定** | 2026-10-03 由「整块是否被 incoming 覆盖」替代，字段保留仅为记录意图 |
