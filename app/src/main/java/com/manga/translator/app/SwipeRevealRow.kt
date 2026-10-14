@@ -89,7 +89,9 @@ fun SwipeRevealRow(
             }
         }
 
-        // 内容层：可水平拖动（offset 必须在 background 之前，否则背景不随内容移动、永远盖住红色层）
+        // 内容层：可水平拖动。
+        // 注意：offset 只能有一处 —— 叠加两个 offset 会让位移变成 2×offsetX（红色层露出量与实际位移错位）。
+        // offset 必须在 background 之前，否则背景不随内容移动、永远盖住红色层。
         Row(
             modifier = Modifier
                 .fillMaxSize()
@@ -114,8 +116,7 @@ fun SwipeRevealRow(
                             scope.launch { offsetX.animateTo(0f, tween(150)) }
                         }
                     )
-                }
-                .offset { IntOffset(offsetX.value.roundToInt(), 0) },
+                },
             verticalAlignment = Alignment.CenterVertically,
             content = content
         )

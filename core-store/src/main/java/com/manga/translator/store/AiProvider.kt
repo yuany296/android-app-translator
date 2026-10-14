@@ -11,42 +11,42 @@ enum class AiProvider(
         id = "openai",
         label = "OpenAI",
         defaultBaseUrl = "https://api.openai.com/v1",
-        defaultModel = "gpt-4o-mini",
+        defaultModel = "",
         supportsThinking = false
     ),
     QWEN(
         id = "qwen",
         label = "千问",
         defaultBaseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        defaultModel = "qwen-vl-max-latest",
+        defaultModel = "",
         supportsThinking = true
     ),
     GLM(
         id = "glm",
         label = "GLM",
         defaultBaseUrl = "https://open.bigmodel.cn/api/paas/v4",
-        defaultModel = "glm-4v-plus",
+        defaultModel = "",
         supportsThinking = true
     ),
     DEEPSEEK(
         id = "deepseek",
         label = "DeepSeek",
         defaultBaseUrl = "https://api.deepseek.com/v1",
-        defaultModel = "deepseek-chat",
+        defaultModel = "",
         supportsThinking = false
     ),
     KIMI(
         id = "kimi",
         label = "Kimi",
         defaultBaseUrl = "https://api.moonshot.cn/v1",
-        defaultModel = "moonshot-v1-8k",
+        defaultModel = "",
         supportsThinking = false
     ),
     SILICONFLOW(
         id = "siliconflow",
         label = "硅基流动",
         defaultBaseUrl = "https://api.siliconflow.cn/v1",
-        defaultModel = "Qwen/Qwen2.5-VL-7B-Instruct",
+        defaultModel = "",
         supportsThinking = false
     ),
     VOLCES(
@@ -61,13 +61,6 @@ enum class AiProvider(
         label = "自定义（OpenAI 兼容）",
         defaultBaseUrl = "",
         defaultModel = "",
-        supportsThinking = false
-    ),
-    BAIDU(
-        id = "baidu",
-        label = "百度OCR",
-        defaultBaseUrl = "https://aip.baidubce.com",
-        defaultModel = "accurate",
         supportsThinking = false
     );
 

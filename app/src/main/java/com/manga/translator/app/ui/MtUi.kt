@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -200,6 +202,223 @@ val MtBrowserIcon: ImageVector by lazy {
             moveTo(12f, 3f)
             arcToRelative(5.2f, 9f, 0f, false, false, 0f, 18f)
             arcToRelative(5.2f, 9f, 0f, false, false, 0f, -18f)
+            close()
+        }
+    }.build()
+}
+
+/**
+ * 离开当前页（内嵌浏览器顶栏右侧的「回到浏览器界面」按钮，2026-10-12 用户指定形状）。
+ *
+ * 形状 =「圆角门框（右侧开口）+ 向右箭头」，两笔画一起说明动作：
+ * 门框 = 现在所处的这一页，箭头朝外 = 从这一页出去。
+ *
+ * 演进过程（三次都因为「形状和动作对不上」被换掉）：
+ * 地球 → 读作「网络 / 在系统浏览器打开」，又紧挨着齿轮，两者抢语义；
+ * 圆角矩形 + 实心标题栏 → 只说明「这是一扇网页窗口」，和按钮要做的事（离开）无关；
+ * 现版 → 直接在形状里画出「离开」（画布 `26:1` / `26:4` / `26:7` / `26:10` 四处统一）。
+ */
+val MtLeavePageIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtLeavePage",
+        defaultWidth = 20.dp,
+        defaultHeight = 20.dp,
+        viewportWidth = 20f,
+        viewportHeight = 20f
+    ).apply {
+        val stroke = SolidColor(Color.Black)
+        // 门框：右侧开口，只留左半边的圆角
+        path(
+            fill = null,
+            stroke = stroke,
+            strokeLineWidth = 1.7f,
+            strokeLineCap = StrokeCap.Round
+        ) {
+            moveTo(12.4f, 2.3f)
+            horizontalLineTo(5.2f)
+            arcToRelative(3f, 3f, 0f, false, false, -3f, 3f)
+            verticalLineTo(14.7f)
+            arcToRelative(3f, 3f, 0f, false, false, 3f, 3f)
+            horizontalLineTo(12.4f)
+        }
+        // 箭头横线：从门框内侧穿出
+        path(
+            fill = null,
+            stroke = stroke,
+            strokeLineWidth = 1.7f,
+            strokeLineCap = StrokeCap.Round
+        ) {
+            moveTo(6.6f, 10f)
+            horizontalLineTo(17.8f)
+        }
+        // 箭头头部
+        path(
+            fill = null,
+            stroke = stroke,
+            strokeLineWidth = 1.7f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            moveTo(13.4f, 5.6f)
+            lineTo(17.8f, 10f)
+            lineTo(13.4f, 14.4f)
+        }
+    }.build()
+}
+
+/**
+ * 小锁（内嵌浏览器地址框左侧的「当前是 https 页面」提示，画布 `11:140`）。
+ *
+ * material-icons-core 里没有 Lock，且项目没引 extended 包，所以照设计稿画一个 14×14 的。
+ */
+val MtLockIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtLock",
+        defaultWidth = 14.dp,
+        defaultHeight = 14.dp,
+        viewportWidth = 14f,
+        viewportHeight = 14f
+    ).apply {
+        // 锁梁（先画，被下面的锁体压住一段）
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.15f,
+            strokeLineCap = StrokeCap.Round
+        ) {
+            moveTo(4.9f, 6.4f)
+            verticalLineTo(4.5f)
+            arcToRelative(2.1f, 2.1f, 0f, false, true, 4.2f, 0f)
+            verticalLineTo(6.4f)
+        }
+        // 锁体
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(4.1f, 6.4f)
+            horizontalLineTo(9.9f)
+            arcToRelative(1.2f, 1.2f, 0f, false, true, 1.2f, 1.2f)
+            verticalLineTo(10.5f)
+            arcToRelative(1.2f, 1.2f, 0f, false, true, -1.2f, 1.2f)
+            horizontalLineTo(4.1f)
+            arcToRelative(1.2f, 1.2f, 0f, false, true, -1.2f, -1.2f)
+            verticalLineTo(7.6f)
+            arcToRelative(1.2f, 1.2f, 0f, false, true, 1.2f, -1.2f)
+            close()
+        }
+    }.build()
+}
+
+/**
+ * 取景框（截图翻译，⋮ 菜单的那一行，画布 `23:267`）。
+ *
+ * 四个角括号 = 「框住一块区域」，是截图类动作最不容易被误读的形状
+ * （相机图标会被读成「拍照」，裁切图标会被读成「裁剪图片」）。
+ */
+val MtScanIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtScan",
+        defaultWidth = 20.dp,
+        defaultHeight = 20.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.9f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            // 左上
+            moveTo(3.5f, 8.5f)
+            verticalLineTo(6f)
+            arcToRelative(2.5f, 2.5f, 0f, false, true, 2.5f, -2.5f)
+            horizontalLineTo(8.5f)
+            // 右上
+            moveTo(15.5f, 3.5f)
+            horizontalLineTo(18f)
+            arcToRelative(2.5f, 2.5f, 0f, false, true, 2.5f, 2.5f)
+            verticalLineTo(8.5f)
+            // 右下
+            moveTo(20.5f, 15.5f)
+            verticalLineTo(18f)
+            arcToRelative(2.5f, 2.5f, 0f, false, true, -2.5f, 2.5f)
+            horizontalLineTo(15.5f)
+            // 左下
+            moveTo(8.5f, 20.5f)
+            horizontalLineTo(6f)
+            arcToRelative(2.5f, 2.5f, 0f, false, true, -2.5f, -2.5f)
+            verticalLineTo(15.5f)
+        }
+    }.build()
+}
+
+/**
+ * 空心星标（顶栏收藏星的「未收藏」态，画布 `31:42` 左态）。
+ *
+ * 为什么是星而不是别的：浏览器里「收藏」的通用符号就是星（Chrome 地址栏右侧那颗），
+ * 而项目里已经有的 `Icons.Filled.Star` 是实心 24dp 版，跟顶栏其它 20dp / 1.6 描边
+ * 的图标规格不一致，所以照画布重画了一颗空心的。
+ *
+ * 2026-10-12 之前它长在设置弹层的「收藏当前页」行上，现在挂在浏览器顶栏。
+ */
+val MtStarIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtStar",
+        defaultWidth = 20.dp,
+        defaultHeight = 20.dp,
+        viewportWidth = 20f,
+        viewportHeight = 20f
+    ).apply {
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.6f,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            moveTo(10f, 2.6f)
+            lineTo(11.94f, 7.33f)
+            lineTo(17.04f, 7.71f)
+            lineTo(13.14f, 11.02f)
+            lineTo(14.35f, 15.99f)
+            lineTo(10f, 13.3f)
+            lineTo(5.65f, 15.99f)
+            lineTo(6.86f, 11.02f)
+            lineTo(2.96f, 7.71f)
+            lineTo(8.06f, 7.33f)
+            close()
+        }
+    }.build()
+}
+
+/**
+ * 实心星标（顶栏收藏星的「已收藏」态，画布 `31:42` 右态）。
+ *
+ * 跟 [MtStarIcon] 是同一颗星的两个状态：形状路径完全一致，只是这里 `fill` 取代 `stroke`。
+ * 路径必须逐点对齐 [MtStarIcon]，否则两态切换时星会「跳」一下。
+ */
+val MtStarFilledIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtStarFilled",
+        defaultWidth = 20.dp,
+        defaultHeight = 20.dp,
+        viewportWidth = 20f,
+        viewportHeight = 20f
+    ).apply {
+        path(
+            fill = SolidColor(Color.Black),
+            stroke = null,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            moveTo(10f, 2.6f)
+            lineTo(11.94f, 7.33f)
+            lineTo(17.04f, 7.71f)
+            lineTo(13.14f, 11.02f)
+            lineTo(14.35f, 15.99f)
+            lineTo(10f, 13.3f)
+            lineTo(5.65f, 15.99f)
+            lineTo(6.86f, 11.02f)
+            lineTo(2.96f, 7.71f)
+            lineTo(8.06f, 7.33f)
             close()
         }
     }.build()
@@ -462,6 +681,35 @@ fun MtDropdownItem(text: String, onClick: () -> Unit) {
     )
 }
 
+/**
+ * 开关：选中 = 品牌蓝轨 + 白滑块，未选中 = 灰轨 + 白滑块。
+ *
+ * 为什么要有这个组件（2026-10-14）：浏览器弹层直接用 M3 `Switch` 默认配色
+ * （紫色轨），和全 App 的品牌蓝不符 —— 统一收口到这里，别处不再裸用 `Switch`。
+ */
+@Composable
+fun MtSwitch(
+    checked: Boolean,
+    onCheckedChange: ((Boolean) -> Unit)?,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
+) {
+    Switch(
+        checked = checked,
+        onCheckedChange = onCheckedChange,
+        modifier = modifier,
+        enabled = enabled,
+        colors = SwitchDefaults.colors(
+            checkedThumbColor = Color.White,
+            checkedTrackColor = MtColors.Brand,
+            checkedBorderColor = Color.Transparent,
+            uncheckedThumbColor = Color.White,
+            uncheckedTrackColor = MtColors.SwitchOff,
+            uncheckedBorderColor = Color.Transparent
+        )
+    )
+}
+
 /** 设置行：名称（13 次级色）+ 值（14 主色）+ 右箭头，行高 56。 */
 @Composable
 fun MtListRow(
@@ -604,7 +852,7 @@ fun MtPrimaryButton(
     }
 }
 
-/** 次按钮：浅蓝底 + 蓝字（Tonal）。 */
+/** 次按钮：浅蓝底 + 蓝字（Tonal）。禁用时灰底弱字（2026-10-14「网页文字翻译」按钮要禁用态）。 */
 @Composable
 fun MtTonalButton(
     text: String,
@@ -612,14 +860,15 @@ fun MtTonalButton(
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
     height: Dp = 42.dp,
-    fontSize: Int = 13
+    fontSize: Int = 13,
+    enabled: Boolean = true
 ) {
     Row(
         modifier = modifier
             .height(height)
             .clip(RoundedCornerShape(12.dp))
-            .background(MtColors.BrandTint)
-            .clickable(onClick = onClick)
+            .background(if (enabled) MtColors.BrandTint else MtColors.SurfaceMuted)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 14.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
@@ -637,7 +886,7 @@ fun MtTonalButton(
             text = text,
             fontSize = fontSize.sp,
             fontWeight = FontWeight.SemiBold,
-            color = MtColors.BrandInk
+            color = if (enabled) MtColors.BrandInk else MtColors.TextTertiary
         )
     }
 }

@@ -345,7 +345,8 @@ node app/src/test/js/mt-overlay-acceptance.test.js   # 渲染层（node）
 
 | 位置 | 情况 | 说明 |
 |---|---|---|
-| `core-translate/OpenAiVisionClient.kt` | `detectBubbles` / `detectTextBlocks` / `groupTextBlocks`（含 `*WithBaidu` 分支）**无调用方** | 远程视觉 OCR 路径已下线（`OcrEngine` 只剩 ML Kit / Paddle）；保留会让人误以为还有远程 OCR |
+| `core-translate/OpenAiVisionClient.kt` | `detectBubbles` / `detectTextBlocks` / `groupTextBlocks`（含 `*WithBaidu` 分支）**无调用方** | 远程视觉 OCR 路径已下线（`OcrEngine` 只剩 ML Kit / Paddle）；保留会让人误以为还有远程 OCR。**注意该类没全死**：`translateTexts` / `fetchAvailableModels` 仍被 `PageTranslationResolver` / `HomeScreen` 使用 |
+| `core-store/AiProvider.kt`（原 `BAIDU`） | 枚举项 `BAIDU`（label「百度OCR」，`aip.baidubce.com`）**已于 2026-10-04 删除** | 它是上面那条已下线的百度 OCR 路径的厂商入口，`HomeScreen` 早已用 `.filter { it != AiProvider.BAIDU }` 把它藏起来。删枚举项时**必须同时删掉那条 filter**（否则不编译）。现在配置档案里的「厂商」下拉就是 `AiProvider.entries` 本身 |
 | `core-translate/BubbleGeometry.kt` | `BubbleMergeHeuristics` **只被上面那条死路径调用**（+ 单测） | 本地分组的判据已换成 `OcrBlockMergeRules` |
 | `core-translate/TextLayoutMetrics.kt` | `expandContentRect` **无调用方**（`WebtoonImageTranslator` 只在注释里提到它） | 排版框外扩已改成在像素空间算（`growTowardOuter`） |
 | `core-store/AppSettings.kt` + `OcrMode.kt` | `ocrMode` 字段**无人读取**，`SettingsRepository` 也没有对应 prefs 键 | 随远程 OCR 下线而闲置的遗留配置 |

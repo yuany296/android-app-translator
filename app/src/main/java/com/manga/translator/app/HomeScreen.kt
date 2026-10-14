@@ -68,6 +68,7 @@ import com.manga.translator.app.ui.MtOutlineButton
 import com.manga.translator.app.ui.MtPlayIcon
 import com.manga.translator.app.ui.MtPrimaryButton
 import com.manga.translator.app.ui.MtSwapIcon
+import com.manga.translator.app.ui.MtSwitch
 import com.manga.translator.app.ui.MtTonalButton
 import com.manga.translator.app.ui.theme.MtColors
 import com.manga.translator.store.AiProvider
@@ -93,7 +94,7 @@ sealed interface MlKitDownloadState {
 /**
  * 首页（设计稿 `06-首页改法`）。
  *
- * 结构：页头 → 状态行（**只在需要时出现**）→ 语言对 → OCR服务 → 翻译服务 → 底部主按钮。
+ * 结构：页头 → 状态行（**只在需要时出现**）→ 语言对 → OCR服务 → 多模态重读 → 翻译服务 → 底部主按钮。
  *
  * 「翻译设置」页已并入本页（2026-09-17，4→3）；2026-09-28 底栏新增「浏览器」tab（内嵌翻译入口）。
  */
@@ -117,8 +118,18 @@ fun LauncherScreen(
         )
     }
     var profileSheetOpen by remember { mutableStateOf(false) }
+    // 档案弹层为谁而开：翻译（选了就全局套用）还是多模态重读（只记档案指针，不动翻译配置）。
+    var profileSheetForVision by remember { mutableStateOf(false) }
     var baiduSheetOpen by remember { mutableStateOf(false) }
+    // OCR 低质量回退多模态（2026-10-14，独立 pref，不属于 API 档案）。
+    // 源语言自动识别没有开关：识别与配置不符时只在浏览器底栏提示（`LanguageMismatchHint`）。
+    var lowQualityVisionOcr by remember { mutableStateOf(repo.isLowQualityVisionOcrEnabled()) }
+    // 多模态重读的档案选择（2026-10-14 深夜定稿）：空 = 跟随翻译配置；选了就用那个档案的
+    // 厂商 / Base URL / Key —— 翻译选 ML Kit 时也能单独选一个云端档案给重读用。
+    // 复用 lastOcrProfileName 指针：重命名/删除档案时 SettingsRepository 已维护它。
+    var visionProfile by remember { mutableStateOf(repo.getLastOcrProfileName()) }
     var formOpen by remember { mutableStateOf(false) }
+    var formForVision by remember { mutableStateOf(false) }
     // 百度两项凭据都填了才算配好（与状态行、卡片值共用）。
     val baiduConfigured = settings.baiduTranslateAppId.isNotBlank() &&
         settings.baiduTranslateSecretKey.isNotBlank()
@@ -241,6 +252,36 @@ fun LauncherScreen(
                 }
             }
 
+            // 多模态重读（2026-10-14 定稿）：与 OCR 服务同级的独立区块。
+            // 配置档案用**同一套档案库**（同一个弹层），但是**独立的选择**：
+            // 没选 = 跟随翻译配置；选了 = 用那个档案的厂商 / Base URL / Key（见 `ServiceLocator`），
+            // 翻译选 ML Kit / 百度也不影响。模型名走档案表单里的「多模态识别模型」（留空跟随翻译模型）。
+            SectionTitle("多模态重读")
+            MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
+                MtPrefSwitchRow(
+                    name = "启用",
+                    hint = "本地读不好时交给云端重读（需配 API）",
+                    checked = lowQualityVisionOcr,
+                    onCheckedChange = {
+                        lowQualityVisionOcr = it
+                        repo.setLowQualityVisionOcrEnabled(it)
+                    }
+                )
+                MtDivider()
+                MtListRow(
+                    name = "配置档案",
+                    value = when {
+                        visionProfile.isNotEmpty() -> visionProfile
+                        engine == TranslateEngine.CLOUD -> "跟随翻译配置"
+                        else -> "未配置"
+                    },
+                    onClick = {
+                        profileSheetForVision = true
+                        profileSheetOpen = true
+                    }
+                )
+            }
+
             SectionTitle("翻译服务")
             // 服务设置卡用直角（2026-09-18 用户要求）。
             MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
@@ -280,22 +321,36 @@ fun LauncherScreen(
     }
 
     if (profileSheetOpen) {
+        val visionMode = profileSheetForVision
         ProfileSheet(
             profiles = profileNames,
-            selected = selectedProfile,
+            title = if (visionMode) "选择多模态重读档案" else "配置档案",
+            // 多模态模式下给一条「跟随翻译配置」：选了档案后还能回到跟随态。
+            showFollowOption = visionMode,
+            selected = if (visionMode) visionProfile else selectedProfile,
             onSelect = { name ->
-                repo.getProfile(name)?.let { onSettingsChange(it) }
-                repo.setLastTranslateProfileName(name)
-                selectedProfile = name
+                if (visionMode) {
+                    // 只记档案指针，不动全局翻译配置（2026-10-14 深夜定稿：
+                    // 翻译选 ML Kit 时多模态可以单独选一个云端档案）。
+                    repo.setLastOcrProfileName(name)
+                    visionProfile = name
+                } else {
+                    repo.getProfile(name)?.let { onSettingsChange(it) }
+                    repo.setLastTranslateProfileName(name)
+                    selectedProfile = name
+                }
                 profileSheetOpen = false
+                profileSheetForVision = false
             },
             onCreate = {
                 profileSheetOpen = false
+                formForVision = visionMode
                 formEditingName = ""
                 formOpen = true
             },
             onEdit = { name ->
                 profileSheetOpen = false
+                formForVision = visionMode
                 formEditingName = name
                 formOpen = true
             },
@@ -303,6 +358,7 @@ fun LauncherScreen(
                 repo.renameProfile(old, new)
                 profileNames = repo.getProfileNames()
                 if (selectedProfile == old) selectedProfile = new
+                if (visionProfile == old) visionProfile = new
             },
             onDuplicate = { name ->
                 var target = "$name 副本"
@@ -317,6 +373,8 @@ fun LauncherScreen(
             onDelete = { name ->
                 repo.deleteProfile(name)
                 profileNames = repo.getProfileNames()
+                // deleteProfile 会同步清掉 lastOcrProfileName 指针，这里把 UI 状态跟上。
+                if (visionProfile == name) visionProfile = ""
                 if (selectedProfile == name) {
                     val next = repo.getProfileNames().firstOrNull().orEmpty()
                     selectedProfile = next
@@ -340,7 +398,10 @@ fun LauncherScreen(
                     }
                 }
             },
-            onDismiss = { profileSheetOpen = false }
+            onDismiss = {
+                profileSheetOpen = false
+                profileSheetForVision = false
+            }
         )
     }
 
@@ -353,10 +414,17 @@ fun LauncherScreen(
             onRememberApiKey = { providerId, key -> repo.saveProviderApiKey(providerId, key) },
             onSaved = { name, updated ->
                 repo.saveProfile(name, updated)
-                repo.setLastTranslateProfileName(name)
+                if (formForVision) {
+                    // 从「多模态重读」的档案弹层进来建/改的：只落到重读的档案指针，
+                    // 不套用到全局翻译配置（否则翻译会被顺手切走）。
+                    repo.setLastOcrProfileName(name)
+                    visionProfile = name
+                } else {
+                    repo.setLastTranslateProfileName(name)
+                    selectedProfile = name
+                    onSettingsChange(updated)
+                }
                 profileNames = repo.getProfileNames()
-                selectedProfile = name
-                onSettingsChange(updated)
                 formOpen = false
             },
             onDismiss = { formOpen = false }
@@ -680,6 +748,9 @@ private fun HomeActionBar(
 private fun ProfileSheet(
     profiles: List<String>,
     selected: String,
+    title: String = "配置档案",
+    /** true = 在列表顶部显示「跟随翻译配置」行（多模态重读选档案时，用于回到跟随态）。 */
+    showFollowOption: Boolean = false,
     onSelect: (String) -> Unit,
     onCreate: () -> Unit,
     onEdit: (String) -> Unit,
@@ -721,13 +792,43 @@ private fun ProfileSheet(
                     )
                 }
                 Text(
-                    text = "配置档案",
+                    text = title,
                     fontSize = 17.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MtColors.TextPrimary
                 )
 
                 Column(modifier = Modifier.fillMaxWidth()) {
+                    if (showFollowOption) {
+                        // 「跟随翻译配置」：视觉规格与 ProfileRow 同款（h52 / 15sp / 当前态蓝勾），
+                        // 但没有 ⋮ 菜单 —— 它不是一条档案，只是「不用专门档案」的选项。
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(52.dp)
+                                    .clickable(onClick = { onSelect("") }),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "跟随翻译配置",
+                                    fontSize = 15.sp,
+                                    color = MtColors.TextPrimary,
+                                    modifier = Modifier.weight(1f),
+                                    maxLines = 1
+                                )
+                                if (selected.isEmpty()) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Check,
+                                        contentDescription = "当前使用",
+                                        tint = MtColors.Brand,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+                            MtDivider()
+                        }
+                    }
                     if (profiles.isEmpty()) {
                         Box(
                             modifier = Modifier
@@ -1014,14 +1115,26 @@ private fun ProfileFormScreen(
         mutableStateOf(if (isEdit) initial.translateApiKey else providerApiKey(provider.id))
     }
     var model by remember { mutableStateOf(initial.translateModel.ifBlank { provider.defaultModel }) }
+    // 多模态识别（视觉 OCR）专用模型（2026-10-14 用户要求与翻译模型分开选、共用同一档案）：
+    // 空串 = 跟随上面的翻译模型；填了别的名字则「低质量重读」用它。随档案保存。
+    var visionModel by remember { mutableStateOf(initial.visionModel) }
+    var visionModelMenu by remember { mutableStateOf(false) }
+    var visionModelBoxWidthPx by remember { mutableStateOf(0) }
     // 思考功能（2026-10-02 用户要求「加一个参数表示是否开启思考功能」）：
     // 有思考会慢很多，所以**新建默认关**；编辑时沿用该档案已保存的值。
-    // 只有支持该参数的厂商（千问 / GLM）才允许打开，见 thinkingSupported。
+    // 只有支持该参数的厂商（千问 / GLM / DeepSeek）才允许打开，见 thinkingSupported。
     var thinking by remember { mutableStateOf(if (isEdit) initial.enableThinking else false) }
     val thinkingSupported = provider.supportsThinking
     var providerMenu by remember { mutableStateOf(false) }
     var fetching by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // 「获取模型列表」只把结果存起来，不自动弹菜单（2026-10-12 用户反馈：自动弹出像误触，
+    // 手滑关掉还得重新请求）。打开入口是 Model 输入框右侧的箭头，随点随开、无需再请求。
+    var fetchedModels by remember { mutableStateOf<List<String>>(emptyList()) }
+    var modelMenu by remember { mutableStateOf(false) }
+    var modelBoxWidthPx by remember { mutableStateOf(0) }
+    // Base URL 一变，之前抓到的列表就是别家端点的了：作废，防止选到不存在的模型名。
+    LaunchedEffect(baseUrl) { fetchedModels = emptyList() }
 
     val nameTaken = !isEdit && existingNames.contains(name.trim())
     val canSave = name.isNotBlank() && baseUrl.isNotBlank() && apiKey.isNotBlank() && !nameTaken
@@ -1122,7 +1235,6 @@ private fun ProfileFormScreen(
                         anchorWidthPx = providerAnchorWidth
                     ) {
                         AiProvider.entries
-                            .filter { it != AiProvider.BAIDU }
                             .forEach { item ->
                                 MtDropdownItem(
                                     text = item.label,
@@ -1134,9 +1246,13 @@ private fun ProfileFormScreen(
                                         provider = item
                                         baseUrl = item.defaultBaseUrl
                                         model = item.defaultModel
+                                        // 多模态模型也回到「跟随翻译模型」：旧厂商的模型名对新厂商无意义。
+                                        visionModel = ""
                                         // 切到不支持思考参数的厂商时把开关收回去，
                                         // 否则会存下一个永远不生效的 enableThinking=true。
                                         if (!item.supportsThinking) thinking = false
+                                        // 换厂商后之前抓到的模型列表是别家的：作废，防止选到不存在的模型。
+                                        fetchedModels = emptyList()
                                     }
                                 )
                             }
@@ -1158,21 +1274,65 @@ private fun ProfileFormScreen(
                     labelOutside = true
                 )
 
+                // 垂直对齐口径（2026-10-12 用户反馈按钮「偏上」）：MtInputField 带 13px 外置标签，
+                // 整体中心高于输入框中心，CenterVertically 会把按钮抬高约 12dp。
+                // 改成底边对齐 + 按钮 padding(2dp)，让按钮在 52dp 输入框带内垂直居中。
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.Bottom
                 ) {
-                    Box(modifier = Modifier.weight(1f)) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .onGloballyPositioned { modelBoxWidthPx = it.size.width }
+                    ) {
                         MtInputField(
                             label = "Model",
                             value = model,
                             onValueChange = { model = it },
-                            labelOutside = true
+                            labelOutside = true,
+                            // 箭头只在抓到列表后才出现（2026-10-12 用户要求：没列表时不要存在）；
+                            // 出现后点它才展开下拉，平时照常手动输入。
+                            trailing = {
+                                if (fetchedModels.isNotEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .clip(RoundedCornerShape(18.dp))
+                                            .background(MtColors.BrandTint)
+                                            .clickable { modelMenu = true },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = MtChevronDownIcon,
+                                            contentDescription = null,
+                                            tint = MtColors.BrandInk,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
                         )
+                        MtDropdownMenu(
+                            expanded = modelMenu,
+                            onDismissRequest = { modelMenu = false },
+                            anchorWidthPx = modelBoxWidthPx
+                        ) {
+                            fetchedModels.forEach { item ->
+                                MtDropdownItem(
+                                    text = item,
+                                    onClick = {
+                                        model = item
+                                        modelMenu = false
+                                    }
+                                )
+                            }
+                        }
                     }
                     MtTonalButton(
                         text = if (fetching) "获取中…" else "获取模型列表",
+                        modifier = Modifier.padding(bottom = 2.dp),
                         onClick = {
                             if (apiKey.isBlank() || fetching) return@MtTonalButton
                             fetching = true
@@ -1188,7 +1348,12 @@ private fun ProfileFormScreen(
                                 }
                                 fetching = false
                                 result.onSuccess { list ->
-                                    if (model.isBlank() && list.isNotEmpty()) model = list.first()
+                                    if (list.isEmpty()) {
+                                        error = "该端点没有返回任何模型"
+                                    } else {
+                                        // 只存列表、不弹菜单、不自动填：选择动作留给用户点箭头。
+                                        fetchedModels = list
+                                    }
                                 }.onFailure {
                                     error = "获取模型列表失败：${it.message}"
                                 }
@@ -1198,15 +1363,79 @@ private fun ProfileFormScreen(
                     )
                 }
 
+                // 多模态识别模型（2026-10-14）：与翻译模型分开选、共用同一档案的
+                // 厂商 / Base URL / API Key。用于「OCR 低质量时自动改用多模态重读」。
+                // 「获取模型列表」的结果与上面共用 —— 同一个端点，抓一次两边都能选。
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onGloballyPositioned { visionModelBoxWidthPx = it.size.width }
+                ) {
+                    MtInputField(
+                        label = "多模态识别模型（可选）",
+                        value = visionModel,
+                        onValueChange = { visionModel = it },
+                        labelOutside = true,
+                        trailing = {
+                            if (fetchedModels.isNotEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .clip(RoundedCornerShape(18.dp))
+                                        .background(MtColors.BrandTint)
+                                        .clickable { visionModelMenu = true },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = MtChevronDownIcon,
+                                        contentDescription = null,
+                                        tint = MtColors.BrandInk,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    )
+                    MtDropdownMenu(
+                        expanded = visionModelMenu,
+                        onDismissRequest = { visionModelMenu = false },
+                        anchorWidthPx = visionModelBoxWidthPx
+                    ) {
+                        fetchedModels.forEach { item ->
+                            MtDropdownItem(
+                                text = item,
+                                onClick = {
+                                    visionModel = item
+                                    visionModelMenu = false
+                                }
+                            )
+                        }
+                    }
+                }
+                Text(
+                    text = "留空 = 与翻译模型相同。识别质量差时自动用这个模型重读漫画，想省 token 可以填个便宜的多模态模型。",
+                    fontSize = 11.sp,
+                    color = MtColors.TextTertiary
+                )
+
+                // 抓取成功的轻提示：箭头亮起 + 一行说明，菜单本身等用户点开。
+                if (fetchedModels.isNotEmpty()) {
+                    Text(
+                        text = "已获取 ${fetchedModels.size} 个模型，点箭头选择",
+                        fontSize = 12.sp,
+                        color = MtColors.TextSecondary
+                    )
+                }
+
                 // 思考功能（2026-10-02）：模型「先思考再作答」更准但明显更慢，
-                // 所以默认关、且只对支持该参数的厂商（千问 / GLM）可开。
+                // 所以默认关、且只对支持该参数的厂商（千问 / GLM / DeepSeek）可开。
                 MtThinkingRow(
                     checked = thinkingSupported && thinking,
                     enabled = thinkingSupported,
                     hint = if (thinkingSupported) {
                         "开启后模型先思考再作答：更准，但明显更慢（默认关）。"
                     } else {
-                        "当前厂商不支持开关（仅千问 / GLM 支持）。"
+                        "当前厂商不支持思考开关。"
                     },
                     onCheckedChange = { thinking = it }
                 )
@@ -1230,6 +1459,7 @@ private fun ProfileFormScreen(
                             translateBaseUrl = baseUrl.trim(),
                             translateModel = model.trim(),
                             translateApiKey = apiKey.trim(),
+                            visionModel = visionModel.trim(),
                             // 思考开关随档案保存（thinkingBudget 沿用 initial 里的值，不在这里暴露）。
                             enableThinking = thinkingSupported && thinking
                         )
@@ -1254,7 +1484,8 @@ private fun MtInputField(
     onValueChange: (String) -> Unit,
     keyboardType: KeyboardType = KeyboardType.Text,
     masked: Boolean = false,
-    labelOutside: Boolean = false
+    labelOutside: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null
 ) {
     val focusRequester = remember { FocusRequester() }
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -1276,23 +1507,57 @@ private fun MtInputField(
             if (!labelOutside) {
                 Text(text = label, fontSize = 11.sp, color = MtColors.TextSecondary, maxLines = 1)
             }
-            BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
-                singleLine = true,
-                textStyle = TextStyle(fontSize = 15.sp, color = MtColors.TextPrimary),
-                cursorBrush = SolidColor(MtColors.Brand),
-                keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
-                visualTransformation = if (masked) {
-                    PasswordVisualTransformation()
-                } else {
-                    VisualTransformation.None
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .focusRequester(focusRequester)
-            )
+            // [trailing] 非空时输入与尾部图标同行（如 Model 框的下拉箭头），
+            // 其余字段不传即保持原样（单个全宽输入）。
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    singleLine = true,
+                    textStyle = TextStyle(fontSize = 15.sp, color = MtColors.TextPrimary),
+                    cursorBrush = SolidColor(MtColors.Brand),
+                    keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+                    visualTransformation = if (masked) {
+                        PasswordVisualTransformation()
+                    } else {
+                        VisualTransformation.None
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focusRequester)
+                )
+                trailing?.invoke()
+            }
         }
+    }
+}
+
+/**
+ * 设置卡里的通用开关行（2026-10-14）：左侧「名称 + 副标题」、右侧开关（[MtSwitch]）。
+ * 行内边距与 [MtListRow] 对齐（左 16 / 右 12），名称也用 13sp 次级色 ——
+ * 改版前没这层 padding，文字直接贴卡片边（首页「太丑」的主因之一）。
+ */
+@Composable
+private fun MtPrefSwitchRow(
+    name: String,
+    hint: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .padding(start = 16.dp, end = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = name, fontSize = 13.sp, color = MtColors.TextSecondary)
+            Box(modifier = Modifier.height(2.dp))
+            Text(text = hint, fontSize = 11.sp, color = MtColors.TextTertiary)
+        }
+        MtSwitch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 

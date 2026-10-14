@@ -55,6 +55,7 @@ import com.manga.translator.app.ui.MtListIcon
 import com.manga.translator.app.ui.theme.MangaTranslatorTheme
 import com.manga.translator.app.ui.theme.MtColors
 import com.manga.translator.store.GlossaryEntry
+import com.manga.translator.store.SentenceCacheKey
 import com.manga.translator.store.TranslationHistoryEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -326,6 +327,8 @@ class MainActivity : ComponentActivity() {
                                     onClose = { pageIndex = MainTab.HOME.ordinal },
                                     onSelectTab = { pageIndex = it }
                                 )
+                                // 浏览器是自足的翻译入口（悬浮球 + ⋮ 菜单「截图翻译」只截 WebView
+                                // 视口，免 MediaProjection / 悬浮窗授权），不再接首页的 startCaptureFlow。
                             }
 
                             MainTab.HOME.ordinal -> {
@@ -527,6 +530,78 @@ class MainActivity : ComponentActivity() {
                                             }
                                             refreshHistory()
                                             toast("翻译历史已清空")
+                                        }
+                                    },
+                                    // 改译文（2026-10-15）：历史只是快照，真正决定「下次遇到这句用什么」
+                                    // 的是句子缓存，所以两边一起改 —— 只动快照的话下次命中缓存还是旧的错译。
+                                    onEditTranslation = { entryId, bubbleIndex, newText ->
+                                        scope.launch {
+                                            val changed = withContext(Dispatchers.IO) {
+                                                val ref = ServiceLocator.translationHistoryRepository
+                                                    .updateBubbleTranslation(entryId, bubbleIndex, newText)
+                                                    ?: return@withContext false
+                                                ServiceLocator.sentenceTranslationRepository.put(
+                                                    ref.sourceLanguage,
+                                                    ref.targetLanguage,
+                                                    ref.originalText,
+                                                    newText
+                                                )
+                                                true
+                                            }
+                                            if (changed) {
+                                                refreshHistory()
+                                                toast("已更新译文 · 以后遇到这句都用它")
+                                            } else {
+                                                toast("这条记录已不存在")
+                                            }
+                                        }
+                                    },
+                                    // 作废单句：删掉这条缓存，下次遇到重新翻译（治「原文本身就被错拼」）。
+                                    onInvalidateBubble = { entryId, bubbleIndex ->
+                                        scope.launch {
+                                            val removed = withContext(Dispatchers.IO) {
+                                                val ref = ServiceLocator.translationHistoryRepository
+                                                    .bubbleRefAt(entryId, bubbleIndex)
+                                                    ?: return@withContext null
+                                                ServiceLocator.sentenceTranslationRepository.remove(
+                                                    ref.sourceLanguage,
+                                                    ref.targetLanguage,
+                                                    ref.originalText
+                                                )
+                                            }
+                                            toast(
+                                                when (removed) {
+                                                    null -> "这条记录已不存在"
+                                                    true -> "已作废这句 · 下次遇到会重新翻译"
+                                                    false -> "这句本来就没进缓存"
+                                                }
+                                            )
+                                        }
+                                    },
+                                    // 作废整页：这一页所有句子一起删，适合「好几处都被合并错」的情况。
+                                    onInvalidatePage = { entryId ->
+                                        scope.launch {
+                                            val removed = withContext(Dispatchers.IO) {
+                                                val refs = ServiceLocator.translationHistoryRepository
+                                                    .pageBubbleRefs(entryId)
+                                                    ?: return@withContext -1
+                                                ServiceLocator.sentenceTranslationRepository.remove(
+                                                    refs.map {
+                                                        SentenceCacheKey(
+                                                            it.sourceLanguage,
+                                                            it.targetLanguage,
+                                                            it.originalText
+                                                        )
+                                                    }
+                                                )
+                                            }
+                                            toast(
+                                                when {
+                                                    removed < 0 -> "这条记录已不存在"
+                                                    removed > 0 -> "已作废本页 $removed 句 · 下次重新翻译"
+                                                    else -> "本页没有可作废的缓存"
+                                                }
+                                            )
                                         }
                                     }
                                 )

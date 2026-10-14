@@ -170,7 +170,8 @@
 ### G9 · 文档漂移【本轮核实仍存在】
 - `CLAUDE.md:64` 仍写 `TranslationCacheRepository`（LRU / TTL）—— 该类**已不存在**，
   现为 `SentenceTranslationRepository`（永久保存）。全仓 grep 确认。
-- `CLAUDE.md:68-70` 只列 3 家 provider，实际已有 7+（含百度、硅基流动、火山方舟等）。
+- `CLAUDE.md:68-70` 只列 3 家 provider，实际已有 7 家（含硅基流动、火山方舟等；2026-10-04
+  删掉了给已下线的百度 OCR 路径用的 `AiProvider.BAIDU`，它本来也被 `HomeScreen` 的 filter 藏着）。
 
 ### G10 · 质量证据入口不唯一
 - `verification.md` 与 `.codex/testing.md` 内容几乎重复（前者开头就是 `# Testing`）。

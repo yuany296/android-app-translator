@@ -1,5 +1,7 @@
 package com.manga.translator.store
-
+/**
+死代码。废弃。
+ */
 enum class OcrMode(
     val id: String,
     val label: String

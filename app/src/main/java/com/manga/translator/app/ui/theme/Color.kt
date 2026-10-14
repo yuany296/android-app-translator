@@ -47,6 +47,15 @@ object MtColors {
     val DangerTint = Color(0xFFFDECEA)
     val SwitchOff = Color(0xFFC7CDDA)
 
+    /**
+     * 已收藏的星标（2026-10-12 用户二选一：黑 / 黄；定黄）。
+     *
+     * 全 App 只有顶栏收藏星用它。为什么不用黑：黑星跟旁边图标同一套线性风格，
+     * 「变实心」在漫画页上一瞥看不出来；而它是顶栏唯一需要**报告状态**的图标，
+     * 黄色是收藏的通用符号，不用学。只在这一处出现，不破坏整体的克制。
+     */
+    val FavoriteStar = Color(0xFFF5A623)
+
     // 空状态插画（用户指定 `空.svg`）
     val Illustration = Color(0xFFC4D0E4)
 

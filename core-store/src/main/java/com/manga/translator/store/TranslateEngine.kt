@@ -11,8 +11,8 @@ enum class TranslateEngine(
     val label: String
 ) {
     CLOUD("cloud", "云端 API"),
-    BAIDU("baidu", "百度翻译（免费额度，快）"),
-    ML_KIT("mlkit", "ML Kit 本地翻译（离线，需 Google Play 服务）");
+    BAIDU("baidu", "百度翻译"),
+    ML_KIT("mlkit", "ML Kit 本地翻译（离线，需 Google Play 服务，需要下载，翻译质量非常差）");
 
     companion object {
         fun fromId(value: String): TranslateEngine {

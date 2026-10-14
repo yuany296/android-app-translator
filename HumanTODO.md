@@ -3,6 +3,100 @@
 - 日期：2026-08-27
 - 维护者：DSH Agent
 
+## 2026-10-10 Android Studio 环境：请重启 Studio 并重新同步一次
+
+### 你报的错（含后续那条 `SharedPreferences`）是同一个根因
+
+- `Could not find compile target android-34 for modules :app, :core-capture, :core-overlay, :core-store, :core-translate`
+- `Cannot access 'Object' which is a supertype of 'MasterKey.Builder'`
+- `Cannot access 'SharedPreferences' which is a supertype of 'EncryptedSharedPreferences'`
+
+**真正的根因：SDK 里有两个「伪造」组件** —— `platforms\android-34` 和 `build-tools\34.0.0`
+**都是 `android-36.1` 的整份副本**，只改了 `source.properties` / `package.xml` 里的版本号。
+
+所以 `platforms\android-34\android.jar` 装的其实是 **API 36** 的类库：
+Studio 校验后不认账，**拒绝登记 "Android API 34 Platform"**（重启后重建的 `jdk.table.xml` 里
+确实只有 `jbr-21` 和 `Android API 36.1`），于是五个 `compileSdk = 34` 的模块都拿不到框架类
+—— 连 `SharedPreferences`（android.jar）和 `Object`（JDK）都解析不出来，才满屏 "Cannot access … supertype"。
+
+**辨识方法**：改版本号骗得过目录名和 `source.properties`，但骗不过二进制 ——
+假 34 的 `aapt2.exe` / `zipalign.exe` / `apksigner.jar` 与 36.1 **逐字节相同**、
+`aapt2 version` 构建号相同、`build.prop` 里写着 `sdk=36`。详见 `docs/LOCAL_DEBUG_GUIDE.md`。
+
+**修复实证**：换成真品后，APK 的 `compileSdkVersion` 由 **`36` 变回 `34`**（codename `16` → `14`），
+与项目 `compileSdk = 34` 一致 —— 这是最硬的交叉验证。
+
+另外还修了两处（它们是**次要**原因，会加重同步失败）：
+
+- `C:\Users\yuanying\.gradle\gradle.properties` 里 **`proxyHost` 留空 + `proxyPort=80`** 的残留配置，
+  让所有下载走一个不存在的代理（表现为 `Connection refused` 或 TLS 握手失败）；
+- **AGP 8.13.2 默认要求 build-tools 35.0.0**，而机器上只有 34.0.0 / 36.1.0。
+
+### 已经做完的（命令行侧实测通过）
+
+- **把 `platforms\android-34` 换成真品**（原伪造品已移到
+  `C:\Users\yuanying\AppData\Local\Android\_backup_fake_android-34_20261010\`）。
+- **把 `build-tools\34.0.0` 换成真品**（伪造品同样移至
+  `…\_backup_fake_build-tools-34.0.0_20261010\`）。
+- **修正 `platforms\android-34\package.xml` 的 `base-extension`**：原先我照伪造品的值写了
+  `false`，官方仓库的权威值是 **`true`**。这一处会让 SDK 库把平台标识算成
+  **`android-34-ext7`** 而不是 **`android-34`**，于是 `compileSdk = 34` 找不到编译目标
+  —— 这正是红字迟迟不退的**最后一个**原因。已用 A/B 实测确认（`avdmanager list target`）。
+- 修掉坏代理配置（原值以注释保留，可回退）。
+- 补装 `build-tools;35.0.0`（腾讯镜像下官方 zip，并按 36.1.0 格式补 `package.xml`）。
+- 补装 `cmdline-tools\latest`（23.0，补上 `sdkmanager` / `avdmanager`）。
+- 实测全过：`:app:assembleDebug` ✅、`test` ✅（**966 个用例，0 失败 0 错误 0 跳过**，
+  且在换平台**之后**于 16:32 重跑）、`:app:assembleDebugAndroidTest` ✅。
+  产物 `app\build\outputs\apk\debug\app-debug.apk`（约 268 MB）。证据日志见 `logs\env-verify-*.log`。
+
+### 需要你做的（只有 GUI 里能做）
+
+**第 0 步：把那个 SDK Update Site 删掉。**
+`Settings → Android SDK → SDK Update Sites` 里那条 `tencentcloud` 是**无效的** ——
+Studio 会去请求该目录本身，返回 **HTTP 400**（日志已证实），所以显示红色感叹号。
+腾讯镜像只适合用 `curl` 直接取具体文件，不能用更新站点。选中它点删除，然后 OK。
+
+**第 1 步：重启 Android Studio**（必须 —— SDK 内容变了，要让它重新枚举平台）。
+
+**第 2 步：手动执行 `File → Sync Project with Gradle Files`**。
+
+> ⚠️ 注意：**「重启」本身不等于「重新同步」**。Studio 启动时会复用缓存里的项目模型，
+> 日志原文是 `Up-to-date models found in the cache. Not invoking Gradle sync.` ——
+> 之前你重启过一次（16:34），它就是这么跳过了同步，所以红字照旧。
+> **必须手动点一次 Sync。**
+
+**第 3 步：若红字仍在**，执行 `File → Invalidate Caches… → Invalidate and Restart`。
+
+**第 4 步：确认**：
+- 那几种 "Cannot access … supertype" 报错是否消失；
+- `Run` 能否装到 `Pixel_8` / `Medium_Phone` 模拟器（当前 `adb devices` 为空，没有设备在跑）。
+
+若要判 SDK 侧是否正常，命令行这条最直接（与 Studio 同一个解析库）：
+```powershell
+& "C:\Users\yuanying\AppData\Local\Android\Sdk\cmdline-tools\latest\bin\avdmanager.bat" list target
+# 必须出现： id: 1 or "android-34"    Type: Platform    API level: 34
+```
+
+**若想用真机**：先开 USB 调试并授权（步骤见 `docs/LOCAL_DEBUG_GUIDE.md`）。
+
+### 关于 Studio 里另外两条提示（都不用管）
+
+- **「Android Gradle plugin version 8.13.2 has an upgrade available」** —— 只是升级建议，
+  不是错误。当前 AGP 8.13.2 + Gradle 8.13 组合已验证可用，**不建议现在升级**：
+  升 AGP 一般要同时换 Gradle 版本，而本机对 `dl.google.com` 直连不稳，升级失败的风险大于收益。
+  点提示里的「不再提示」即可。
+- **「Spelling and grammar checks are not available … Chinese」** —— 拼写检查插件在 Studio
+  更新后缺中文语言包，属纯编辑器辅助功能，**与构建/编译/运行完全无关**。
+  在 `Settings → Editor → Natural Languages` 关掉即可。
+
+### 已知但不影响使用
+
+- `dl.google.com` 直连时通时断。若要补装 SDK 组件，用 `curl` 从腾讯镜像直接取文件，
+  **不要**把它加为 Studio 的 SDK Update Site（会返回 HTTP 400）。
+  命令见 `docs/LOCAL_DEBUG_GUIDE.md`。
+- `sources` 目录只有 `android-36.1`，没有 `android-34` —— 只影响「跳进框架源码」，
+  不影响编译；需要时可再补 `sources;android-34`。
+
 ## 2026-10-03 跨页接缝（缝落在第 2 行之后一点）：请用同一页确认三件事
 
 ### 背景（你的原话 + 三张截图）
@@ -1629,3 +1723,31 @@ session_fail RuntimeException: A WebView method was called on thread
 **已知限制（本轮没做，避免丢译文）**：如果接缝另一侧那一行是**另一行文字**（不是同一行的另一半），
 我们现在**不会**把它并进接缝气泡（参考项目会把它的译文并进去，我们还没有这条支路）——
 所以这类版面会表现为「两行各自翻译」，而不是合成一段。要成一段需要再加一条翻译支路，你说要我再做。
+
+## 2026-10-04：词条列表「左滑露出删除」位移被叠加了两次 —— 已修，并已在模拟器上 A/B 复测
+
+**问题**：`app/src/main/java/com/manga/translator/app/SwipeRevealRow.kt` 的内容层 `Row` 上挂了
+**两个** `.offset { IntOffset(offsetX.value.roundToInt(), 0) }`（分别在 `background` 前后）。
+Modifier 链是 `fillMaxSize → offset → background → pointerInput → offset`，两个 offset **嵌套累加**，
+但 `background` 夹在两者**中间**、只被推 1 次。所以症状**不是**「红色带露多了」——
+而是**表面层走 1×、文字/图标走 2×**：全开时白色表面移 80dp，而文字/开关/⋮ 移 160dp，
+左侧文字被整段推出屏幕外，⋮ 与表面层右缘之间空出一大片白（拖动中途同理，内容比表面多跑一倍）。
+（本条目上一版把症状写成「内容右缘与删除按钮之间露红带」，那个描述是错的，已按实测更正。）
+
+**已改**：删掉 `background` 之后那个 offset（保留 `offset → background` 顺序），并加注释「offset 只能有一处」。
+
+**模拟器复测**（emulator-5556，1080×2400 / 420dpi → 80dp = 210px；脚本与截图在 `swipe_verify/`）：
+
+| 场景 | 表面层位移（=露出的红带） | 内容位移（⋮ 墨迹右缘，静止态 963px） | 结论 |
+|---|---|---|---|
+| 故意改回双 offset，整条左滑到底 | 207px（78.9dp） | 963−543 = **420px** | = 2×210，**bug 复现** |
+| 修复版，整条左滑到底 | 207px（78.9dp） | 963−753 = **210px** | = 1×210（80dp），**修好** |
+| 修复版，按住拖到一半不抬（累计 −120px，slop 吃掉约 24px） | 96px | 99px | 比值 1.03，内容与表面同步 |
+
+另外：中途松手（未过一半）抬起后截图与静止态**逐像素一致** → 回弹正常；
+全开后点右侧垃圾桶 → 弹确认框 → 删除生效、列表回到「还没有术语表」（测试数据已清掉）。
+
+**还需要你在真机上看一眼的**（模拟器只能证明位移比例，证明不了手感）：
+1. 左滑时文字/开关是否**和白色表面一起走**（不再比表面多跑一倍、不再被推出屏幕左缘）；
+2. 滑到底后 ⋮ 与右侧删除按钮的间距是否自然；
+3. 中途松手回弹、滑到底吸附，以及删除确认流程是否都还正常。
