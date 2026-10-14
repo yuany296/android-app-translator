@@ -146,29 +146,30 @@ class SeamBubbleMergerTest {
             )
         )
         assertEquals(0, plan.pairedBottomSeam)
-        // 配不上对时两块都必须有归宿（2026-10-03 修，以前下半会被丢掉）：
+        // 配不上对时两块都必须有归宿：
         //   · 上半 x[60,300] y[1050,1195] 完全在本图内 → 普通 owned（句子残缺，但至少不丢）；
-        //   · 下半 x[520,760] y[1205,1340] 整块落在下条带里 → 认领 + 移交下一页（本图不渲染）。
-        assertEquals(2, plan.owned.size)
-        assertEquals(1, plan.handedTail)
+        //   · 下半 x[520,760] y[1205,1340] 整块落在下条带里 → 丢弃（2026-10-12 起不再移交：
+        //     移交框是拼接系百分比，下一张换算会整体错位一个坐标系 —— 它由下一张图
+        //     自己完整看到，交给下一张的 owned 链路坐标才正确）。
+        assertEquals(1, plan.owned.size)
+        assertEquals(0, plan.handedTail)
         assertEquals(0, plan.orphanAdopted)
-        assertEquals(0, plan.droppedNeighbor)
-        val inside = plan.owned.first { it.bubble.originalText == "안녕하" }
+        assertEquals(1, plan.droppedNeighbor)
+        val inside = plan.owned.single()
+        assertEquals("안녕하", inside.bubble.originalText)
         assertFalse(inside.cross)
         assertTrue(inside.renderHere)
-        val handed = plan.owned.first { it.bubble.originalText == "세요" }
-        assertTrue(handed.cross)
-        assertFalse(handed.renderHere)
     }
 
     @Test
-    fun tailBlockInBottomBandIsHandedOverWithoutRenderingHere() {
-        // 整块落在下条带里（= 下一张图的正文）→ 认领、cross=true（移交），但 renderHere=false
+    fun tailBlockInBottomBandIsDroppedForNextImage() {
+        // 整块落在下条带里（= 下一张图的正文）→ 丢弃（2026-10-12 起不再移交）：
+        // 移交框是拼接系百分比，下一张换算整体错位（真机 gamesal 7/8 页：악질들泡移交框
+        // 落第 8 页 -6.5%、真实字形 +4.9%）；下一张自己完整看到它，交给下一张的 owned 链路。
         val plan = plan(listOf(detection("다음 그림", 300f, 1205f, 700f, 1340f)))
-        assertEquals(1, plan.owned.size)
-        val owned = plan.owned.single()
-        assertTrue(owned.cross)
-        assertFalse(owned.renderHere)
+        assertEquals(0, plan.owned.size)
+        assertEquals(0, plan.handedTail)
+        assertEquals(1, plan.droppedNeighbor)
     }
 
     @Test
@@ -238,12 +239,11 @@ class SeamBubbleMergerTest {
         )
         // 上条带里那块 = 上一张图正文，且上一张没移交；它整块在本图画面之外（裁完高度为 0）
         // → 仍然丢弃（画不出来的东西不该硬画）。
-        assertEquals(1, plan.droppedNeighbor)
+        assertEquals(2, plan.droppedNeighbor)
         assertEquals(0, plan.orphanAdopted)
-        // 下条带那块 = 下一张图正文 → 认领 + 移交（renderHere=false，不在本图渲染）
-        assertEquals(1, plan.handedTail)
-        assertEquals(1, plan.owned.size)
-        assertFalse(plan.owned.single().renderHere)
+        // 下条带那块 = 下一张图正文 → 丢弃（2026-10-12 起不再移交，由下一张自己的 owned 链路处理）。
+        assertEquals(0, plan.handedTail)
+        assertEquals(0, plan.owned.size)
     }
 
     @Test
@@ -434,8 +434,10 @@ class SeamBubbleMergerTest {
         val cfg = config(edgeWindow = SeamTuning.resolveEdgeWindow(100f))
         val plan = plan(listOf(upper, lower), config = cfg)
         assertEquals(0, plan.pairedBottomSeam)
-        // 两块各自独立成气泡（文本没有被空格拼成一句）
-        assertEquals(2, plan.owned.size)
+        // 两块不合并；下块整块落在下条带里 → 丢弃（2026-10-12 起不再移交，由下一张自己的
+        // owned 链路处理），本图只保留上块。
+        assertEquals(1, plan.owned.size)
+        assertEquals("위 조각", plan.owned.single().bubble.originalText)
         assertFalse(plan.owned.any { it.bubble.originalText.contains("위 조각 아래") })
     }
 

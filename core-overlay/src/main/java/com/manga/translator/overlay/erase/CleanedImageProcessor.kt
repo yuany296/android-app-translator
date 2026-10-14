@@ -92,6 +92,14 @@ class CleanedImageProcessor {
         val bgrMat = Mat()
         val mask = Mat.zeros(source.height, source.width, CvType.CV_8UC1)
         val dst = Mat()
+        // 纯色气泡的直填区域（2026-10-11 用户：「背景是纯色的就不要用清理图了，直接用
+        // 纯色就行」）：不走 inpaint，直接把墨迹像素填成背景色。
+        //
+        // 为什么：inpaint 对 dense 文本会退化成整块矩形擦除（见 paintInkMask 的
+        // DENSE_INK 回退），矩形角落伸进气泡锯齿轮廓之外时，重采样会把气泡外的
+        // 灰天空/邻气泡颜色吸进来 —— 用户截图里白气泡上那块灰晕就是这么来的。
+        // 直填没有重采样，就没有色晕。
+        val solidFills = mutableListOf<android.graphics.Rect>()
         try {
             Utils.bitmapToMat(source, srcMat)
             // inpaint 仅支持 3 通道 BGR 输入，bitmapToMat 产出 4 通道 RGBA，先转换。
@@ -127,6 +135,11 @@ class CleanedImageProcessor {
                 val bottom = (roi.bottom + padY).coerceAtMost(outerGuardBottom(usableOuter, source.height))
                 if (right - left < 2 || bottom - top < 2) return@forEach
                 val target = android.graphics.Rect(left, top, right, bottom)
+                if (solid) {
+                    solidFills += target
+                    changed = true
+                    return@forEach
+                }
                 // 只把「字」打成 mask，保留框内的画面/渐变：
                 // 整块矩形 inpaint 会把旁白底下的画面抹成一片糊（2026-09-28 实测 residual_max=0.26），
                 // 墨迹级 mask 则只重建笔画像素，背景纹理原样保留。
@@ -148,6 +161,7 @@ class CleanedImageProcessor {
                 Imgproc.cvtColor(dst, rgba, Imgproc.COLOR_BGR2RGBA)
                 val cleaned = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(rgba, cleaned)
+                solidFills.forEach { rect -> applySolidFill(cleaned, rect) }
                 return cleaned
             } finally {
                 rgba.release()
@@ -157,6 +171,61 @@ class CleanedImageProcessor {
             bgrMat.release()
             mask.release()
             dst.release()
+        }
+    }
+
+    /**
+     * 纯色气泡的直填擦除（2026-10-11）：把 [rect] 内「离背景色够远」的像素
+     * （= 笔画 + 描边 + 抗锯齿晕）填成背景色。判据与 [paintInkMask] 完全同一条
+     * （[buildInkMaskData] 的 RGB 距离），但**不走 inpaint** —— 重采样就是把气泡外的
+     * 颜色吸进来的通道。1px 膨胀吃掉抗锯齿过渡带，不然留着的是一圈淡影。
+     */
+    private fun applySolidFill(bitmap: Bitmap, rect: android.graphics.Rect) {
+        val width = rect.width()
+        val height = rect.height()
+        if (width <= 0 || height <= 0 || bitmap.isRecycled) return
+        val background = backgroundRgb(bitmap, rect)
+        val pixels = IntArray(width * height)
+        bitmap.getPixels(pixels, 0, width, rect.left, rect.top, width, height)
+        val ink = buildInkMaskData(pixels, background)
+        val filled = ByteArray(pixels.size)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val index = y * width + x
+                if (ink[index].toInt() != 0) {
+                    filled[index] = 0xFF.toByte()
+                    continue
+                }
+                // 1px 膨胀：抗锯齿过渡像素不在阈值内，直接填掉
+                var hit = false
+                var dy = -1
+                while (dy <= 1 && !hit) {
+                    var dx = -1
+                    while (dx <= 1) {
+                        val nx = x + dx
+                        val ny = y + dy
+                        if (nx in 0 until width && ny in 0 until height &&
+                            ink[ny * width + nx].toInt() != 0
+                        ) {
+                            hit = true
+                            break
+                        }
+                        dx++
+                    }
+                    dy++
+                }
+                if (hit) filled[index] = 0xFF.toByte()
+            }
+        }
+        var changed = 0
+        for (index in pixels.indices) {
+            if (filled[index].toInt() != 0) {
+                pixels[index] = background
+                changed++
+            }
+        }
+        if (changed > 0) {
+            bitmap.setPixels(pixels, 0, width, rect.left, rect.top, width, height)
         }
     }
 

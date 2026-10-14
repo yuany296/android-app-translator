@@ -521,18 +521,21 @@ internal fun planSeamOwnership(
             return@forEachIndexed
         }
         if (box.top >= bottom - 0.5f) {
-            // 整块落在**下**条带里 = 下一张图的正文。本图只认领+移交，**不在本图渲染**
-            // （它的百分比框在本图画面之外，渲染只会得到一行贴在页脚的假译文）。
-            val crossesDown = config.hasBottomBand && box.bottom > bottom + 0.5f
-            if (crossesDown && !isFragment(box.height)) {
-                handedTail += 1
-                verdicts[index] = "handed_tail"
-                owned += SeamOwnership(detection.bubble, cross = true, renderHere = false)
-            } else {
-                // 贴着分界的退化小块 / 太薄的残片：移交给下一张也画不出东西。
-                dropped += 1
-                verdicts[index] = if (crossesDown) "dropped_fragment" else "dropped_tail"
-            }
+            // 整块落在**下**条带里 = 下一张图的正文（2026-10-12 起不再移交，直接丢弃）。
+            //
+            // 历史行为是「认领 + 移交下一张」（handed_tail，renderHere=false）。但移交框是
+            // **拼接图坐标系**的百分比（分母 = 拼接高），下一张换算时却按「上一张本图高」
+            // 解（[CrossBubblePart.sourceHeightPx] = source.height）—— 整块在条带里的泡
+            // 换算后整体错位：真机 15:04 trace（gamesal 7/8 页）악질들泡移交框落在第 8 页
+            // -6.5%，真实字形在 +4.9% → 中文叠在错位处、韩文原样露出，且第 8 页自己的
+            // 检出被 [isHandedOverByIncoming] 抑制，两边都没人擦。
+            // 而下一张图自己**必然完整看到**这个泡（它不受条带切割），由下一张的 owned
+            // 链路渲染/擦除/翻译，坐标天然正确 —— 所以这里直接丢弃（dropped_tail），
+            // 把泡还给下一张。
+            // 真跨缝泡（规则 1 的 cross：主体在本图内、只伸进条带一点）不受影响 ——
+            // 它的主体坐标在第 7 页本图内，移交/接缝带语义成立。
+            dropped += 1
+            verdicts[index] = "dropped_tail"
             return@forEachIndexed
         }
         val clipped = if (config.hasBottomBand && box.bottom > cap) {

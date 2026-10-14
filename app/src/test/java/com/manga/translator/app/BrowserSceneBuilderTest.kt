@@ -1,6 +1,7 @@
 package com.manga.translator.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -119,6 +120,35 @@ class BrowserSceneBuilderTest {
         assertTrue(json.contains("\"font_height_percent\":3.2"))
         assertTrue(json.contains("\"stitch_overflow\":false"))
         assertTrue(json.contains("\"patch_url\":null"))
+        // flat_cover 只在 true 时下发（老渲染层没有这个字段 → 行为与改动前一致）。
+        assertFalse(json.contains("flat_cover"))
+    }
+
+    @Test
+    fun `flat cover flag is emitted only when set`() {
+        fun sceneWith(flat: Boolean) = BrowserSceneBuilder.Scene(
+            cleanedUrl = null,
+            bubbles = listOf(
+                BrowserSceneBuilder.SceneBubble(
+                    id = "b0", x = 0f, y = 0f, w = 10f, h = 10f,
+                    originalText = "原文",
+                    translatedText = "译文",
+                    sourceLineCount = 1,
+                    vertical = false,
+                    alignment = "center",
+                    bgType = "none",
+                    bgColorHex = "#f3e9d2",
+                    textColorHex = "#111827",
+                    strokeColorHex = "#ffffff",
+                    fontHeightPercent = 3f,
+                    flatCover = flat
+                )
+            )
+        )
+        val on = BrowserSceneBuilder.buildSceneJson("mt1", sceneWith(true))
+        val off = BrowserSceneBuilder.buildSceneJson("mt1", sceneWith(false))
+        assertTrue("flat_cover must be emitted when set: $on", on.contains("\"flat_cover\":true"))
+        assertFalse("flat_cover must be omitted when false: $off", off.contains("flat_cover"))
     }
 
     @Test

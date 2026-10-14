@@ -219,6 +219,53 @@ const TILTED_POLYGON = [
 })();
 
 // ---------------------------------------------------------------------------
+// §17 遮罩倾角的两条硬门槛（移植参考项目 cover-geometry.js，2026-10-14）
+//
+// 用户现场（2026-10-14，Lezhin 内嵌浏览器）：气泡原文透过译文可见、盖板时有时无、
+// 有时只盖住一条 —— 根因是 rotation_deg ≈ ±90（检测器对高而窄的框一律给 ±90°）
+// 被当成「斜排」，外接框被旋转 90°，盖板变成横条；亚 1° 的识别噪声同理。
+// ---------------------------------------------------------------------------
+(function coverRotationSemantics() {
+  // (a) |倾角| ≥ 60° 是**竖排方向**，不是「歪了」：必须按四边形/原框走，不能旋转外接框。
+  const page = freshPage();
+  const column = [{ x: 45, y: 10 }, { x: 55, y: 10 }, { x: 55, y: 70 }, { x: 45, y: 70 }];
+  apply(page, scene(page, [bubble({
+    polygon: column, rotation_deg: 89.97, x: 45, y: 10, w: 10, h: 60, bg_type: "none"
+  })]));
+  const clip = page.document.querySelector(".__mt_scene_root").querySelector(".mt-cover-clip");
+  check("vertical rotation keeps the column cover (not a horizontal band)",
+    parseFloat(clip.style.height) > parseFloat(clip.style.width),
+    { w: clip.style.width, h: clip.style.height, clip: clip.style.clipPath });
+
+  // 没有四边形时同理：框本身 = 那一列，旋转它只会把盖板转成横条。
+  const page2 = freshPage();
+  apply(page2, scene(page2, [bubble({ rotation_deg: 89.97, x: 45, y: 10, w: 10, h: 60, bg_type: "none" })]));
+  const clip2 = page2.document.querySelector(".__mt_scene_root").querySelector(".mt-cover-clip");
+  check("vertical rotation without a polygon is not rotated either",
+    parseFloat(clip2.style.height) > parseFloat(clip2.style.width) &&
+    clip2.style.transform.indexOf("rotate(") === -1,
+    { w: clip2.style.width, h: clip2.style.height, transform: clip2.style.transform });
+
+  // (b) 亚 COVER_ROTATION_NOISE_DEG = 识别噪声：不旋转、不裁剪（转歪只会露出原文边角）。
+  const page3 = freshPage();
+  apply(page3, scene(page3, [bubble({ rotation_deg: -0.6, x: 10, y: 10, w: 40, h: 10, bg_type: "none" })]));
+  const clip3 = page3.document.querySelector(".__mt_scene_root").querySelector(".mt-cover-clip");
+  check("sub-noise rotation keeps the axis-aligned cover box",
+    near(parseFloat(clip3.style.width), 40, 0.01) && near(parseFloat(clip3.style.height), 10, 0.01) &&
+    clip3.style.transform.indexOf("rotate(") === -1,
+    { w: clip3.style.width, h: clip3.style.height, transform: clip3.style.transform });
+
+  // (c) 真斜排（2°..60°）行为不变：形状由 clip-path 表达，节点本身不再旋转（否则转两次）。
+  const page4 = freshPage();
+  apply(page4, scene(page4, [bubble({ rotation_deg: 12, x: 40, y: 40, w: 20, h: 4, bg_type: "none" })]));
+  const clip4 = page4.document.querySelector(".__mt_scene_root").querySelector(".mt-cover-clip");
+  check("real tilt still tilts the cover (shape via clip-path, no double rotation)",
+    parseFloat(clip4.style.height) > 4 && clip4.style.clipPath.startsWith("polygon(") &&
+    clip4.style.transform.indexOf("rotate(") === -1,
+    { h: clip4.style.height, clip: clip4.style.clipPath, transform: clip4.style.transform });
+})();
+
+// ---------------------------------------------------------------------------
 // §4 / §13.2 实底：填充色 = 采样底色，范围 = 文字框 ∪ fill_box，按 region_polygon 裁剪
 // ---------------------------------------------------------------------------
 (function solidFill() {
@@ -302,6 +349,68 @@ const TILTED_POLYGON = [
     {
       x: cover.style.getPropertyValue("--mt-cleaned-size-x"),
       y: cover.style.getPropertyValue("--mt-cleaned-size-y")
+    });
+})();
+
+// ---------------------------------------------------------------------------
+// §15 速度优先模式（关闭「精细擦字」）：旁白/透明块用**不透明实底**盖住原文
+//
+// 用户 2026-10-11 反馈：「现在会有残影。不要这样的，而是用实体的背景遮挡」——
+// 关闭开关时宿主不再建整页清理图（scene.cleaned_url = null），也不再用逐气泡贴片
+// （贴片是局部边缘填充，笔画边缘必然留残影），而是下发 `flat_cover`：盖板直接铺采样
+// 出来的气泡底色，100% 不透明。
+// ---------------------------------------------------------------------------
+(function flatCoverForFastMode() {
+  const page = freshPage();
+  apply(page, scene(page, [bubble({
+    bg_type: "none",
+    bg_color: "#f3e9d2",
+    flat_cover: true,
+    // 即使同时带了贴片来源，flat_cover 也必须赢（实底优先，不留残影通道）。
+    patch_url: "https://mtlocal.overlay/p1.png",
+    patch_box: { x: 10, y: 40, w: 50, h: 20 }
+  })]));
+  const cover = coverBubbleOf(page.document.querySelector(".__mt_scene_root"));
+  check("flat cover marks the node", cover.dataset.coverFill === "flat", cover.dataset.coverFill);
+  check("flat cover uses the sampled bubble color",
+    cover.style.getPropertyValue("--mt-adaptive-bg") === "#f3e9d2",
+    cover.style.getPropertyValue("--mt-adaptive-bg"));
+  check("flat cover gives up the patch image (solid block wins)",
+    cover.style.getPropertyValue("--mt-cleaned-image") === "",
+    cover.style.getPropertyValue("--mt-cleaned-image"));
+  check("flat cover still keeps the text readable stroke class",
+    cover.className.includes("mt-bg-none"), cover.className);
+})();
+
+// ---------------------------------------------------------------------------
+// §15 跨图续排：贴片盖板仍然可用（patch_url + patch_box 的裁剪层语义）
+// ---------------------------------------------------------------------------
+(function patchBackedCoverForFastMode() {
+  const page = freshPage();
+  apply(page, scene(page, [bubble({
+    bg_type: "none",
+    patch_url: "https://mtlocal.overlay/p1.png",
+    patch_box: { x: 10, y: 40, w: 50, h: 20 }
+  })]));
+  const root = page.document.querySelector(".__mt_scene_root");
+  const clip = root.querySelector(".mt-cover-clip");
+  const cover = coverBubbleOf(root);
+  check("no scene-level cleaned image in fast mode",
+    root.style.getPropertyValue("--mt-cleaned-image") === "",
+    root.style.getPropertyValue("--mt-cleaned-image"));
+  check("patch_box drives the clip layer (center + size)",
+    near(parseFloat(clip.style.left), 35) && near(parseFloat(clip.style.top), 50) &&
+    near(parseFloat(clip.style.width), 50) && near(parseFloat(clip.style.height), 20),
+    { left: clip.style.left, top: clip.style.top, w: clip.style.width, h: clip.style.height });
+  check("patch image fills the cover node 100%",
+    cover.style.getPropertyValue("--mt-cleaned-image") === 'url("https://mtlocal.overlay/p1.png")' &&
+    cover.style.getPropertyValue("--mt-cleaned-size-x") === "100%" &&
+    cover.style.getPropertyValue("--mt-cleaned-size-y") === "100%" &&
+    cover.style.getPropertyValue("--mt-cleaned-position-x") === "0" &&
+    cover.style.getPropertyValue("--mt-cleaned-position-y") === "0",
+    {
+      image: cover.style.getPropertyValue("--mt-cleaned-image"),
+      sizeX: cover.style.getPropertyValue("--mt-cleaned-size-x")
     });
 })();
 
@@ -422,10 +531,79 @@ const TILTED_POLYGON = [
   const cover = coverBubbleOf(root);
   const fontSize = parseFloat(text.style.fontSize);
   check("overflowing text shrinks below the start size", fontSize < 52, fontSize);
+  check("overflowing text bottoms out at the 8px absolute floor", fontSize === 8, fontSize);
   check("overflowing text expands its own box", text.style.minWidth !== "", text.style.minWidth);
   check("solid mask expands with the text (§7 实底填充同步撑满)",
     cover.style.minWidth === text.style.minWidth && cover.style.minHeight === text.style.minHeight,
     { text: text.style.minWidth, cover: cover.style.minWidth });
+})();
+
+// ---------------------------------------------------------------------------
+// §7.1 字号自适应（2026-10-12 用户规则）：装不下先缩字号，缩到装得下就**不撑开**；
+// 只有缩到 8px 绝对下限仍装不下才允许撑出原文位置，且必须打 MTFONT 诊断。
+// ---------------------------------------------------------------------------
+(function fontShrinkInsteadOfExpand() {
+  const page = freshPage();
+  // 探针在字号 > 20px 时溢出、≤ 20px 时装得下 → 必须收字号装进原框。
+  globalThis.__mtStubProbeScroll = (probe) => {
+    const size = parseFloat(probe.style.fontSize) || 0;
+    return size > 20 ? { width: 9999, height: 9999 } : null;
+  };
+  apply(page, scene(page, [bubble({ translated_text: "四行以内的普通台词" })]));
+  globalThis.__mtStubProbeScroll = null;
+  const root = page.document.querySelector(".__mt_scene_root");
+  const text = root.querySelector(".mt-text-layer");
+  const size = parseFloat(text.style.fontSize);
+  check("shrink-to-fit picks a size that fits the original box",
+    size > 0 && size <= 20.1, size);
+  check("shrink-to-fit must not expand the node",
+    text.style.minWidth === "" && text.style.minHeight === "",
+    { minW: text.style.minWidth, minH: text.style.minHeight });
+
+  // 缩到绝对下限仍装不下：允许撑开，但必须留下 MTFONT 诊断日志。
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (msg) => logs.push(String(msg));
+  try {
+    globalThis.__mtStubProbeScroll = { width: 400, height: 400 };
+    apply(page, scene(page, [bubble({ translated_text: "装不下的超长译文" })]));
+  } finally {
+    globalThis.__mtStubProbeScroll = null;
+    console.log = originalLog;
+  }
+  const fontLines = logs.filter((line) => line.startsWith("MTFONT expand"));
+  check("floor expansion emits an MTFONT diagnostic",
+    fontLines.length === 1 && /box=\d+x\d+ need=\d+x\d+ font=8/.test(fontLines[0]),
+    fontLines[0]);
+})();
+
+// ---------------------------------------------------------------------------
+// §7.2 排版框重叠诊断（MTGEOM，只记日志）：同 root 内两个文字节点交叠过半必须报出来，
+// 用于区分「宿主下发的框本身重叠」和「渲染层自己画重」。
+// ---------------------------------------------------------------------------
+(function geomOverlapDiagnostic() {
+  const page = freshPage();
+  const Mt = page.Mt;
+  const makeNode = (x, y, w, h) => {
+    const node = page.document.createElement("div");
+    node.dataset.xPercent = String(x);
+    node.dataset.yPercent = String(y);
+    node.dataset.wPercent = String(w);
+    node.dataset.hPercent = String(h);
+    return node;
+  };
+  const lines = [];
+  const originalLog = console.log;
+  console.log = (msg) => lines.push(String(msg));
+  try {
+    Mt._logTextOverlap([makeNode(10, 10, 40, 20), makeNode(20, 12, 40, 20)], "scene=test");
+    Mt._logTextOverlap([makeNode(0, 0, 40, 20), makeNode(50, 60, 40, 20)], "scene=test");
+  } finally {
+    console.log = originalLog;
+  }
+  check("overlap diagnostic logs once for two half-overlapping boxes",
+    lines.length === 1 && lines[0].startsWith("MTGEOM overlap scene=test"),
+    lines);
 })();
 
 // ---------------------------------------------------------------------------
@@ -1356,8 +1534,128 @@ const TILTED_POLYGON = [
 })();
 
 // ---------------------------------------------------------------------------
-// 汇总
+// §16 场景重建后「被接缝层顶掉的半块」必须继续被顶掉（2026-10-14）
+//
+// 用户反馈：「向下划后再次向上划的时候可能会出现重复的译文」。
+//
+// 现场链条：懒加载站点滚动时把 `<img>` 换成新 blob URL（内容不变）→ 会话按内容指纹复用
+// 场景重新下发 → `applyScene` 建新 root，而被 `suppressBubble` 摘掉的那半块又回来了；
+// 接缝层还活着 → 同一句台词画两遍（一份接缝带、一份半块）。
+// 修复：同名 `data-mt-layer` 的抑制登记在重建时**换绑**到新 root，继续摘掉；
+// 接缝层一旦失效（restoreSeamHalves）仍能把它们贴回新 root。
 // ---------------------------------------------------------------------------
+(function suppressionSurvivesSceneRebuild() {
+  const page = freshPage();
+  function sceneWith(cleanedUrl) {
+    return JSON.stringify({
+      v: 1,
+      kind: "scene",
+      image_id: "mt1",
+      cleaned_url: cleanedUrl,
+      bubbles: [
+        bubble({ id: "b0", x: 10, y: 80, w: 50, h: 25, stitch_overflow: true }),
+        bubble({ id: "b1", x: 10, y: 10, w: 40, h: 20 })
+      ]
+    });
+  }
+  function layersOf(layerId) {
+    const entry = page.Mt._overlays.get("mt1");
+    const kids = (entry && entry.root && entry.root.children) || [];
+    return kids.filter((n) => n.dataset && n.dataset.mtLayer === layerId).length;
+  }
+
+  check("scene applies", JSON.parse(page.Mt.applySceneJson(sceneWith(null))).ok === true);
+  check("both bubbles are on screen", layersOf("b0:text") === 1 && layersOf("b1:text") === 1);
+
+  // 宿主摘掉上半块（接缝层生效时的正常动作）。
+  const removed = page.Mt.suppressBubble("mt1", "b0");
+  check("half is suppressed", removed > 0 && layersOf("b0:text") === 0, removed);
+
+  // 站点换图（新 blob URL）→ 同一份场景换一个清理图 URL 重新下发 = 触发重建。
+  const rebuilt = JSON.parse(page.Mt.applySceneJson(sceneWith("https://mtlocal.overlay/cleaned-b.jpg")));
+  check("scene is rebuilt on a changed signature", rebuilt.ok === true && rebuilt.rebuilt === true, rebuilt);
+  check("rebuilt scene reports the suppressed bubble", rebuilt.suppressed === 1, rebuilt);
+  check("suppressed half stays off screen after the rebuild",
+    layersOf("b0:text") === 0 && layersOf("b0:cover") === 0,
+    [layersOf("b0:text"), layersOf("b0:cover")]);
+  check("the other bubble is still there", layersOf("b1:text") === 1);
+
+  // 接缝层失效（两张切片不再相接）→ 那半块必须能贴回**新** root（换绑后仍有效）。
+  page.Mt.restoreSeamHalves("mt1|mt2");
+  check("restore brings the half back into the rebuilt root",
+    layersOf("b0:text") === 1 && layersOf("b0:cover") === 1,
+    [layersOf("b0:text"), layersOf("b0:cover")]);
+  check("suppression registry is drained after restore",
+    page.Mt._suppressedHalves().length === 0, page.Mt._suppressedHalves().length);
+})();
+
+// ---------------------------------------------------------------------------
+// 像素感知均衡断行（2026-10-14）：纯函数表驱动 —— 词边界 / 标点禁则 / 均衡 / 行数
+// ---------------------------------------------------------------------------
+(function balancedLineBreaking() {
+  const page = freshPage();
+  const Mt = page.Mt;
+
+  // 注入式分词与测宽（与 WebView 环境无关）：`|` 分隔词，每字符宽 10。
+  const measure = (text) => Array.from(String(text || "")).length * 10;
+  const tokenize = (text) => String(text || "").split("|").filter(Boolean)
+    .map((word) => ({ text: word, sepAfter: "", wordLike: true }));
+  const breakRows = (units, widths, lines, maxWidth) =>
+    Mt._breakBalancedLines(
+      units.map((text) => ({ text, sepAfter: "", wordLike: true })),
+      widths,
+      lines,
+      maxWidth
+    );
+
+  // 1) 单元（词）永不被劈开：每行都是连续单元的拼接。
+  const units = ["一二三", "四五", "六七", "八九", "十零一"];
+  const widths = units.map((u) => u.length * 10);
+  const rows = breakRows(units, widths, 2, 1000);
+  check("balanced break returns the requested line count", rows && rows.length === 2, rows);
+  const rebuilt = rows ? rows.join("") : "";
+  check("balanced break never splits a unit", rebuilt === units.join(""), rows);
+
+  // 2) 行首禁则：收尾标点不许起行（即使均分更划算）。
+  const punctRows = breakRows(["一二三四五", "！", "六七八九十"], [50, 10, 50], 2, 1000);
+  check("closing punctuation never starts a line",
+    punctRows && punctRows[1].charAt(0) !== "！", punctRows);
+
+  // 3) 标点优先：能断在逗号之后就不在别处断。
+  const commaRows = breakRows(["今天天气很好", "，", "我们一起出去玩吧"], [60, 10, 90], 2, 1000);
+  check("break prefers right after punctuation",
+    commaRows && commaRows[0].charAt(commaRows[0].length - 1) === "，", commaRows);
+
+  // 4) 均衡：11 个同宽字断 2 行 → 6/5，不允许 10/1。
+  const eleven = Array.from({ length: 11 }, (_, i) => "字" + i);
+  const balanced = breakRows(eleven, eleven.map(() => 10), 2, 1000);
+  check("balanced break avoids a one-character last line",
+    balanced && Array.from(balanced[1]).length >= 4, balanced);
+
+  // 5) 行数不足/已含换行/单行目标 → 组合入口返回 null（调用方保持原文本）。
+  check("formatBalancedLines rejects line count <= 1",
+    Mt._formatBalancedLines("顶部哦我讨厌它", 1, 500, measure, tokenize) === null);
+  check("formatBalancedLines rejects text with hard lines",
+    Mt._formatBalancedLines("已有\n换行", 2, 500, measure, tokenize) === null);
+
+  // 6) 组合入口：词边界保持（不劈开「讨厌」）——用真实分词器（WebView/Node 都有 Intl.Segmenter）。
+  if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+    const realText = "顶部!?哦一我讨厌它！不要吓太";
+    const formatted = Mt._formatBalancedLines(realText, 2, 220, measure);
+    const lines = formatted ? formatted.split("\n") : [];
+    check("real segmenter keeps words intact",
+      lines.length === 2 && !lines.some((line) => /讨$/.test(line) || /^厌/.test(line)),
+      formatted);
+  } else {
+    check("real segmenter keeps words intact (skipped: no Intl.Segmenter)", true);
+  }
+
+  // 7) 贪心行数统计（重排必须保持行数不变）。
+  check("countGreedyLines counts hard lines and wraps",
+    Mt._countGreedyLines("一二三|四五六|七八九十", 50, measure, tokenize) === 3, null);
+})();
+
+
 const total = passed + failures.length;
 if (failures.length > 0) {
   console.log("FAILED " + failures.length + "/" + total);

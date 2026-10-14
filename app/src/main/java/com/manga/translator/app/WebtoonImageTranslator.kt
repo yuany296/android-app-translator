@@ -11,9 +11,11 @@ import android.text.TextPaint
 import android.util.Log
 import android.graphics.Typeface
 import com.manga.translator.overlay.BubbleColors
+import com.manga.translator.overlay.BubbleInteriorScanner
 import com.manga.translator.overlay.WritableAreaRefiner
 import com.manga.translator.overlay.erase.ErasePatch
 import com.manga.translator.store.AppSettings
+import com.manga.translator.translate.BalancedLineBreaker
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.BubbleGeometry
 import com.manga.translator.translate.NormalizedRect
@@ -230,6 +232,16 @@ class WebtoonImageTranslator(
         incomingCross: List<CrossBubblePart> = emptyList(),
         renderMode: BrowserRenderMode = BrowserRenderMode.DOM_SCENE,
         /**
+         * 允许「相邻行并回」（2026-10-11，见 [absorbIncomingFragments]）。
+         *
+         * 会话侧在**有接缝带瞄准本图**时必须传 false：接缝带的译文是上一张图按截断文本
+         * 翻的（它在接缝上下连成一句，正是「一块盖板 + 一份译文」的价值所在），而并回会把
+         * 更深的行并进移交气泡、整句重翻 —— 接缝带派发时会摘掉移交气泡那一层，并回的
+         * 译文就丢了。所以带在时保持旧行为（相邻行作为独立气泡自己渲染），带不在
+         * （整图模式 / 移交失败 / 章节首尾）时才并回。
+         */
+        allowIncomingMerge: Boolean = true,
+        /**
          * 阶段回调（2026-10-02）：给内嵌浏览器的 loading 框用。
          *
          * 为什么需要它：单张图要走「OCR → 翻译 → 擦字渲染」，RIDI/Lezhin 这种大图上实测
@@ -251,7 +263,17 @@ class WebtoonImageTranslator(
             }
             timer.mark("start", "src=${source.width}x${source.height} topH=$topH botH=$botH mode=$renderMode")
             try {
-                return translateStitched(stitched, source, topH, botH, incomingCross, timer, renderMode, onPhase)
+                return translateStitched(
+                    stitched,
+                    source,
+                    topH,
+                    botH,
+                    incomingCross,
+                    timer,
+                    renderMode,
+                    allowIncomingMerge,
+                    onPhase
+                )
             } finally {
                 if (stitched !== source && !stitched.isRecycled) stitched.recycle()
                 if (!source.isRecycled) source.recycle()
@@ -275,6 +297,7 @@ class WebtoonImageTranslator(
         incomingRaw: List<CrossBubblePart>,
         timer: TranslationTimer,
         renderMode: BrowserRenderMode,
+        allowIncomingMerge: Boolean,
         onPhase: (String) -> Unit = {}
     ): Outcome {
         val settings = ServiceLocator.settingsRepository.getSettings()
@@ -302,6 +325,22 @@ class WebtoonImageTranslator(
         // 下条带是否不够装跨缝内容（检测到就在返回时告诉调用方，由它加高条带重跑一次）。
         var stripTruncated = false
 
+        // 分片接缝（裁切线）文字归属 + 「半截字」配对，对齐 C:\homework\translator 的 seam 处理：
+        // - 整块跨下边界 → 本图（cross，剩余部分交给下一张继续画）；
+        // - 整块跨上边界 → 上一张图（本图丢弃，避免重复翻译）；
+        // - OCR 把被劈开的一行识别成上下两块时，按参考项目判据（水平重叠/行高比/间隙/合并高度
+        //   + 句子连续性）配成一句完整台词 → 解决「半截字 / 缺字 / 跨页断句」。
+        // 行高先算（收到侧交叉判据也要用，见 filterContestedIncoming）。
+        val detections = ocrResult.bubbles.mapNotNull { bubble ->
+            val outer = percentRectToPx(BubbleGeometry.outerRect(bubble), stitched.width, stitched.height)
+            if (outer.width() <= 1f || outer.height() <= 1f) return@mapNotNull null
+            val content = percentRectToPx(BubbleGeometry.contentRect(bubble), stitched.width, stitched.height)
+            SeamDetection(bubble, outer.toSeamBox(), content.toSeamBox())
+        }
+        val topBand = topH.toFloat()
+        val bottomBand = botH.toFloat()
+        val medianLineHeight = SeamTuning.medianLineHeight(detections)
+
         // 收到侧交叉判定（2026-10-03）：本图在移交气泡的目标区域**另有检出、且那检出伸出了
         // 移交框之外** → 说明这一带不只是「上一张那半句」，移交框不该盖上来。
         // 真机 `[32317270]`：移交框只覆盖本图那份检出的 34%，白框中文于是糊在本图另一个气泡上，
@@ -313,25 +352,10 @@ class WebtoonImageTranslator(
             stitched = stitched,
             topH = topH,
             sourceHeight = source.height,
+            lineHeightPx = medianLineHeight,
             timer = timer
         )
 
-        // 分片接缝（裁切线）文字归属 + 「半截字」配对，对齐 C:\homework\translator 的 seam 处理：
-        // - 整块跨下边界 → 本图（cross，剩余部分交给下一张继续画）；
-        // - 整块跨上边界 → 上一张图（本图丢弃，避免重复翻译）；
-        // - OCR 把被劈开的一行识别成上下两块时，按参考项目判据（水平重叠/行高比/间隙/合并高度
-        //   + 句子连续性）配成一句完整台词 → 解决「半截字 / 缺字 / 跨页断句」。
-        val detections = ocrResult.bubbles.mapNotNull { bubble ->
-            val outer = percentRectToPx(BubbleGeometry.outerRect(bubble), stitched.width, stitched.height)
-            if (outer.width() <= 1f || outer.height() <= 1f) return@mapNotNull null
-            val content = percentRectToPx(BubbleGeometry.contentRect(bubble), stitched.width, stitched.height)
-            SeamDetection(bubble, outer.toSeamBox(), content.toSeamBox())
-        }
-        val topBand = topH.toFloat()
-        val bottomBand = botH.toFloat()
-        // 行高先算：贴边窗口、配对间隙、合并上限、切开余量全都以它为**唯一单位**
-        // （2026-10-03 第二轮：以前这些阈值互相乘系数，一个环就整体失守 → 两个气泡被合并）。
-        val medianLineHeight = SeamTuning.medianLineHeight(detections)
         val maxCrossHeight = SeamTuning.maxCrossHeight(topBand, bottomBand, medianLineHeight)
         val edgeWindow = SeamTuning.resolveEdgeWindow(medianLineHeight)
         // 「切开余量」= A 能看到的范围（条带），不是「半行」—— 缝落在第 2 行之后时，
@@ -397,37 +421,96 @@ class WebtoonImageTranslator(
                         .joinToString(separator = " ") { "[${it.bubble.originalText}]" }
             )
         }
-        // 收到侧吸收（2026-10-03）：把「与本图移交框同一行的**本图碎片**」并进那个移交框，
-        // 并把碎片从本图自己的场景里摘掉。
+        // 收到侧吸收（2026-10-03 同行碎片 / 2026-10-11 相邻行）：把「与移交框同属一个气泡的
+        // 本图检出」并进移交框 —— 同行碎片只扩框（译文上一张已有），相邻行还要把原文并进
+        // 本次的翻译请求（见 [absorbIncomingFragments]）。
         //
         // 现场（真机 `[5467219]`）：移交框来自**上一张图**的字形轮廓，本图实际字形比它大/更靠外，
         // 而且本图自己的 OCR 会把同一行读成碎片甚至乱码（`1드하데 거리기라`，框高 <1% = 退化框）：
         //   · 移交框只盖住一部分 → 边缘**露字**（截图里的 `밖에 …!!`）；
         //   · 那条碎片既不擦也不盖 → 乱码留在画面上（截图里那行）。
         // 并进同一个框之后：一块盖板 + 一份译文，把整行盖住；碎片不再单独翻译（避免重复）。
-        val (incomingFragments, absorbedOwned) = absorbSameLineFragments(
+        // 翻译能力判定提前到这里：没有翻译引擎时相邻行不并回（并回只会得到原文回退，
+        // 不如保持旧行为让那行自己走一遍「翻译=原文」）。
+        val engine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine)
+        val useLocalEngine = engine == com.manga.translator.store.TranslateEngine.ML_KIT &&
+            ServiceLocator.localTranslator.isSupported(settings.sourceLanguage, settings.targetLanguage)
+        val missingCloudConfig = settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()
+        val absorption = absorbIncomingFragments(
             parts = incomingCross,
             owned = ownedWorth,
             stitchedWidth = stitched.width,
             stitchedHeight = stitched.height,
             topH = topH,
             sourceHeight = source.height,
-            lineHeightPx = medianLineHeight
+            lineHeightPx = medianLineHeight,
+            // ① 没有翻译引擎时并回只会得到原文回退；② 有接缝带瞄准本图时并回的译文会被
+            // 接缝带派发摘掉（见 [translateImage.allowIncomingMerge]）—— 两种情况都不并。
+            mergeAdjacentLines = allowIncomingMerge && !(missingCloudConfig && !useLocalEngine)
         )
-        val owned = if (absorbedOwned.isEmpty()) {
+        val incomingFragments = absorption.eraseFragmentBoxes
+        val absorbedOwned = absorption.absorbedOwnedIndices
+        // 框按文本行数向下扩（2026-10-11 真机 [Lezhin]）：OCR 的框经常比它装的文本**矮一半**
+        // （现场 4 行台词框高只够 2 行：`box=60x6` 装 `케이지라고요!!⏎…⏎두 가지 밖에 없는데.!`）
+        // → 擦除/清理图只擦上半，下半原文留在画面上（用户截图「清理图没了、原文露着」），
+        // 跨缝块的移交框/接缝带也同样缺一截。扩框放在 prepareVisuals 之前：擦除、贴片、
+        // 移交、接缝带全部继承同一个框；扩多的部分由墨迹精修收回（没字形就缩回），
+        // 邻居框保护防止压进下方其它气泡。
+        val ownedSource = if (absorbedOwned.isEmpty()) {
             ownedWorth
         } else {
             ownedWorth.filterIndexed { index, _ -> index !in absorbedOwned }
         }
+        val owned = ownedSource.map { ownership ->
+            ownership.copy(
+                bubble = growBubbleToTextHeight(
+                    bubble = ownership.bubble,
+                    others = ownedSource.map { it.bubble },
+                    stitchedWidth = stitched.width,
+                    stitchedHeight = stitched.height,
+                    lineHeightPx = medianLineHeight
+                )
+            )
+        }
         if (absorbedOwned.isNotEmpty()) {
             timer.mark(
                 "incoming_absorbed",
-                "absorbed=${absorbedOwned.size} parts=${incomingFragments.size} " +
+                "absorbed=${absorbedOwned.size} same_line=" +
+                    (absorbedOwned.size - absorption.adjacentByPart.values.sumOf { it.size }) +
+                    " adjacent=" + absorption.adjacentByPart.values.sumOf { it.size } +
+                    " parts=${incomingFragments.size} " +
                     "texts=" + absorbedOwned.sorted().joinToString(" ") { index ->
                         "[${ownedWorth[index].bubble.originalText.take(10)}]"
                     }
             )
         }
+        // 相邻行并回（Todolist §30「未做 #1」，对齐参考项目 `buildSeamExtendedBubbles`）：
+        // 被吸收行的**原文**并进移交气泡的原文（按纵向排序），整句重新翻译一次；译出后回填
+        // 移交气泡（`translatedText`），框扩到并集（`contentRect` / `sourceBoxPercent`）。
+        // 这样「缝落在行间」的气泡在收到侧也是**一块盖板 + 一份完整译文**，而不是上下两块
+        // 各翻各的（断行对不上、盖板接缝处叠一层 —— 用户说的「多余的残影」就是这类）。
+        // 翻译请求在下面统一发出：`owned` 的原文在前、合并原文追加在后，结果按下标切回。
+        data class MergedIncomingRequest(val partIndex: Int, val mergedOriginal: String, val union: RectF)
+        val mergedRequests = incomingCross.mapIndexed { partIndex, part ->
+            val fragments = absorption.adjacentByPart[partIndex].orEmpty()
+            if (fragments.isEmpty()) return@mapIndexed null
+            val union = RectF(part.contentRect)
+            fragments.forEach { fragment ->
+                if (fragment.box.left < union.left) union.left = fragment.box.left
+                if (fragment.box.top < union.top) union.top = fragment.box.top
+                if (fragment.box.right > union.right) union.right = fragment.box.right
+                if (fragment.box.bottom > union.bottom) union.bottom = fragment.box.bottom
+            }
+            MergedIncomingRequest(
+                partIndex = partIndex,
+                mergedOriginal = SeamIncomingGeometry.mergeAdjacentLineText(
+                    partText = part.originalText,
+                    partTop = part.contentRect.top,
+                    fragments = fragments
+                ),
+                union = union
+            )
+        }.filterNotNull()
         if (owned.isEmpty() && incomingCross.isEmpty()) {
             timer.mark("render_done", "bubbles=0 detected=${seamPlan.detected}")
             return Outcome(0, 0, 0, null, null)
@@ -481,6 +564,35 @@ class WebtoonImageTranslator(
                 if (crossTruncated) stripTruncated = true
             }
         }
+        // 句中截断的第二形态（2026-10-11 真机 [Lezhin]）：框**没**顶到拼接图底边，但框底
+        // 停在条带深处（现场：`…돌아가거나⏎두 가`，框底距拼接图底边 54px ≈ 1 行半）——下一行
+        // 只进了半截就被条带边缘切掉。移交过去就只有半句，缝下剩下的原文（本图 OCR 又没
+        // 检出来）没人擦没人翻。
+        // 判据（纯几何，2026-10-11 第二版）：跨缝气泡的框伸进了下条带、但框底距拼接图底边
+        // 不足 2 行 —— 条带明明还有内容而框停住了，大概率是 OCR 把切在句中的那行截掉了
+        // （末行不完整时框不会包到条带底边）。第一版曾要求「句尾无标点」，但真机日志的
+        // `detected_texts` 是 take(22) 截断显示，尾部有没有标点根本看不出来，条件形同虚设。
+        // 误报的代价只是一次重跑（结果只会更完整），漏报的代价是缝下留原文。
+        run {
+            val stitchedBottom = stitched.height.toFloat()
+            val lineHeight = medianLineHeight.coerceAtLeast(24f)
+            val nearEdgeFloor = stitchedBottom - 2f * lineHeight
+            val candidates = detections.withIndex().filter { (index, d) ->
+                d.outer.bottom >= nearEdgeFloor && d.outer.bottom < stitchedBottom - 1.5f &&
+                    seamPlan.verdicts.getOrNull(index)?.startsWith("cross") == true
+            }
+            if (candidates.isNotEmpty()) {
+                timer.mark(
+                    "seam_strip_sentence_cut",
+                    "band=${botH}px floor=${nearEdgeFloor.toInt()} :: " +
+                        candidates.take(3).joinToString(" ") { (_, d) ->
+                            "[${d.bubble.originalText.replace('\n', '⏎').take(16)}]" +
+                                "@${d.outer.bottom.toInt()}"
+                        }
+                )
+                stripTruncated = true
+            }
+        }
         // 每张图**认出了哪些文字**（去换行、截断到 22 字）：用户报「某句没翻译」时，
         // 第一步必须能回答「OCR 到底看没看到它」。之前只能从 erase_target 反推，
         // 而那条只覆盖「参与擦字」的气泡 —— 分组阶段被丢掉、或被并入别的块的那些句子
@@ -493,10 +605,6 @@ class WebtoonImageTranslator(
         )
 
         val pageHash = withContext(ioDispatcher) { ServiceLocator.eraseProcessor.buildPageHash(stitched) }
-        val engine = com.manga.translator.store.TranslateEngine.fromId(settings.translateEngine)
-        val useLocalEngine = engine == com.manga.translator.store.TranslateEngine.ML_KIT &&
-            ServiceLocator.localTranslator.isSupported(settings.sourceLanguage, settings.targetLanguage)
-        val missingCloudConfig = settings.translateBaseUrl.isBlank() || settings.translateApiKey.isBlank()
         // OCR 已经出结果，接下来是「翻译 + 擦字/颜色预处理」（两者并行）。
         onPhase(WebtoonPhase.TRANSLATING)
 
@@ -513,6 +621,7 @@ class WebtoonImageTranslator(
             topH = topH,
             sourceHeight = source.height,
             fragmentBoxes = incomingFragments,
+            adjacentFragmentBoxes = absorption.adjacentFragmentBoxes,
             lineHeightPx = medianLineHeight
         )
         if (crossPrepBubbles.isNotEmpty()) {
@@ -539,8 +648,41 @@ class WebtoonImageTranslator(
                 )
             }
             val glossaryEntries = ServiceLocator.glossaryRepository.activeGlossaryEntries()
+            // 翻译请求 = owned 的原文 + 相邻行并回的合并原文（追加在尾部，结果按下标切回；
+            // `resolveTranslations` 按列表顺序逐条返回，顺序/条数都与入参一致）。
+            val requestBubbles = owned.map { it.bubble } + mergedRequests.map { request ->
+                val union = request.union
+                val stitchedW = stitched.width.toFloat()
+                val stitchedH = stitched.height.toFloat()
+                val xPct = (union.left / stitchedW * 100f).coerceIn(0f, 100f)
+                val wPct = (union.width() / stitchedW * 100f).coerceIn(0f, 100f)
+                val yPct = ((union.top + topH) / stitchedH * 100f).coerceIn(0f, 100f)
+                val hPct = (union.height() / stitchedH * 100f).coerceIn(0f, 100f)
+                Bubble(
+                    x = xPct,
+                    y = yPct,
+                    w = wPct,
+                    h = hPct,
+                    bgType = if (incomingCross[request.partIndex].narration) "none" else "solid",
+                    // 合并原文只在翻译请求里用；几何是陪伴字段（缓存/日志可读）。
+                    originalText = request.mergedOriginal,
+                    translatedText = "",
+                    contentX = xPct,
+                    contentY = yPct,
+                    contentW = wPct,
+                    contentH = hPct
+                )
+            }
+            if (mergedRequests.isNotEmpty()) {
+                timer.mark(
+                    "incoming_merge_request",
+                    "count=${mergedRequests.size} texts=" + mergedRequests.joinToString(" ") { request ->
+                        "[${request.mergedOriginal.replace('\n', '⏎').take(24)}]"
+                    }
+                )
+            }
             val translateKey = translationResolver.buildTranslateKey(
-                texts = owned.map { it.bubble.originalText },
+                texts = requestBubbles.map { it.originalText },
                 settings = settings,
                 glossaryRevision = ServiceLocator.glossaryRepository.activeRevision()
             )
@@ -548,11 +690,11 @@ class WebtoonImageTranslator(
                 warning = "仅OCR（未配置翻译API）"
                 timer.mark("translate_response", "skipped=missing_translate_api")
                 merged = TranslationResult(
-                    owned.map { it.bubble.copy(translatedText = it.bubble.originalText) }
+                    requestBubbles.map { it.copy(translatedText = it.originalText) }
                 )
             } else {
                 translationResolver.resolveTranslations(
-                    bubbles = owned.map { it.bubble },
+                    bubbles = requestBubbles,
                     settings = settings,
                     translateKey = translateKey,
                     pageHash = pageHash,
@@ -573,7 +715,51 @@ class WebtoonImageTranslator(
         if (cleanupIssue != null) {
             warning = listOfNotNull(warning, cleanupIssue).joinToString(" ｜ ")
         }
-        val finalBubbles = merged?.bubbles ?: emptyList()
+        // 结果切回：前 owned.size 条是本图自己的气泡，尾部是相邻行并回的合并译文。
+        // ⚠️ finalBubbles 必须与 owned 一一对应（geometries/crossFlags 都按下标对齐）。
+        val mergedAll = merged?.bubbles.orEmpty()
+        val finalBubbles = mergedAll.take(owned.size)
+        // 相邻行并回（2026-10-11）：合并译文回填移交气泡，框扩到「移交框 ∪ 被吸收行」的并集。
+        //
+        // 为什么连框一起扩：移交框只来自上一张图看得到的那段，被吸收行在它下面 —— 框不扩，
+        // 译文按旧框排版，并进来的那行会落在框外（渲染层裁掉 = 等于没翻）。
+        // contentRect 是本图像素（顶边可为负），sourceBoxPercent 是「上一张图百分比」：
+        // y% 的口径是 100 = 上一张图底边（= 本图顶边），渲染层换算时上一张图的高度会消掉，
+        // 所以这里直接用**本图**的宽高折算即可（推导见 buildScene 的 percentBox 换算）。
+        // 字号刻意不动：接缝两侧必须同字号（上一张那半已按 fontSizePx 渲染），合并文本
+        // 多出的行由并集框装下；万一溢出，落点也是被清理图擦过的背景，不会压到原文。
+        val incomingFinal = if (mergedRequests.isEmpty()) {
+            incomingCross
+        } else {
+            val updated = incomingCross.toMutableList()
+            var applied = 0
+            mergedRequests.forEachIndexed { k, request ->
+                val translated = mergedAll.getOrNull(owned.size + k)?.translatedText?.trim().orEmpty()
+                if (translated.isBlank()) return@forEachIndexed
+                val srcWf = source.width.toFloat().coerceAtLeast(1f)
+                val srcHf = source.height.toFloat().coerceAtLeast(1f)
+                updated[request.partIndex] = updated[request.partIndex].copy(
+                    translatedText = translated,
+                    contentRect = RectF(request.union),
+                    sourceBoxPercent = floatArrayOf(
+                        request.union.left / srcWf * 100f,
+                        100f + request.union.top / srcHf * 100f,
+                        request.union.width() / srcWf * 100f,
+                        request.union.height() / srcHf * 100f
+                    )
+                )
+                applied += 1
+            }
+            timer.mark(
+                "incoming_merge",
+                "requests=${mergedRequests.size} applied=$applied texts=" +
+                    mergedRequests.joinToString(" ") { request ->
+                        val index = owned.size + mergedRequests.indexOf(request)
+                        "[${mergedAll.getOrNull(index)?.translatedText?.take(16).orEmpty()}]"
+                    }
+            )
+            updated
+        }
         val crossFlags = owned.map { it.cross }
         // 译文的「擦字 + 画字」准备与场景/成图渲染（loading 框的最后一段）。
         onPhase(WebtoonPhase.RENDERING)
@@ -596,6 +782,10 @@ class WebtoonImageTranslator(
             timer.mark("ink_tilt", probe)
             pendingTiltProbe = null
         }
+        pendingOutlineProbe?.let { probe ->
+            timer.mark("cover_outline", probe)
+            pendingOutlineProbe = null
+        }
 
         // 覆盖层模式：把「擦掉原文 → 画上译文」下发给 WebView 的 DOM 渲染层
         // （场景 = 百分比几何 + 颜色 + 原字高 + 清理图 URL）；整图模式：照旧渲染成图 PNG。
@@ -605,7 +795,7 @@ class WebtoonImageTranslator(
         if (renderMode == BrowserRenderMode.DOM_SCENE) {
             scene = runCatching {
                 withContext(ioDispatcher) {
-                    buildScene(source, topH, finalBubbles, geometries, finalPrep, incomingCross, crossFlags)
+                    buildScene(source, topH, finalBubbles, geometries, finalPrep, incomingFinal, crossFlags)
                 }
             }.getOrElse { err ->
                 timer.mark("render_scene_fail", "reason=${err.javaClass.simpleName}:${err.message?.take(60)}")
@@ -614,8 +804,12 @@ class WebtoonImageTranslator(
             timer.mark(
                 "render_scene",
                 if (scene != null) {
-                    "owned=${finalBubbles.size} incoming=${incomingCross.size} " +
-                        "cleaned=${scene.cleanedUrl != null} patches=${incomingCross.count { it.patchUrl != null }}"
+                    // cleaned = 场景带整页清理图；patches = 跨图续排的贴片盖板数；
+                    // flat = 用**不透明实底**盖住原文的气泡数（关闭「精细擦字」时旁白走这条）。
+                    "owned=${finalBubbles.size} incoming=${incomingFinal.size} " +
+                        "cleaned=${scene.cleanedUrl != null} " +
+                        "patches=${scene.bubbles.count { it.patchUrl != null }} " +
+                        "flat=${scene.bubbles.count { it.flatCover }}"
                 } else {
                     "fallback=full_png"
                 }
@@ -623,7 +817,7 @@ class WebtoonImageTranslator(
         }
         if (scene == null) {
             val renderResult = withContext(ioDispatcher) {
-                renderSlice(source, topH, finalBubbles, finalPrep, incomingCross, geometries)
+                renderSlice(source, topH, finalBubbles, finalPrep, incomingFinal, geometries)
             }
             val output = renderResult.first
             // 字号诊断：`字号/原文行高`，核对「译文字号是否和原文一致」（用户 2026-09-28 要求）。
@@ -663,6 +857,17 @@ class WebtoonImageTranslator(
                 val fontSize = geometry.fixedFontPx
                 if (fontSize == null || patch == null || patch.bitmap.isRecycled) {
                     crossProbe.append("i$index:no_patch ")
+                    return@forEachIndexed
+                }
+                // 译文回退成原文（翻译失败/乱码原文）的跨缝块不移交、不进接缝带（2026-10-11）：
+                // 接缝带会把它当「译文」整块画上去 —— 用户看到的就是乱码原文印在面板上
+                // （现场 `1드하데 거리기라→1드하데 거리기라`）。跳过后该区域由下一张图自己的
+                // 检出兜底，比盖一层乱码好。OCR-only 模式（本来就拿原文当译文）不适用。
+                val untranslated = !(missingCloudConfig && !useLocalEngine) &&
+                    (bubble.translatedText.isBlank() ||
+                        bubble.translatedText.trim() == bubble.originalText.trim())
+                if (untranslated) {
+                    crossProbe.append("i$index:untranslated ")
                     return@forEachIndexed
                 }
                 val subTop = maxOf(patch.srcRect.top, bottomLimit)
@@ -745,7 +950,27 @@ class WebtoonImageTranslator(
                     ),
                     fontSizePx = fontSize,
                     alignment = bubble.alignment,
-                    sourceBoxPercent = geometry.boxPercent,
+                    // ⚠️ boxPercent 是**拼接图**坐标系的百分比（分母 = 拼接高，含上/下条带），
+                    // 而下一张图换算时按「上一张**本图**高」解（见 crossBubbles 的 topPx 公式，
+                    // sourceHeightPx = source.height）。两者对「完全落在下条带里的框」会差出
+                    // 一个坐标系：真机 gamesal 7/8 页，跨缝泡 c0 被换到页面外（-13.7%），下一张
+                    // 「已被移交」的抑制判据（isHandedOverByIncoming，用 contentRect，是对的）
+                    // 因此失配 → 缝上残行被下一张又认领又翻一遍，叠在接缝带译文上。
+                    // 这里统一换算成**本图系**百分比（y 减 topH、y/h 分母换成 source 高），
+                    // 与 contentRect / patchDest 同一口径。
+                    sourceBoxPercent = geometry.boxPercent.let { pct ->
+                        if (pct.size == 4 && stitched.height > 0 && source.height > 0) {
+                            val topPx = pct[1] / 100f * stitched.height - topH
+                            floatArrayOf(
+                                pct[0],
+                                topPx / source.height * 100f,
+                                pct[2],
+                                pct[3] * stitched.height / source.height
+                            )
+                        } else {
+                            pct
+                        }
+                    },
                     sourceWidthPx = source.width,
                     sourceHeightPx = source.height,
                     // 移交下一张图的轮廓必须和**本图盖板**同源，否则接缝两侧会各画一块大小
@@ -757,7 +982,22 @@ class WebtoonImageTranslator(
                     // 再扩 15%）当盖板 → 比本图那块大 30%，肉眼就是「上面/下面两个盖板不一样宽」。
                     // [FinalBubble.regionPolygonPercent] 两种情形都有值且语义就是「字形 + 几像素」：
                     // 有倾角时是外扩后的四边形，轴对齐时是外扩后的矩形四角。
-                    sourcePolygon = geometry.regionPolygonPercent
+                    //
+                    // y 同 sourceBoxPercent：从拼接系换算成上一张**本图系**（y 减 topH、分母换
+                    // source 高）—— 下一张的 `flat[i] - 100f` 假设输入是本图系百分比。
+                    sourcePolygon = geometry.regionPolygonPercent?.let { flat ->
+                        if (flat.size == 8 && stitched.height > 0 && source.height > 0) {
+                            List(flat.size) { i ->
+                                if (i % 2 == 1) {
+                                    (flat[i] / 100f * stitched.height - topH) / source.height * 100f
+                                } else {
+                                    flat[i]
+                                }
+                            }
+                        } else {
+                            flat
+                        }
+                    }
                 )
             }
         }
@@ -797,17 +1037,17 @@ class WebtoonImageTranslator(
         finalPrep.patchesByBubbleId.values.forEach { patch ->
             if (!patch.bitmap.isRecycled) patch.bitmap.recycle()
         }
-        incomingCross.forEach { part -> runCatching { part.patchBitmap.recycle() } }
+        incomingFinal.forEach { part -> runCatching { part.patchBitmap.recycle() } }
         // 清理图：整图模式在贴片里用完即弃；覆盖层模式 buildScene 已导出为 JPEG，
         // 这里统一回收（导出用的是裁剪副本，原图位图必须由本方法负责释放）。
         finalPrep.cleanedImage?.let { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() }
         timer.mark(
             "render_done",
-            "bubbles=${finalBubbles.size} incoming=${incomingCross.size} crossOut=${crossOut.size} " +
+            "bubbles=${finalBubbles.size} incoming=${incomingFinal.size} crossOut=${crossOut.size} " +
                 "seam=${seam?.bubbles?.size ?: 0} mode=$renderMode png=${png?.size ?: 0}B"
         )
         return Outcome(
-            bubbleCount = finalBubbles.size + incomingCross.size,
+            bubbleCount = finalBubbles.size + incomingFinal.size,
             cacheHitCount = cacheStats.hitCount,
             cacheTotalCount = cacheStats.total,
             warningMessage = warning,
@@ -1010,11 +1250,18 @@ class WebtoonImageTranslator(
         crossFlags: List<Boolean> = emptyList()
     ): BrowserSceneBuilder.Scene {
         val cleanedUrl = exportCleanedImage(prep.cleanedImage, topH, source.height)
+        // 没有纹理来源 → 旁白/透明块（bg=none）改用**不透明实底盖板**：直接铺采样出来的气泡
+        // 底色把原文盖死。触发条件有两类 —— ①速度优先模式（关闭「精细擦字」，本来就不建清理图）；
+        // ②清理图构建/导出失败。用户 2026-10-11 原话：「现在会有残影。不要这样的，而是用实体的
+        // 背景遮挡」—— 贴片（局部边缘填充）边缘必然留残影，纯色块虽丢纹理但绝不会露原文。
+        // 纯色气泡不需要：渲染层给它们画的就是采样底色平涂（.mt-bg-solid::before）。
+        val useFlatCover = cleanedUrl == null
         val srcH = source.height
         val ownedBubbles = bubbles.mapIndexedNotNull { index, bubble ->
             val geometry = geometries.getOrNull(index) ?: return@mapIndexedNotNull null
             val colors = prep.colors[index] ?: BubbleColors(Color.BLACK, Color.WHITE)
             val box = geometry.boxPercent
+            val flatCover = useFlatCover && !bubble.bgType.equals("solid", ignoreCase = true)
             BrowserSceneBuilder.SceneBubble(
                 id = "b$index",
                 x = box[0], y = box[1], w = box[2], h = box[3],
@@ -1049,7 +1296,8 @@ class WebtoonImageTranslator(
                 // 盖板还在下面」。更糟的是「整块落在下条带里」的移交块：它的框在本图之外
                 // （y 夹到 100%），锚点被夹回来之后会在页脚画出一行假译文。
                 // 打开开关后：锚点按真实框走，超出画面的部分由 root 的 `overflow:hidden` 裁掉。
-                stitchOverflow = crossFlags.getOrElse(index) { false }
+                stitchOverflow = crossFlags.getOrElse(index) { false },
+                flatCover = flatCover
             )
         }
         val crossBubbles = incomingCross.mapIndexed { index, part ->
@@ -1153,8 +1401,8 @@ class WebtoonImageTranslator(
      * 关键区分（2026-09-30「扩张太大超出气泡框」的修法）：
      * - [maskRect] / [maskPolygonPercent]：**字形**范围（墨迹紧包围框 / 最小外接四边形）——
      *   遮罩、实底填充裁剪、擦字都用它，绝不超出气泡；
-     * - [layoutRect] / [boxPercent]：**排版框** = 字形框朝气泡方向扩一圈（给译文留余地、
-     *   字号不被压小），只用于译文排版与字号拟合。
+     * - [layoutRect] / [boxPercent]：**排版框** = 字形框原样（2026-10-14 用户规则：译文
+     *   位置/字号以原文为基准，装不下才由渲染层缩字号），只用于译文排版与字号拟合。
      */
     private data class FinalBubble(
         val layoutRect: RectF,
@@ -1193,6 +1441,7 @@ class WebtoonImageTranslator(
         topH: Int
     ): List<FinalBubble?> {
         resetTiltProbe()
+        resetOutlineProbe()
         val result = bubbles.mapIndexed { index, bubble ->
             val refinedRect = prep.contentRects[index]
             if (refinedRect == null || refinedRect.width() <= 2f || refinedRect.height() <= 2f) {
@@ -1205,15 +1454,52 @@ class WebtoonImageTranslator(
             // 这里取「精修框 ∪ 未精修 OCR 框」，保证窗口不小于 OCR 原始框。
             val tiltWindow = unionRect(refinedRect, prep.ocrRects[index])
             val vertical = bubble.layout.equals("vertical", ignoreCase = true)
+            // -----------------------------------------------------------------
+            // 逐行框（2026-10-14「字号以原文为基准」）：ML Kit 自带每行 boundingBox，
+            // 并集 = 真实字形区。块级框偏松（含行距/内边距），粘到气泡描边时 OTSU
+            // 墨迹收紧也收不动（描边被当成墨迹）→ 遮罩/盖板/字号基线全被撑大
+            // （真机实测：4 行泡 lineH=45.3、相邻 5 行泡 34.9，译文比原文大 1/3、
+            // 白盖板戳出气泡下沿 —— 用户截图）。有逐行框时：
+            // - 字形区 = 行框并集（横排）；斜排仍用墨迹最小外接矩形（行框在斜排下
+            //   同样是 AABB，并集不比块框紧）；
+            // - 字号基线 = 行高中位数（见下方 lineHeightPx）。
+            // Paddle / 跨缝合并泡拿不到逐行框 → null，行为与改动前一致。
+            // -----------------------------------------------------------------
+            val lineBoxesPx = bubble.lineBoxes
+                ?.filter { it.size == 4 && it.all { v -> v.isFinite() } }
+                ?.map { lb ->
+                    RectF(
+                        lb[0] / 100f * stitched.width,
+                        lb[1] / 100f * stitched.height,
+                        lb[2] / 100f * stitched.width,
+                        lb[3] / 100f * stitched.height
+                    )
+                }
+                ?.filter { it.width() > 1f && it.height() > 1f }
+                ?.takeIf { it.isNotEmpty() }
+            val lineUnion = lineBoxesPx?.let { boxes ->
+                RectF(boxes[0]).apply {
+                    for (i in 1 until boxes.size) union(boxes[i])
+                }
+            }
             // ML Kit 的文字框是「块级」的、偏松（含行距/内边距），PaddleOCR 给的是紧贴字形的四边形。
-            // 只对**没有四边形**的气泡走墨迹几何。
+            // 只对**没有四边形**的气泡走墨迹几何。有逐行框时收紧窗口换成行框并集：
+            // 窗口不再含气泡描边，收紧只服务于斜排四边形，失败也不伤框本身。
             val inkGeometry = if (bubble.polygon == null) {
-                resolveInkGeometry(stitched, rawRect, tiltWindow, vertical)
+                resolveInkGeometry(stitched, lineUnion ?: rawRect, tiltWindow, vertical)
             } else {
                 tiltProbe.append("has_quad(${bubble.polygon?.size ?: 0}) ")
                 null
             }
-            val maskRect = inkGeometry?.rect ?: rawRect
+            val maskRect = when {
+                lineUnion == null -> inkGeometry?.rect ?: rawRect
+                inkGeometry?.quad != null -> inkGeometry.rect
+                else -> lineUnion
+            }
+            // 原文行数：**检测器给出的行数**（ML Kit = `block.lines`，`countVisualLines` 现在会把
+            // 块内行数按组求和）。此前「两行并成一个块」会被算成 1 行 → 「框高 ÷ 行数」翻倍 →
+            // `font_height_percent` 翻倍 → 译文比原文大一大截、整块戳出气泡
+            // （用户 2026-10-14：「超出太多了吧」）。详见 `TextLayoutMetrics.countVisualLines`。
             val lineCount = renderer.resolveSourceLineCount(bubble.sourceLineCount, bubble.originalText)
             val ocrPolygon = TextQuadGeometry.stitchedPolygonToSource(
                 polygon = bubble.polygon,
@@ -1241,17 +1527,65 @@ class WebtoonImageTranslator(
             // 字号被渲染层 FONT_MIN 兜在 10px，再叠上 1.8px 白描边 → 用户看到的是
             // 「倾斜的文本看不清（像空心白字）」。所以量厚度前必须先按原图尺寸换算成像素。
             val quadThicknessPx = percentQuadThicknessPx(maskQuadSource, srcW, srcH)
-            val lineHeightPx = if (quadThicknessPx > 2f) {
-                quadThicknessPx / lineCount.coerceAtLeast(1)
-            } else {
-                renderer.originalLineHeightPx(
-                    contentHeightPx = maskRect.height(),
-                    sourceLineCount = lineCount,
-                    contentWidthPx = maskRect.width(),
-                    vertical = vertical
+            val fallbackLineHeightPx = renderer.originalLineHeightPx(
+                contentHeightPx = maskRect.height(),
+                sourceLineCount = lineCount,
+                contentWidthPx = maskRect.width(),
+                vertical = vertical
+            )
+            // 字号基线：斜排四边形厚度 → 逐行框中位数（横排行高 / 竖排列宽）→
+            // 块框 ÷ 行数（老口径兜底）。前两档都紧贴字形，「块框 ÷ 行数」会被
+            // 块框松弛放大（见上方 lineBoxesPx 注释）。
+            val lineHeightPx = when {
+                quadThicknessPx > 2f -> quadThicknessPx / lineCount.coerceAtLeast(1)
+                lineBoxesPx != null -> {
+                    val median = TextLayoutMetrics.medianLineBoxDimPx(
+                        lineBoxesPx.map { floatArrayOf(it.left, it.top, it.right, it.bottom) },
+                        vertical
+                    )
+                    if (median > 2f) median else fallbackLineHeightPx
+                }
+                else -> fallbackLineHeightPx
+            }
+            // -----------------------------------------------------------------
+            // 排版框（2026-10-14 用户规则）：**就是字形框原样**，一个像素都不动。
+            //
+            // 译文的位置和字号都以原文为基准——原文在哪个位置、字号多大，译文就在哪个
+            // 位置、字号多大。对 layoutRect 的任何加工（外扩/收窄/削高）都是在挪译文，
+            // 一律不做。唯一允许的调整是「译文按原文字号装不下时，渲染层自适应缩小字号」
+            // （JS fitBubbleFontSize：原字高起步、装不下二分收小）；字号基线 [lineHeightPx]
+            // 来自四边形厚度/字形框，本就不受排版框影响。
+            //
+            // 历史（勿回加）：
+            // - 字形框 ∓0.2 行高（descender 余量）→ 已删：外扩等于给译文多让地；
+            // - interiorCap 横向扩到 1.3×/容器宽 → 已删：译文行铺到原文宽度之外，
+            //   白底同色页面上直接戳出气泡（「文字超出气泡框」的来源之一）；
+            // - interiorCap 纵向削到容器高 → 已删：这就是纵向收窄；
+            // - 2026-10-12 固定横向收窄 ∓0.2 行高 → 用户真机对比判定负优化（악질들泡
+            //   译文第一行被接缝盖板裁掉一截），当天已回退。
+            // interiorCap 的逐行扫描**保留**，但只喂给盖板轮廓裁剪（见下方
+            // regionPolygonPercent，防椭圆收腰白肩），与译文排版无关。
+            // -----------------------------------------------------------------
+            val layoutRect = RectF(maskRect)
+            // ⚠️ 容器扫描的输入必须是**宽松框**（精修后的内容框），不能跟排版框一起换成
+            // 行框并集：扫描从框中心逐行向外量「底色弦宽」，行框紧贴文字时每一行都穿过
+            // 笔画（桥接上限只有框高 ×0.22），密集韩文行直接把弦宽卡成几十像素的窄条 →
+            // 盖板轮廓多边形退化成窄缝，实底填充被裁没（2026-10-14 어린아이 泡实测：
+            // 原文全露、译文底下无盖板）。这个扫描只服务盖板轮廓，与排版无关。
+            val interiorCap = resolveInteriorCap(
+                stitched = stitched,
+                glyphRect = rawRect,
+                lineCount = lineCount,
+                colors = prep.colors[index],
+                bubble = bubble
+            )
+            if (interiorCap != null) {
+                tiltProbe.append(
+                    "|b$index interior_cap(cover_outline_only)=${interiorCap.widthPx.toInt()}" +
+                        "x${interiorCap.heightPx?.toInt() ?: -1} " +
+                        "mid=${interiorCap.midWidthPx.toInt()} "
                 )
             }
-            val layoutRect = growTowardOuter(maskRect, outerRectPx(bubble, stitched))
             // 字号输入诊断（2026-09-30 用户反馈「倾斜的文本看不清」）：
             // 真机上 `font_height_percent` 只有 3.13%（真值 11.09%），字号被 FONT_MIN 兜住 = 10px。
             // 只打最终字号是查不出「四边形厚度算错还是 srcH 口径不对」的，这里把三个输入全打出来。
@@ -1259,6 +1593,7 @@ class WebtoonImageTranslator(
                 "|b$index lineH=${"%.1f".format(lineHeightPx)}" +
                     " quad=${"%.1f".format(quadThicknessPx)}" +
                     " lines=$lineCount" +
+                    " lb=${lineBoxesPx?.size ?: 0}" +
                     " mask=${"%.0f".format(maskRect.width())}x${"%.0f".format(maskRect.height())}" +
                     " src=${srcW}x$srcH stitch=${stitched.width}x${stitched.height}" +
                     " topH=$topH poly=${bubble.polygon?.size ?: 0}" +
@@ -1327,7 +1662,7 @@ class WebtoonImageTranslator(
             // 斜排（≥3°）时下沿口径失效：世界坐标的「下沿」不等于文字的「下沿」（文字是斜的），
             // 强行只加下沿会把四边形拉歪。斜排气泡因此只吃均匀的那一档（ML Kit 档本就比
             // 有四边形时大一档），见 `coverPadPxFor`。
-            val regionPolygonPercent = paddedQuadPercent ?: BrowserSceneBuilder.expandPercentBoxByPx(
+            val defaultRegionPolygon = paddedQuadPercent ?: BrowserSceneBuilder.expandPercentBoxByPx(
                 maskRectPercent,
                 coverPadPx,
                 srcW,
@@ -1341,6 +1676,45 @@ class WebtoonImageTranslator(
                     rect[0], rect[1] + rect[3]
                 )
             }
+            // 纯色盖板轮廓（2026-10-14 加固，用户报「锯齿 + 盖不住原文」）：
+            // 纯色盖板是**矩形**，按容器逐行轮廓裁一下（左侧上→下、右侧下→上），
+            // 否则椭圆/圆角气泡收腰处会在轮廓外露出一块白肩（2026-10-13 真机夹具实测：
+            // 445px 宽的文字框在椭圆上沿比轮廓宽 18px/侧）。
+            //
+            // 加固三条（详见 [CoverOutlinePolygon]）：①墨迹守卫——落在文字行带内的行
+            // 不许窄于该行带的字形框（否则裁切切进字形区，缺口处原文/背景透出来）；
+            // ②邻行外抹平——单行噪声尖刺向邻行看齐（去锯齿）；③整体外扩。
+            // 轮廓不可信（行退化/可用行不足）时返回 null，落回矩形/四边形轮廓。
+            val wantsCoverOutline = interiorCap?.hasOutline == true &&
+                bubble.bgType.equals("solid", ignoreCase = true)
+            val coverOutline = if (wantsCoverOutline) {
+                CoverOutlinePolygon.build(
+                    profileRowsPx = interiorCap!!.profileRowsPx,
+                    coverTopPx = maskRect.top - coverPadPx,
+                    coverBottomPx = maskRect.bottom + coverPadBottomPx,
+                    inkBands = inkBandsForOutline(lineBoxesPx, maskRect),
+                    dilatePx = outlineDilatePx(lineHeightPx),
+                    stitchedWidthPx = stitched.width,
+                    srcHeightPx = srcH,
+                    topStripHeightPx = topH,
+                    minChordRatio = OUTLINE_ROW_MIN_CHORD_RATIO
+                )
+            } else {
+                null
+            }
+            if (wantsCoverOutline) {
+                outlineProbe.append(
+                    if (coverOutline == null) {
+                        "b$index=fallback "
+                    } else {
+                        val diag = coverOutline.diag
+                        "b$index=rows${diag.rowsTotal}/drop${diag.rowsDropped}" +
+                            "/clamp${diag.rowsInkClamped}(+${diag.maxInkDeficitPx.toInt()}px)" +
+                            "/dil${diag.dilatePx.toInt()} "
+                    }
+                )
+            }
+            val regionPolygonPercent = coverOutline?.pointsPercent ?: defaultRegionPolygon
             // 盖板外框 = 轮廓的外接框（四边形的外接框已经含了那几像素外扩）。
             val coverBoxPercent = paddedQuadPercent?.let { percentQuadBounds(it) }
                 ?: BrowserSceneBuilder.expandPercentBoxByPx(
@@ -1376,6 +1750,7 @@ class WebtoonImageTranslator(
             )
         }
         flushTiltProbe()
+        flushOutlineProbe()
         return result
     }
 
@@ -1444,6 +1819,7 @@ class WebtoonImageTranslator(
         stitched: Bitmap,
         topH: Int,
         sourceHeight: Int,
+        lineHeightPx: Float,
         timer: TranslationTimer
     ): List<CrossBubblePart> {
         if (parts.isEmpty() || localBubbles.isEmpty()) return parts
@@ -1472,9 +1848,29 @@ class WebtoonImageTranslator(
                     val ix = (minOf(right, bRight) - maxOf(left, bLeft)).coerceAtLeast(0f)
                     val iy = (minOf(bottom, bBottom) - maxOf(top, bTop)).coerceAtLeast(0f)
                     val coverage = (ix * iy) / bArea
-                    coverage >= INCOMING_CONTEST_MIN_OVERLAP &&
-                        coverage < SeamTuning.SUPPRESS_INCOMING_OVERLAP &&
-                        !textExplainedByHandoff(bubble.originalText, part.originalText)
+                    if (coverage < INCOMING_CONTEST_MIN_OVERLAP ||
+                        coverage >= SeamTuning.SUPPRESS_INCOMING_OVERLAP
+                    ) return@firstOrNull false
+                    if (textExplainedByHandoff(bubble.originalText, part.originalText)) {
+                        return@firstOrNull false
+                    }
+                    // 同句重读豁免（2026-10-11 真机 [Lezhin]）：本图把「条带里那几行 + 缝下
+                    // 本图的行」读成一个框，它与移交原文只有部分字符重合（移交框只装了上半，
+                    // 实测 sim=0.67 < 0.7 被旧判据丢掉）—— 但几何上它就是同一句：
+                    // ①框伸进了上条带（bTop < 0，含上一张的内容）；
+                    // ②横向与移交框同列（±15%）；
+                    // ③缝以下的部分几乎完全被移交框覆盖（≥90%）。
+                    // 这种形态丢了移交，移交带来的那几行（本图 OCR 往往根本没检出来）就
+                    // 没人擦没人翻 —— 截图里「缝下整段原文还留着」正是这条。
+                    // 反例守卫（[32317270]）：本图检出横向伸出移交框（x 83 vs 187，超 15%），
+                    // 不是同列 → 不豁免 → 照旧丢弃。
+                    !isSameBubbleReRead(
+                        localLeft = bLeft, localRight = bRight, localTop = bTop,
+                        localBottom = bBottom,
+                        incomingLeft = left, incomingRight = right,
+                        incomingTop = top, incomingBottom = bottom,
+                        heightF = heightF
+                    )
                 }
             }
             if (contested == null) {
@@ -1495,6 +1891,38 @@ class WebtoonImageTranslator(
     }
 
     /**
+     * 本图检出是不是「同一句被条带 + 本图上下两半合并后的重读」：
+     * ①框伸进上条带（localTop < 0）；②横向与移交框同列（左右各 ±15% 以内）；
+     * ③缝以下的部分被移交框覆盖 ≥90%。三条同时成立才豁免（判据与现场数字见调用点注释）。
+     */
+    private fun isSameBubbleReRead(
+        localLeft: Float,
+        localRight: Float,
+        localTop: Float,
+        localBottom: Float,
+        incomingLeft: Float,
+        incomingRight: Float,
+        incomingTop: Float,
+        incomingBottom: Float,
+        heightF: Float
+    ): Boolean {
+        if (localTop >= 0f) return false
+        val incomingWidth = (incomingRight - incomingLeft).coerceAtLeast(1f)
+        val tolerance = incomingWidth * 0.15f
+        if (kotlin.math.abs(localLeft - incomingLeft) > tolerance ||
+            kotlin.math.abs(localRight - incomingRight) > tolerance
+        ) return false
+        val visibleTop = maxOf(localTop, 0f)
+        val visibleBottom = minOf(localBottom, heightF)
+        val visibleArea = (localRight - localLeft).coerceAtLeast(0f) *
+            (visibleBottom - visibleTop).coerceAtLeast(0f)
+        if (visibleArea <= 0f) return false
+        val ix = (minOf(incomingRight, localRight) - maxOf(incomingLeft, localLeft)).coerceAtLeast(0f)
+        val iy = (minOf(incomingBottom, visibleBottom) - maxOf(incomingTop, visibleTop)).coerceAtLeast(0f)
+        return (ix * iy) / visibleArea >= 0.9f
+    }
+
+    /**
      * 本图的这段文字能否用**上一张移交的原文**解释（= 同一句话的残缺/变体读法）。
      *
      * 判据与取值依据见 [HandoffTextMatch]（纯逻辑，可 JVM 单测）：
@@ -1509,25 +1937,54 @@ class WebtoonImageTranslator(
         HandoffTextMatch.overlap(localText, handoffOriginalText)
 
     /**
-     * 收到侧吸收：找出「与某个移交框**同一行**的本图检出」，返回
-     * ① 每个移交框要并进来的碎片框（本图坐标）；② 这些检出在 `owned` 里的下标（要从本图场景里摘掉）。
+     * 收到侧吸收：找出「与某个移交框同属一个气泡的本图检出」，返回
+     * ① 每个移交框要并进来的碎片框（本图坐标，擦字/盖板扩到并集用）；
+     * ② 这些检出在 `owned` 里的下标（要从本图场景里摘掉）；
+     * ③ 其中「相邻行」碎片按移交框分组的明细（带原文，译文并回 winner 用）。
      *
-     * 判据见 [SeamIncomingGeometry.isSameLineFragment]（横向重叠 ≥40% + 纵向一行以内）：
-     * 并排的另一个气泡横向几乎不重叠，因此不会被误吸收。
+     * 两种形态（判据都在 [SeamIncomingGeometry]）：
+     * - **同一行的两半**（[SeamIncomingGeometry.isSameLineFragment]）：移交气泡的译文来自
+     *   上一张的拼接 OCR（它看到过整行），本图碎片只是同一行的另一种读法 —— 摘掉即可，
+     *   文字不用并回；
+     * - **同一气泡的相邻行**（[SeamIncomingGeometry.isAdjacentLineFragment]，2026-10-11 补齐
+     *   Todolist §30「未做 #1」）：缝落在行与行之间时，移交气泡只盖住前几行，本图检出的
+     *   是同一气泡的下一行 —— 摘掉之外**原文必须并进翻译请求**，否则那行没人翻。
+     *
+     * [mergeAdjacentLines] 为假（OCR-only 模式：没有翻译能力，并回只会得到原文回退）时
+     * 相邻行不吸收，保持旧行为（那行作为独立气泡自己走一遍「翻译=原文」）。
      *
      * 纯几何 + 纯计算，与 `crossPrepareBubbles`（要 Bitmap）分开，便于单测钉住真机数字。
      */
-    private fun absorbSameLineFragments(
+    private class IncomingAbsorption(
+        /** 同行碎片的框（本图坐标）——交给 `expandForAdjacentFragments` 固定点并框。 */
+        val eraseFragmentBoxes: Map<Int, List<SeamIncomingGeometry.Box>>,
+        /**
+         * 相邻行的框（本图坐标）——**普通并集、不参与固定点链式扩框**。
+         *
+         * 为什么不能链式：链式并掉一行后框下移，下一行又变得「相邻」—— 整段会被逐行吞进
+         * 擦除框，而这些行没有并进翻译请求（吸收判据只认移交框紧邻的那一两行）→
+         * 擦掉却没人翻。并回判据（[SeamIncomingGeometry.isAdjacentLineFragment] 对**移交框**
+         * 判）与扩框集合必须严格同集。
+         */
+        val adjacentFragmentBoxes: Map<Int, List<SeamIncomingGeometry.Box>>,
+        /** 被吸收的 owned 下标（ownedWorth 坐标系）——从本图场景摘掉。 */
+        val absorbedOwnedIndices: Set<Int>,
+        /** 每个移交框吸收的「相邻行」碎片（带原文）——译文并回 winner 用。 */
+        val adjacentByPart: Map<Int, List<SeamIncomingGeometry.AbsorbedFragment>>
+    )
+
+    private fun absorbIncomingFragments(
         parts: List<CrossBubblePart>,
         owned: List<SeamOwnership>,
         stitchedWidth: Int,
         stitchedHeight: Int,
         topH: Int,
         sourceHeight: Int,
-        lineHeightPx: Float
-    ): Pair<Map<Int, List<SeamIncomingGeometry.Box>>, Set<Int>> {
+        lineHeightPx: Float,
+        mergeAdjacentLines: Boolean
+    ): IncomingAbsorption {
         if (parts.isEmpty() || owned.isEmpty()) {
-            return emptyMap<Int, List<SeamIncomingGeometry.Box>>() to emptySet()
+            return IncomingAbsorption(emptyMap(), emptyMap(), emptySet(), emptyMap())
         }
         val widthF = stitchedWidth.toFloat()
         val stitchedH = stitchedHeight.toFloat()
@@ -1550,19 +2007,84 @@ class WebtoonImageTranslator(
             )
         }
         val fragments = HashMap<Int, MutableList<SeamIncomingGeometry.Box>>()
+        val adjacentBoxes = HashMap<Int, MutableList<SeamIncomingGeometry.Box>>()
+        val adjacentLines = HashMap<Int, MutableList<SeamIncomingGeometry.AbsorbedFragment>>()
         val absorbed = HashSet<Int>()
         owned.forEachIndexed { index, detection ->
             val box = bubbleBox(detection.bubble)
             if (box.width <= 0f || box.height <= 0f) return@forEachIndexed
+            // 同行优先：两半的框基本叠在一起，相邻行判据会把它挡在外面，但显式先判更稳。
             val partIndex = partBoxes.indexOfFirst { partBox ->
                 SeamIncomingGeometry.isSameLineFragment(partBox, box, lineHeightPx)
             }
             if (partIndex >= 0) {
                 fragments.getOrPut(partIndex) { mutableListOf() } += box
                 absorbed += index
+                return@forEachIndexed
+            }
+            if (!mergeAdjacentLines) return@forEachIndexed
+            val adjacentIndex = partBoxes.indexOfFirst { partBox ->
+                SeamIncomingGeometry.isAdjacentLineFragment(partBox, box, lineHeightPx)
+            }
+            if (adjacentIndex >= 0) {
+                adjacentBoxes.getOrPut(adjacentIndex) { mutableListOf() } += box
+                adjacentLines.getOrPut(adjacentIndex) { mutableListOf() } +=
+                    SeamIncomingGeometry.AbsorbedFragment(
+                        ownedIndex = index,
+                        box = box,
+                        originalText = detection.bubble.originalText
+                    )
+                absorbed += index
             }
         }
-        return fragments.toMap() to absorbed
+        return IncomingAbsorption(
+            eraseFragmentBoxes = fragments.toMap(),
+            adjacentFragmentBoxes = adjacentBoxes.toMap(),
+            absorbedOwnedIndices = absorbed,
+            adjacentByPart = adjacentLines.toMap()
+        )
+    }
+
+    /**
+     * 把「框比文本矮」的气泡框向下扩到装得下文本（2026-10-11，见调用点注释）。
+     *
+     * 行数口径（2026-10-12 收紧）：**只按原文硬换行数**，行高用全页中位行高。
+     *
+     * 为什么撤掉「每行按宽度可容纳字数」的折行估算（2026-10-12 用户截图
+     * 게임은 살인이다 第 1 话 + 渲染层 CDP 实测 `origH_pct=4.51`）：
+     * 单行小字气泡（OCR 框 316×25px，全页中位行高 36px）被按中位行高估字宽
+     * （36×0.72≈26px/字），14 个字折成 2 行 → 框撑到 ~108px 高。扩出来的区域
+     * 撞上气泡描边，墨迹精修把描边当墨迹收不回 → `lineH=108` →
+     * `font_height_percent=4.5%`（真值 1.04%）→ 译文渲染大 4 倍、白盖板伸出气泡外。
+     * 折行本来就是给「原文行宽超过 OCR 框宽」兜底的 —— 而原文行宽 ≤ 框宽是 OCR 的
+     * 量测结果，这个兜底只会在小字气泡上误伤。需要补的只有「框高 < 硬行数 × 行高」
+     * （2026-10-11 的原始现场：4 行台词框高只够 2 行），硬行数本身就够 —— 而且用中位
+     * 行高算 2312+4×43×1.2=2518，比当年折行版（2570 被邻居夹到 2520）更贴真实底边。
+     */
+    private fun growBubbleToTextHeight(
+        bubble: Bubble,
+        others: List<Bubble>,
+        stitchedWidth: Int,
+        stitchedHeight: Int,
+        lineHeightPx: Float
+    ): Bubble {
+        val rect = percentRectToPx(BubbleGeometry.outerRect(bubble), stitchedWidth, stitchedHeight)
+        val hardLineCount = bubble.originalText.split('\n', '\r').count { it.isNotBlank() }
+        val otherRects = others.mapNotNull {
+            if (it === bubble) null else percentRectToPx(BubbleGeometry.outerRect(it), stitchedWidth, stitchedHeight)
+        }
+        val newBottom = growBubbleBottomPx(
+            rectLeft = rect.left,
+            rectTop = rect.top,
+            rectRight = rect.right,
+            rectBottom = rect.bottom,
+            hardLineCount = hardLineCount,
+            medianLineHeightPx = lineHeightPx,
+            stitchedHeightPx = stitchedHeight.toFloat(),
+            others = otherRects.map { it.toSeamBox() }
+        ) ?: return bubble
+        val deltaPct = (newBottom - rect.bottom) / stitchedHeight * 100f
+        return bubble.copy(h = bubble.h + deltaPct, contentH = bubble.contentH + deltaPct)
     }
 
     private fun crossPrepareBubbles(
@@ -1571,6 +2093,8 @@ class WebtoonImageTranslator(
         topH: Int,
         sourceHeight: Int,
         fragmentBoxes: Map<Int, List<SeamIncomingGeometry.Box>> = emptyMap(),
+        /** 相邻行的框（2026-10-11）：普通并集（**不**参与同行碎片的固定点链式扩框），见 [IncomingAbsorption]。 */
+        adjacentFragmentBoxes: Map<Int, List<SeamIncomingGeometry.Box>> = emptyMap(),
         lineHeightPx: Float = 0f
     ): List<Bubble> {
         if (incomingCross.isEmpty() || stitched.width <= 0 || stitched.height <= 0) return emptyList()
@@ -1624,6 +2148,14 @@ class WebtoonImageTranslator(
                 topPx = grown.top.coerceIn(0f, heightF)
                 bottomPx = grown.bottom.coerceIn(0f, heightF)
             }
+            // 相邻行（2026-10-11）：普通并集（见 [IncomingAbsorption.adjacentFragmentBoxes] ——
+            // 链式扩框会把没并进翻译请求的行也擦掉）。
+            adjacentFragmentBoxes[index].orEmpty().forEach { adjacent ->
+                leftPx = minOf(leftPx, adjacent.left).coerceIn(0f, stitchedW)
+                rightPx = maxOf(rightPx, adjacent.right).coerceIn(0f, stitchedW)
+                topPx = minOf(topPx, adjacent.top).coerceIn(0f, heightF)
+                bottomPx = maxOf(bottomPx, adjacent.bottom).coerceIn(0f, heightF)
+            }
             // 退化框（真机 `box=42x0`：高不足 1%）必须至少撑到一行高：
             // 否则擦字擦不到、盖板也只有一条薄片 → 原文留着（截图里那行乱码韩文）。
             val sized = SeamIncomingGeometry.enforceMinimumHeight(
@@ -1659,47 +2191,90 @@ class WebtoonImageTranslator(
     }
 
     /**
-     * 排版框外扩：朝气泡外框方向每侧最多扩 [TextLayoutMetrics.LAYOUT_GROW_RATIO]/2，
-     * 并保留 [TextLayoutMetrics.LAYOUT_OUTER_INSET_RATIO] 的描边保护（与旧的
-     * [TextLayoutMetrics.expandContentRect] 同口径，只是改成在**像素空间**、从字形框出发）。
+     * 气泡内部实测的容器几何，**只供盖板轮廓裁剪**（`regionPolygonPercent`，防椭圆收腰白肩）。
+     *
+     * ⚠️ 2026-10-14 用户规则后，它**不再参与排版框**：排版框 = 字形框原样，宽度/高度
+     * 上限一律不用（历史与原因见 `resolveFinalBubbles` 里的详注）。
      */
-    private fun growTowardOuter(content: RectF, outer: RectF?): RectF {
-        if (content.width() <= 0f || content.height() <= 0f) return content
-        val growPerSide = TextLayoutMetrics.LAYOUT_GROW_RATIO / 2f
-        var left = content.left - content.width() * growPerSide
-        var top = content.top - content.height() * growPerSide
-        var right = content.right + content.width() * growPerSide
-        var bottom = content.bottom + content.height() * growPerSide
-        // ⚠️ 只有「气泡外框真的把字形框包住」时才拿它收边（2026-09-30）。
-        // 区域检测偶尔会给出一个和文字框**错位**的框：实测 syn1 的蓝字斜排没有气泡轮廓，
-        // 外框被检测成画面底部 `y 981~1399`，而字形在 `y 945~1051` —— 用它收边后
-        // 排版框被压成 `997~1067` 的一条细缝，既不盖住原文（实底裁剪轮廓是按排版框定位的，
-        // 一部分被裁到框外）也不居中（用户反馈「倾斜文字位置完全错了、没有完全覆盖」）。
-        // 外框不包含字形框 = 这个外框不可信，直接不用它。
-        val outerUsable = outer != null && outer.width() > 2f && outer.height() > 2f &&
-            outer.left <= content.left && outer.top <= content.top &&
-            outer.right >= content.right && outer.bottom >= content.bottom
-        if (outerUsable && outer != null) {
-            val insetX = outer.width() * TextLayoutMetrics.LAYOUT_OUTER_INSET_RATIO
-            val insetY = outer.height() * TextLayoutMetrics.LAYOUT_OUTER_INSET_RATIO
-            left = maxOf(outer.left + insetX, left)
-            top = maxOf(outer.top + insetY, top)
-            right = minOf(outer.right - insetX, right)
-            bottom = minOf(outer.bottom - insetY, bottom)
-        }
-        if (right - left <= content.width() && bottom - top <= content.height()) return content
-        val clampedRight = maxOf(right, left + 1f)
-        val clampedBottom = maxOf(bottom, top + 1f)
-        return RectF(left, top, clampedRight, clampedBottom)
+    private class InteriorCap(
+        val widthPx: Float,
+        val heightPx: Float?,
+        val midWidthPx: Float,
+        /** 容器逐行边界（拼接图像素，`[y,left,right] × N`），供盖板轮廓裁剪用。 */
+        val profileRowsPx: FloatArray
+    ) {
+        val hasOutline: Boolean get() = profileRowsPx.size >= 6
     }
 
-    /** 气泡外框（拼接图像素）；拿不到（外框≈内容框/退化）时返回 null。 */
-    private fun outerRectPx(bubble: Bubble, stitched: Bitmap): RectF? {
-        val outer = BubbleGeometry.outerRect(bubble)
-        if (outer.width <= 2f || outer.height <= 2f) return null
-        val rect = percentRectToPx(outer, stitched.width, stitched.height)
-        return rect.takeIf { it.width() > 2f && it.height() > 2f }
+    /**
+     * 气泡内部可写区域 → 盖板轮廓的容器几何（**不作排版框上限**，背景与用法见
+     * [resolveFinalBubbles] 里的详注）。
+     *
+     * 只在**量到可信容器**（中点行宽 ≥ 字形宽 × 0.9，且容器没贴着画面边缘/没比字形框大得
+     * 离谱，见 [BubbleInteriorScanner.Interior.isTrustworthyContainer]）时返回；斜排
+     * （四边形 / 明显倾角）与「量到的其实是整页白底」都直接跳过 —— 前者逐行量的是水平弦
+     * 会把字号误压小，后者会把盖板轮廓裁成一根窄柱（2026-10-14 真机夹具实测 213px）。
+     */
+    private fun resolveInteriorCap(
+        stitched: Bitmap,
+        glyphRect: RectF,
+        lineCount: Int,
+        colors: BubbleColors?,
+        bubble: Bubble
+    ): InteriorCap? {
+        val palette = colors ?: return null
+        if (bubble.polygon != null) return null
+        if (kotlin.math.abs(bubble.rotationDeg ?: 0f) > INTERIOR_CAP_MAX_TILT_DEG) return null
+        val glyphWidth = glyphRect.width()
+        val glyphHeight = glyphRect.height()
+        if (glyphWidth < 8f || glyphHeight < 8f) return null
+        val interior = ServiceLocator.bubbleInteriorScanner.scan(
+            source = stitched,
+            glyph = glyphRect,
+            lineCount = lineCount.coerceAtLeast(1),
+            bgColor = palette.bgColor
+        ) ?: return null
+        if (!interior.isTrustworthyContainer(glyphWidth, glyphHeight, stitched.width, stitched.height)) {
+            return null
+        }
+        val widthCap = interior.widthCapPx(glyphWidth) ?: return null
+        return InteriorCap(
+            widthPx = widthCap,
+            heightPx = interior.heightCapPx(glyphWidth, glyphHeight),
+            midWidthPx = interior.midRowWidthPx,
+            profileRowsPx = interior.profileRows
+        )
     }
+
+    /**
+     * 墨迹守卫的行带（[CoverOutlinePolygon] 用）：优先检测器给的**逐行框**（每行各自的实际
+     * 字形范围，宽度互不相同），拿不到时退化成整块字形框（一行并集）。
+     *
+     * 为什么优先逐行框：多行气泡各行的宽度常差很多（长句 + 短句），拿并集守会把短行带
+     * 一起撑到最长行的宽度 → 短行两侧重新露出白肩。逐行框就没有这个问题。
+     */
+    private fun inkBandsForOutline(
+        lineBoxesPx: List<RectF>?,
+        maskRect: RectF
+    ): List<FloatArray> {
+        val boxes = lineBoxesPx
+            ?.filter { it.width() > 1f && it.height() > 1f }
+            ?.takeIf { it.isNotEmpty() }
+            ?: return listOf(
+                floatArrayOf(maskRect.left, maskRect.top, maskRect.right, maskRect.bottom)
+            )
+        return boxes.map { floatArrayOf(it.left, it.top, it.right, it.bottom) }
+    }
+
+    /**
+     * 盖板轮廓的整体外扩（px）：按行高的一个比例，钳在 [OUTLINE_DILATE_MIN_PX, OUTLINE_DILATE_MAX_PX]。
+     *
+     * 为什么不能用盖板的 `coverPadPx`（最大能到 11px）：那是给**字形框**留的余量，已经算进
+     * coverBox 里了；轮廓再按它外扩等于外扩翻倍，「露白肩」会回来。这里只取一个能吃掉
+     * 抗锯齿/亚像素误差的小量。
+     */
+    private fun outlineDilatePx(lineHeightPx: Float): Float =
+        (lineHeightPx * OUTLINE_DILATE_LINE_RATIO).coerceIn(OUTLINE_DILATE_MIN_PX, OUTLINE_DILATE_MAX_PX)
 
     /**
      * 两个框的并集（[extra] 为 null 时原样返回 [base]）。
@@ -1783,6 +2358,23 @@ class WebtoonImageTranslator(
 
     /** 本轮倾角诊断（[flushTiltProbe] 写入，[translateStitched] 读取）。 */
     private var pendingTiltProbe: String? = null
+
+    /** 盖板轮廓裁切诊断累积串（每张图一条 `cover_outline` 日志）。 */
+    private val outlineProbe = StringBuilder()
+
+    /** 每张图开始时清空轮廓诊断（在 [resolveFinalBubbles] 入口调用）。 */
+    private fun resetOutlineProbe() {
+        outlineProbe.setLength(0)
+    }
+
+    /** 轮廓诊断：累积到 [pendingOutlineProbe]，由 [translateStitched] 统一打日志。 */
+    private fun flushOutlineProbe() {
+        pendingOutlineProbe = outlineProbe.toString().trim().ifEmpty { null }
+        outlineProbe.setLength(0)
+    }
+
+    /** 本轮轮廓诊断（[flushOutlineProbe] 写入，[translateStitched] 读取）。 */
+    private var pendingOutlineProbe: String? = null
 
     /**
      * 没有 OCR 四边形（= ML Kit）时的几何重建。三步：
@@ -2111,6 +2703,20 @@ class WebtoonImageTranslator(
             "$text@" + "${block.left.toInt()},${block.top.toInt()}," +
                 "${(block.right - block.left).toInt()}x${(block.bottom - block.top).toInt()}"
         }
+        // 行块级全量清单（2026-10-12 接缝「误吸邻页泡」取证）：`ocr_texts_*` 只在分组失败/
+        // 丢块时打且截断到 6 块，跨缝排查需要**全部**行块的拼接图像素坐标 —— 接缝条带里的
+        // 残行（被条带边缘切开）框在哪里、和最终气泡框差多少，看这一行就能对出来。
+        if (structureBlocks.isNotEmpty()) {
+            timer.mark(
+                "ocr_blocks_all",
+                "blocks=${structureBlocks.size} img=${bitmap.width}x${bitmap.height} :: " +
+                    structureBlocks.joinToString(" ˌ ") { block ->
+                        val text = block.text.replace('\n', '⏎').take(12)
+                        "$text@" + "${block.left.toInt()},${block.top.toInt()}," +
+                            "${(block.right - block.left).toInt()}x${(block.bottom - block.top).toInt()}"
+                    }
+            )
+        }
         // 缝感知分组（2026-10-03）：把**页面切缝**告诉 planner —— 拼接图里「上一气泡的尾行」
         // 与「下一气泡的首行」几何上常常紧挨着，纯邻近合并会把两个气泡的台词并成一句
         // （真机 `erase_target` 实测 `…두 가지 밖에 없는데.! 악질들한테 걸리기라도 …`）。
@@ -2186,6 +2792,41 @@ class WebtoonImageTranslator(
             return groupLocalBlocks(structureBlocks, bitmap.width, bitmap.height, timer)
         }
         timer.mark("response_ok", "stage=ocr bubbles=${bubbles.size}")
+        // 「纯色底就当 solid 处理」（2026-10-13 用户：「这个截页处的气泡框是纯色背景，但是它用的是
+        // 清理图。希望处理为 solid」）：
+        //
+        // 真机日志里 `bubble_region_stats detected=0` 的页面占多数 —— 区域检测没命中时气泡一律走
+        // 「无区域」分支 → `bg_type=none` → 盖板从**清理图**（inpaint 产物）裁切。白气泡上 inpaint
+        // 必然留下擦不干净的灰痕（用户截图里气泡边上的污迹），而这类气泡本来就是一块平底色。
+        //
+        // 判据是**量出来的**，两条证据任一成立即可（对齐参考项目 `bubble-colors.js` 的
+        // adaptiveBackground 升级，并补上它没有覆盖的「OCR 框比气泡宽」现场）：
+        // ① 外圈一致率 ≥ 0.92 且底色够亮（文字框整个落在气泡里时这条成立）；
+        // ② 容器内部量测：从字形框中心走出一块**不比字形框窄**的亮色平底
+        //    （`BubbleInteriorScanner`，环被气泡外的插画污染时靠它）。
+        // 两条都不成立（网点/渐变/插画）就什么都不做 —— 平涂色块比灰痕更糟，底线不破。
+        val upgrades = mutableListOf<String>()
+        val tuned = bubbles.mapIndexed { index, bubble ->
+            if (bubble.bgType.equals("solid", ignoreCase = true)) return@mapIndexed bubble
+            val sampled = ServiceLocator.bubbleColorExtractor.sampleBackground(bitmap, bubble)
+                ?: return@mapIndexed bubble
+            val lineCount = renderer.resolveSourceLineCount(bubble.sourceLineCount, bubble.originalText)
+            val glyphBox = bubbleContentRectPx(bubble, bitmap.width, bitmap.height)
+            val interior = if (sampled.flatBackground) {
+                null
+            } else {
+                ServiceLocator.bubbleInteriorScanner.scan(bitmap, glyphBox, lineCount, sampled.color)
+            }
+            val flatBackground = sampled.flatBackground ||
+                interior?.isFlatBrightContainer(glyphBox.width(), sampled.color) == true
+            if (!flatBackground) return@mapIndexed bubble
+            upgrades += "b$index=ring%.2f".format(sampled.coverage) +
+                (interior?.let { "/flat%.2f".format(it.flatCoverage) } ?: "")
+            bubble.copy(bgType = "solid")
+        }
+        if (upgrades.isNotEmpty()) {
+            timer.mark("solid_upgrade", "count=${upgrades.size} evidence=${upgrades.joinToString(" ")}")
+        }
         // 正常路径只在「块数明显多于气泡数」时打一行，用于发现「有文字被丢在分组之外」
         // —— 用户报的缺句就是这种形态（块被认出来了，但没被分进任何气泡）。
         if (structureBlocks.size > bubbles.size) {
@@ -2194,7 +2835,7 @@ class WebtoonImageTranslator(
                 "blocks=${structureBlocks.size} bubbles=${bubbles.size} :: $ocrBlockDigest"
             )
         }
-        return TranslationResult(bubbles)
+        return TranslationResult(tuned)
     }
 
     private suspend fun groupLocalBlocks(
@@ -2280,6 +2921,17 @@ class WebtoonImageTranslator(
             .trim()
         if (originalText.isBlank()) return null
         val quad = TextQuadGeometry.quadOf(memberBlocks, imageWidth, imageHeight)
+        val lineBoxesPercent = memberBlocks.flatMap { block -> block.lineBoxes.orEmpty() }
+            .filter { it.size >= 4 }
+            .map { lb ->
+                floatArrayOf(
+                    (lb[0] / imageWidth.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[1] / imageHeight.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[2] / imageWidth.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[3] / imageHeight.toFloat() * 100f).coerceIn(0f, 100f)
+                )
+            }
+            .takeIf { it.isNotEmpty() }
         return Bubble(
             x = (leftPx / imageWidth.toFloat() * 100f).coerceIn(0f, 100f),
             y = (topPx / imageHeight.toFloat() * 100f).coerceIn(0f, 100f),
@@ -2297,7 +2949,8 @@ class WebtoonImageTranslator(
             alignment = TextAlignment.infer(memberBlocks, imageWidth.toFloat()),
             sourceLineCount = TextLayoutMetrics.countVisualLines(memberBlocks),
             polygon = quad.first,
-            rotationDeg = quad.second
+            rotationDeg = quad.second,
+            lineBoxes = lineBoxesPercent
         )
     }
 
@@ -2306,7 +2959,11 @@ class WebtoonImageTranslator(
     // -----------------------------------------------------------------------
 
     private data class ImageVisualPrep(
-        /** 按气泡下标索引的擦字贴片（[ErasePatch.bubbleId] = 传入气泡列表下标）。 */
+        /**
+         * 按气泡下标索引的擦字贴片。下标口径 = **`prepareVisuals` 收到的气泡列表**（未过滤），
+         * 与 `finalBubbles` / `geometries` / 移交列表同一套下标：`erasePage` 的 `bubbleId` 是
+         * 「它收到的那个列表」的下标，擦字目标被 `isWorthErasing` 过滤过，取用时已按原下标重编。
+         */
         val patchesByBubbleId: Map<Int, ErasePatch>,
         /** 精修后的内容框（像素，拼接图坐标）—— 遮罩/实底范围用它。 */
         val contentRects: Map<Int, RectF>,
@@ -2340,11 +2997,15 @@ class WebtoonImageTranslator(
     }
 
     /**
-     * @param includeSolidInpaint 「精细擦字」开启（浏览器设置，默认开）= solid 气泡也走整页 inpaint 清理图，
-     *   **且**逐气泡擦字允许走 OpenCV inpaint（慢但背景连续）；
-     *   关闭时 solid 气泡只用逐块取色快速贴片（`FAST_ONLY`，不跑 inpaint）—— 这才是「开/关」的真实差别
-     *   （2026-09-28 用户反馈「开不开好像都一样」：旧实现关闭时逐气泡仍走 OPENCV_INPAINT，
-     *   出来的背景和整页清理图几乎一样，既没省时间也没看出区别）。
+     * @param includeSolidInpaint 「精细擦字」开关（浏览器设置，默认开）。两条路线的分工是**硬**的
+     *   （2026-10-11 用户要求：「开启的时候最符合原文，关闭的时候只考虑速度，只要显示出来译文就行」）：
+     *   - **开 = 质量优先**：整页清理图必建（纯色气泡直填背景色、旁白墨迹级 inpaint），每个气泡的
+     *     盖板背景都来自它 → 与原文最接近；
+     *   - **关 = 速度优先**：一张清理图都不建（整页 inpaint + 整页 JPEG 导出全省），逐气泡策略
+     *     `FAST_ONLY`，`bg=none` 气泡改用**不透明实底盖板**（`flat_cover`，见 [buildScene]）。
+     *
+     *   （2026-09-28 用户反馈「开不开好像都一样」：旧实现关闭时逐气泡仍走 OPENCV_INPAINT 且照建
+     *   清理图，出来的背景和开启几乎一样，既没省时间也没看出区别。）
      */
     private suspend fun prepareVisuals(
         result: TranslationResult,
@@ -2356,11 +3017,25 @@ class WebtoonImageTranslator(
         // 只擦「有内容可覆盖」的区域：OCR 读不出原文的区域擦了只会留下白块（2026-09-30 用户
         // 要求「读不出就别擦」）。判据与理由见 EraseTargets.kt —— 不做任何语言假设。
         // 读不出的区域已在上游（translateStitched 的 erase_skip）整块丢弃，这里再过滤是兜底。
-        val eraseTargets = result.bubbles.filter { isWorthErasing(it) }
+        //
+        // ⚠️ 下标：`erasePage` 拿「传进去那个列表」的下标当 `bubbleId`，而这里传的是**过滤后**
+        // 的列表；下游（`patchFor` / 擦字质量统计 / 跨图移交）用的却是**未过滤**的
+        // `result.bubbles` 下标 —— 一旦有气泡被 `isWorthErasing` 刷掉，两边就错位（贴片贴到
+        // 别的气泡上）。所以先把「擦字目标 → 原下标」记下来，拿到贴片再按原下标重编。
+        val eraseTargetIndices = result.bubbles.withIndex()
+            .filter { isWorthErasing(it.value) }
+            .map { it.index }
+        val eraseTargets = eraseTargetIndices.map { result.bubbles[it] }
         timer.mark("erase_targets", eraseTargetsDiag(result.bubbles))
         result.bubbles.forEachIndexed { i, b -> timer.mark("erase_target", eraseTargetDetailDiag(i, b)) }
-        val needsCleanedImage = includeSolidInpaint ||
-            eraseTargets.any { !it.bgType.equals("solid", ignoreCase = true) }
+        // 「精细擦字」开 = **质量优先**：总是建整页清理图（纯色气泡直填背景色、旁白走墨迹级
+        // inpaint），所有气泡的背景都从它来 —— 与原文最接近。
+        //
+        // 「精细擦字」关 = **速度优先**（2026-10-11 用户明确要求：「关闭的时候只考虑速度，
+        // 只要显示出来译文就行」）：一张清理图都不建 —— 整页 inpaint 与整页 JPEG 导出全省掉
+        // （实测 273–700ms/张），旁白/透明块改用**逐气泡擦字贴片**当盖板背景（渲染层既有的
+        // 旁白/透明块改用**不透明实底盖板**把原文盖死（`flat_cover`）。因此「关闭」是真的完全不跑 inpaint。
+        val needsCleanedImage = includeSolidInpaint
         val cleanedImage = if (needsCleanedImage) {
             ServiceLocator.cleanedImageProcessor.buildCleanedImage(
                 source = source,
@@ -2373,12 +3048,14 @@ class WebtoonImageTranslator(
         }
         timer.mark(
             "cleaned_image",
-            if (cleanedImage != null) {
-                "built=${cleanedImage.width}x${cleanedImage.height} include_solid=$includeSolidInpaint"
-            } else if (needsCleanedImage) {
-                "skipped=build_failed include_solid=$includeSolidInpaint"
-            } else {
-                "skipped=all_solid"
+            when {
+                cleanedImage != null ->
+                    "built=${cleanedImage.width}x${cleanedImage.height} include_solid=$includeSolidInpaint"
+
+                needsCleanedImage -> "skipped=build_failed include_solid=$includeSolidInpaint"
+                // 关闭「精细擦字」= 速度优先：整页清理图**完全不建**（不跑整页 inpaint、不导出
+                // 整页 JPEG）。旁白/透明块的盖板改用不透明实底（场景下发的 flat_cover）。
+                else -> "skipped=fast_mode"
             }
         )
         val erasePolicy = if (includeSolidInpaint) {
@@ -2457,7 +3134,9 @@ class WebtoonImageTranslator(
                 )
             }.joinToString(" ")
         )
-        val patchesByBubbleId = patches.associateBy { it.bubbleId }
+        val patchesByBubbleId = patches.associateBy { patch ->
+            eraseTargetIndices.getOrElse(patch.bubbleId) { patch.bubbleId }
+        }
         // 擦字质量观测量（2026-09-28 用户反馈「清理图有时候不生效」）：
         // 逐气泡比较「原图内容框里的墨迹占比」与「贴片上同一区域的墨迹占比」，
         // 残墨比 residual 接近 0 = 原字被擦干净；接近 1 = 贴片里还带着原字（没擦到/没贴片）。
@@ -2618,6 +3297,28 @@ class WebtoonImageTranslator(
         private const val TAG = "WebtoonImageTranslator"
         private const val LOCAL_BUBBLE_PADDING_RATIO = 0.10f
         private const val LOCAL_BUBBLE_MIN_PADDING_PX = 6f
+
+        /**
+         * 排版框按气泡内部收窄时，能容忍的最大倾角（度）。
+         *
+         * 超过它就跳过：`BubbleInteriorScanner` 逐行量的是**水平弦**，而斜排文字的
+         * 「行」跟着基线走 —— 用水平弦收窄会把字号误压小。四边形（Paddle）同样直接跳过。
+         */
+        private const val INTERIOR_CAP_MAX_TILT_DEG = 2f
+
+        /**
+         * 盖板轮廓逐行弦宽的下限（占最大弦的比例）。
+         *
+         * OCR 原框紧贴文字时，扫描行穿过密集字形，量到的弦是行内字间空隙（真机实测
+         * 37%↔48% 锯齿自交，盖板被裁没、原文全露）。低于最大弦 45% 的行按文字噪声丢弃，
+         * 可用行不足 3 行就整体退回矩形盖板（见 [CoverOutlinePolygon.build]）。
+         */
+        private const val OUTLINE_ROW_MIN_CHORD_RATIO = 0.45f
+
+        /** 盖板轮廓外扩占行高的比例（吃抗锯齿/亚像素误差；上下限见下两行）。 */
+        private const val OUTLINE_DILATE_LINE_RATIO = 0.05f
+        private const val OUTLINE_DILATE_MIN_PX = 2f
+        private const val OUTLINE_DILATE_MAX_PX = 6f
         /** 残墨统计：采样步长与「算不算墨迹」的亮度差阈值。 */
         private const val INK_SAMPLE_STRIDE = 3
         private const val INK_DELTA_THRESHOLD = 52f
@@ -2832,7 +3533,12 @@ class BubbleImageRenderer {
         val contentWidth = contentWidthPx(rect.width())
         val textSize = fixedFontSizePx ?: fitFontSize(trimmed, rect, originalLineHeightPx)
         val paint = newTextPaint(textSize)
-        val layout = buildLayout(trimmed, paint, contentWidth, alignment)
+        val greedyLayout = buildLayout(trimmed, paint, contentWidth, alignment)
+        // 像素感知均衡断行（2026-10-14）：字号已定，把「贪心断行」换成「词边界 + 像素宽均衡」。
+        // 行数保持不变（行数变了高度就变、字号拟合失效）；断不开（无解/单行/已含换行）保持贪心。
+        val balancedText = balancedDrawText(trimmed, paint, contentWidth, greedyLayout.lineCount)
+        val layout = if (balancedText != null) buildLayout(balancedText, paint, contentWidth, alignment) else greedyLayout
+        val strokeText = balancedText ?: trimmed
 
         val layoutWidth = widestLine(layout).coerceAtMost(rect.width() - 2f)
         // 左/右对齐：整块贴着内容框对应边；居中：整块居中（行内再由 StaticLayout 对齐）。
@@ -2856,7 +3562,7 @@ class BubbleImageRenderer {
                 strokeWidth = (textSize * NARRATION_STROKE_RATIO).coerceIn(2f, 6f)
                 color = colors.strokeColor
             }
-            val strokeLayout = buildLayout(trimmed, strokePaint, contentWidth, alignment)
+            val strokeLayout = buildLayout(strokeText, strokePaint, contentWidth, alignment)
             canvas.save()
             canvas.translate(drawLeft, drawTop)
             strokeLayout.draw(canvas)
@@ -2885,6 +3591,35 @@ class BubbleImageRenderer {
             textSize = textSizePx
             typeface = Typeface.SERIF
         }
+    }
+
+    /**
+     * 画布链路（覆盖层关闭时的整图 PNG）的气泡译文重排（2026-10-14）。
+     *
+     * [BalancedLineBreaker] 断一次；**行数必须与贪心断行一致**才采用（行数变化会让
+     * 文字块高度变化、刚定好的字号失效）。不一致/无解返回 null，调用方保持贪心结果。
+     */
+    private fun balancedDrawText(
+        text: String,
+        paint: TextPaint,
+        contentWidth: Int,
+        lineCount: Int
+    ): String? {
+        if (text.indexOf('\n') >= 0 || lineCount <= 1 || contentWidth <= 8) return null
+        val width = contentWidth.toFloat()
+        val rows = BalancedLineBreaker.breakLines(
+            text = text,
+            lineCount = lineCount,
+            maxWidthPx = width,
+            measure = { value -> paint.measureText(value) }
+        ) ?: return null
+        val joined = rows.joinToString("\n")
+        val greedy = BalancedLineBreaker.countGreedyLines(
+            text = joined,
+            maxWidthPx = width,
+            measure = { value -> paint.measureText(value) }
+        )
+        return if (greedy == lineCount) joined else null
     }
 
     /**
@@ -2963,6 +3698,51 @@ class BubbleImageRenderer {
         // 1.08 与常见漫画排版更接近，同时给字号留出空间。
         const val LINE_SPACING_MULTIPLIER = 1.08f
     }
+}
+
+/**
+ * 「框比文本矮」向下扩框的**纯判据**（2026-10-12 从 [WebtoonImageTranslator.growBubbleToTextHeight]
+ * 提出，全 Float 入参 + [SeamBox]，JVM 可直接单测 —— 这条判据两次闯过祸，必须钉住）。
+ *
+ * 判据：框底(需) = 框顶 + 硬行数 × 中位行高 × 1.2；不超过 框底 + 0.3×行高 就不扩；
+ * 要扩则夹到拼接图底与「下方邻居的顶边」（横向重叠 ≥ 0.3× 较窄者才算邻居）。
+ *
+ * 现场回归（都用真机数字）：
+ * - 2026-10-12 误扩现场：单行小字 316×44@2410、中位行高 36 → 需 2410+43.2=2453.2 ≤
+ *   2454+10.8 → **不扩**（旧版按字宽折行算出 2 行 → 扩到 2596 → 字号炸 4 倍）；
+ * - 2026-10-11 原始现场：4 行台词框 360×161@2312、行高 43 → 2312+206.4=2518，
+ *   下方邻居@2520 不挡（2518 < 2520）→ 扩到 **2518**（当年折行版 2570 被夹回 2520，
+ *   纯硬行数反而更贴真实底边）。
+ */
+internal fun growBubbleBottomPx(
+    rectLeft: Float,
+    rectTop: Float,
+    rectRight: Float,
+    rectBottom: Float,
+    hardLineCount: Int,
+    medianLineHeightPx: Float,
+    stitchedHeightPx: Float,
+    others: List<SeamBox>
+): Float? {
+    if (medianLineHeightPx <= 0f || !medianLineHeightPx.isFinite()) return null
+    if (hardLineCount <= 0) return null
+    val boxWidth = rectRight - rectLeft
+    if (boxWidth <= 2f) return null
+    val neededBottom = rectTop + hardLineCount * medianLineHeightPx * 1.2f
+    if (neededBottom <= rectBottom + medianLineHeightPx * 0.3f) return null
+    var newBottom = neededBottom.coerceAtMost(stitchedHeightPx)
+    others.forEach { other ->
+        if (other.width <= 2f || other.height <= 2f) return@forEach
+        val hOverlap = minOf(rectRight, other.right) - maxOf(rectLeft, other.left)
+        if (hOverlap >= 0.3f * minOf(boxWidth, other.width) &&
+            other.top >= rectBottom - 1f &&
+            other.top < newBottom
+        ) {
+            newBottom = other.top
+        }
+    }
+    if (newBottom <= rectBottom) return null
+    return newBottom
 }
 
 

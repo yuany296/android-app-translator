@@ -201,6 +201,12 @@ class CaptureForegroundService : Service() {
      */
     private fun handleFloatingTap() {
         if (translateJob?.isActive == true) {
+            // 诊断（2026-10-14）：这一条以前是**静默 return** —— 用户报「悬浮球点不动」时，
+            // 日志里连一行都没有，没法区分「没收到点击」和「收到了但被这里挡掉」。
+            Log.d(
+                "TranslationPerf",
+                "floating_tap_busy overlay_active=${overlayController?.hasActiveTranslationLayer() == true}"
+            )
             return
         }
         // 2026-08-27 新增：译文层显示/锁定时点击悬浮球 = 恢复原文（清除译文层），

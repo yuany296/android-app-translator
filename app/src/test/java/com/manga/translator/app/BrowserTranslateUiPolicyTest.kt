@@ -81,22 +81,28 @@ class BrowserTranslateUiPolicyTest {
         assertTrue(c.primaryEnabled)
     }
 
+    /**
+     * 状态行兜底文案（2026-10-12 第三轮改口径）。
+     *
+     * 底栏不再有「翻译/停止」与「原文｜译文」两个控件，文案一律指向**悬浮球**与
+     * **球上的 ⋮ 菜单**；指向已消失的按钮就是死文案，这一条单测专门防它回潮。
+     */
     @Test
     fun idleHint_coversFourQuadrants() {
         assertEquals(
-            "点「翻译」自动翻完整页",
+            "点球自动翻完整页",
             BrowserTranslateUiPolicy.idleHint(BrowserViewMode.TRANSLATED, hasRender = false, pageLoaded = true)
         )
         assertEquals(
-            "译文已显示 · 点「原文」看原图",
+            "译文已盖上 · 点球可停止",
             BrowserTranslateUiPolicy.idleHint(BrowserViewMode.TRANSLATED, hasRender = true, pageLoaded = true)
         )
         assertEquals(
-            "原文显示中 · 点「译文」显示译文",
+            "原文显示中 · 点球上菜单切译文",
             BrowserTranslateUiPolicy.idleHint(BrowserViewMode.ORIGINAL, hasRender = true, pageLoaded = true)
         )
         assertEquals(
-            "打开漫画网页后点「翻译」",
+            "打开漫画网页后点球翻译",
             BrowserTranslateUiPolicy.idleHint(BrowserViewMode.TRANSLATED, hasRender = false, pageLoaded = false)
         )
     }

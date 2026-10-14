@@ -149,6 +149,19 @@ class BubbleFirstRegionPlanner {
                 .joinToString(separator = " ") { it.text.trim() }
         }.trim()
         if (orderedText.isBlank()) return null
+        // 逐行框：块像素 → 百分比（口径同 x/y/w/h）。ML Kit 块自带每行 boundingBox；
+        // Paddle / 远程 OCR 没有时为 null，下游走「块框 ÷ 行数 + 墨迹收紧」老路径。
+        val lineBoxesPercent = blocks.flatMap { block -> block.lineBoxes.orEmpty() }
+            .filter { it.size >= 4 }
+            .map { lb ->
+                floatArrayOf(
+                    (lb[0] / imageWidth.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[1] / imageHeight.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[2] / imageWidth.toFloat() * 100f).coerceIn(0f, 100f),
+                    (lb[3] / imageHeight.toFloat() * 100f).coerceIn(0f, 100f)
+                )
+            }
+            .takeIf { it.isNotEmpty() }
 
         val rect = if (region.regionType == BubbleRegionType.BUBBLE) {
             region
@@ -183,7 +196,10 @@ class BubbleFirstRegionPlanner {
             // 文字四边形 + 倾角（2026-09-29）：像素 → 百分比在此完成，渲染层只吃百分比。
             // 多框合并出的块一定是轴对齐的，[TextQuadGeometry] 只在单框时透传。
             polygon = quad.first,
-            rotationDeg = quad.second
+            rotationDeg = quad.second,
+            // 逐行框（2026-10-14）：供译文字号基线（行高中位数）与字形区（行框并集），
+            // 见 [TextBlock.lineBoxes]。
+            lineBoxes = lineBoxesPercent
         )
     }
 

@@ -21,6 +21,15 @@
   var FONT_MIN = 10;
   var FONT_MAX = 52;
   var FONT_ABS_MAX = 120;
+  /**
+   * 字号**绝对下限**（2026-10-12 用户规则「译文装不下原文位置时，自适应缩减字号」）。
+   *
+   * 此前二分下限就是 FONT_MIN=10：10px 仍装不下 → 走 `expandForTextOverflow`
+   * 把节点撑出气泡框 —— 译文叠到邻近气泡/面板上（用户 2026-10-12 截图）。
+   * 现在二分一路缩到 8px（与画布渲染 `BubbleImageRenderer.MIN_FONT_SIZE_PX` 同档）
+   * 才允许撑开，撑开从「常规兜底」降级成「极端兜底」。
+   */
+  var FONT_ABS_MIN = 8;
   var FONT_BASE_RATIO = 0.78;          // 拿不到原字高时：起点 = 框高 × 0.78
   var FONT_BINARY_STEPS = 9;
   var FONT_SAFETY = 0.96;              // 横排安全系数
@@ -29,6 +38,18 @@
   var FONT_CACHE_MAX = 600;
   var STROKE_RATIO = 0.085;            // 描边宽 = 字号 × 0.085，clamp [1.8, 4.2]
   var COVER_TILT_TOLERANCE_DEG = 0.5;
+  /**
+   * 「OCR 的 rotation_deg 是不是真在说这块文字歪了」的**旋转噪声地板**（对齐参考项目
+   * `cover-geometry.js` 的同名常量，2026-10-14 移植）。
+   *
+   * 与 [COVER_TILT_TOLERANCE_DEG] 分工不同：那个判定的是**四边形本身**是否轴对齐，
+   * 这个判定的是 rotation_deg 这条独立证据值不值得相信。参考项目现场（Lezhin 跨页气泡）：
+   * rotation_deg = -0.6° 是纯粹的识别噪声（0.6° 在 122px 高的框上只挪约 1px），
+   * 却让「斜排」成立 → 盖板按字形四边形裁剪，原文直接露在译文下面。
+   * 真正的斜排 SFX 远大于这个角度（夹具实测 12°/20°/35°），所以地板取 2°：
+   * 低于它一律按轴对齐处理（不旋转、不裁剪）。
+   */
+  var COVER_ROTATION_NOISE_DEG = 2;
   // 遮罩外扩档位（见 resolveCoverQuad）。**默认 0**：外扩不在这里做。
   // 2026-09-30 用户要求「盖板不进行扩展，要扩也只是几个像素，顶多遮住 OCR 没识别到的像素点」——
   // 于是外扩改成宿主（Kotlin）按**像素**算好，写进 `polygon` / `region_polygon` / `cover_box`：
@@ -285,12 +306,21 @@
    * - 都没有 → 轴对齐框。
    * ⚠️ 绝不拿 rotation_deg 与百分比 polygon 的夹角「比对是否一致」：两套坐标读出的
    *    角度本来就不同，误判成冲突会退回旋转外接框，把遮罩撑成包围盒。
+   *
+   * ⚠️ rotation_deg 有两条"不算斜排"的硬门槛（2026-10-14 移植参考项目 cover-geometry.js）：
+   * - **|倾角| ≥ [RENDER_ROTATION_VERTICAL_MIN_DEG] 是竖排方向，不是"歪了"**：检测器对
+   *   高而窄的框一律给 ±90°，照它旋转外接框会把竖列转成**横条** —— 盖板/清理图只盖上
+   *   一条横带、原文大面积露出（用户 2026-10-14 截图：气泡原文透过译文可见），
+   *   外框还会被撑成横跨画面的包围盒（"盖板太大"同源）。这种角度必须按四边形/原框走。
+   * - **亚 [COVER_ROTATION_NOISE_DEG] 是识别噪声**：0.6° 在 120px 高的框上只挪 1px，
+   *   旋转只会把盖板转歪、把原文边角露出来。
    */
   function resolveCoverQuad(options) {
     var padding = Number(options && options.padding) || 0;
     var scale = 1 + COVER_PADDING_BASE * clamp(padding, 0, COVER_PADDING_MAX);
     var rotation = Number(options && options.rotationDeg) || 0;
-    var rotationTilted = Math.abs(rotation) > COVER_TILT_TOLERANCE_DEG;
+    var rotationTilted = Math.abs(rotation) > COVER_ROTATION_NOISE_DEG
+      && Math.abs(rotation) < RENDER_ROTATION_VERTICAL_MIN_DEG;
     var polygonPoints = normalizePoints(options && options.polygon, 4);
     var polygonBox = polygonPoints && boundsOfPoints(polygonPoints);
     var normalizedBox = normalizeBox(options && options.box) || polygonBox;
@@ -304,11 +334,13 @@
       quad = inflatePolygonAboutCenter(polygonPoints, scale);
       tilted = rotationTilted || polygonTilted;
     } else {
-      quad = rotateBoxQuad(normalizedBox, rotation, scale);
+      // 只有框、没有四边形：竖排（≥60°）与噪声（≤2°）都不旋转 —— 竖排的框就是那一列，
+      // 噪声的框本来就该是轴对齐的。
+      quad = rotateBoxQuad(normalizedBox, rotationTilted ? rotation : 0, scale);
     }
     var bounds = boundsOfPoints(quad || []);
     if (!bounds) {
-      var fallback = rotateBoxQuad(normalizedBox, rotation, 1);
+      var fallback = rotateBoxQuad(normalizedBox, rotationTilted ? rotation : 0, 1);
       var fallbackBounds = boundsOfPoints(fallback || []);
       return fallbackBounds
         ? { quad: fallback, bounds: fallbackBounds, rotationDeg: rotation, tilted: tilted }
@@ -417,6 +449,10 @@
     // font-size 也一并声明：探针/遮罩在 inline 字号写入之前就要和宿主无关。
     ".mt-overlay-root,.mt-bubble,.mt-bubble-content,.mt-loading-card,.mt-loading-label{letter-spacing:normal;font-style:normal;",
     "text-transform:none;font-size:inherit;line-height:normal;}",
+    // 截图翻译的译文层 = **纯展示**：整棵场景根（含气泡的 click 目标）禁用指针事件，
+    // 触摸/滚动全部**穿透到页面**，不再影响站内交互（用户 2026-10-14 报「译文盖在上面、
+    // 影响应用交互」）。点气泡看原文只保留在活翻译链路（那本来就是半透明探索层）。
+    ".__mt_no_touch,.__mt_no_touch *{pointer-events:none!important;cursor:default!important;}",
     ".mt-bubble{position:absolute;box-sizing:border-box;max-width:none;max-height:none;",
     "display:flex;flex-direction:column;align-items:center;justify-content:center;",
     "font-family:\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif;",
@@ -461,6 +497,12 @@
     "background-position:var(--mt-cleaned-position-x,0) var(--mt-cleaned-position-y,0);",
     "border:1px solid transparent;-webkit-text-stroke:var(--mt-stroke-width,2px) var(--mt-stroke-color,#fff);",
     "paint-order:stroke fill;text-shadow:0 0 1px var(--mt-stroke-color,#fff);}",
+    // **不透明实底盖板**（宿主显式下发 `flat_cover`，见 createCoverNode）：速度优先路线上宁可
+    // 用一块纯色把原文彻底盖住，也不要「贴片边缘留残影」。选择器比 .mt-bg-none 更具体，
+    // 也压过 data-cleaned-layers="2" 的多层清理图规则。
+    ".mt-bubble.mt-cover-only[data-cover-fill=\"flat\"],",
+    ".mt-bubble.mt-cover-only[data-cover-fill=\"flat\"]::before{background:var(--mt-adaptive-bg,rgba(255,255,255,0.96))!important;",
+    "background-image:none!important;}",
     // 背景单色且原文无描边 → 整条描边关掉（2026-09-30 用户要求）。
     // ⚠️ 只把 --mt-stroke-width 置 0 还不够：`.mt-bg-none` 还有一条 1px 的白 text-shadow，
     // 留着就是一圈极浅的白晕，10px 小字上依然会糊掉笔画。选择器比 `.mt-bg-none` 多一个类，稳赢。
@@ -612,11 +654,330 @@
     return rows.filter(Boolean).join("\n");
   }
 
+  // ---------------------------------------------------------------------------
+  // 像素感知均衡断行（2026-10-14）
+  //
+  // 为什么加：字符数均衡（上面的 formatTranslationForOriginalLines）只解决「行数对」，
+  // 不解决三件事 ——
+  // 1. 行数 = 1 的气泡完全不参与（全靠 CSS 贪心换行 → 末行一两个字）；
+  // 2. 按**字数**均衡，不是按**渲染宽度**均衡（CJK 标点/英数字宽度不同，实际仍不均）；
+  // 3. 断点可以落在**词中间**（用户截图：「讨｜厌它」被劈成两行）。
+  //
+  // 这一层用「分词 + 实测宽度 + 动态规划」替换贪心：断点只在词边界，标点优先，
+  // 行首/行尾禁则，且每行宽度不超过容器可用宽度。
+  // ---------------------------------------------------------------------------
+
+  /** 行首不能出现的收尾标点（会挂在前一行末尾）。 */
+  var BREAK_CLOSING_PUNCT = /[。，、！？；：）］｝」』〉》’”…‥・,!?;:)\]}]/;
+  /** 行尾不能出现的开引/开括号（会挂到下一行开头）。 */
+  var BREAK_OPENING_PUNCT = /[（［｛「『〈《“‘〔【(\[{]/;
+  /** 断点落在标点之后是「自然断点」：给折扣，优先在标点后断行。 */
+  var BREAK_PUNCT_BONUS = 60;
+  /** 行首出现收尾标点 / 行尾出现开括号：罚到几乎不可能（除非无解）。 */
+  var BREAK_FORBIDDEN_PENALTY = 600;
+  /** 单单元成行（一个词/一个字占一行）：丑，罚分。 */
+  var BREAK_SINGLE_UNIT_PENALTY = 120;
+  /** 末行太短（≤2 字符）：丑，罚分。 */
+  var BREAK_SHORT_LAST_PENALTY = 45;
+  /** 超宽（行宽超过可用宽度）：尽量别发生；实在无解时允许（CSS 会再折，字号拟合兜底）。 */
+  var BREAK_OVERFLOW_WEIGHT = 8;
+  var BREAK_OVERFLOW_FLAT = 400;
+  /** 均衡断行最多支持几行（与字符数 DP 的上限一致）。 */
+  var BREAK_MAX_LINES = 8;
+  /** `.mt-bubble` 的水平内边距（em，见 OVERLAY_CSS 的 padding:0.12em 0.34em）。 */
+  var BUBBLE_PADDING_X_EM = 0.34;
+  /** CJK 字符判定（含假名/谚文），用于「超宽单元拆字」。 */
+  var CJK_CHAR_RE = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/;
+
+  /**
+   * 分词（Intl.Segmenter，词典分词）：返回 `[{text, sepAfter, wordLike}]`。
+   * 段后空白挂到前一段（`sepAfter=" "`）；不支持 Segmenter 的旧 WebView 退化为
+   * 「拉丁按空格切词 + CJK/标点逐字」——不强求精度，只求断点不落在词中间。
+   */
+  function segmentTextForBreaking(text) {
+    var raw = String(text || "");
+    var units = [];
+    var segmenter = null;
+    try {
+      if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
+        segmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+      }
+    } catch (err) {
+      segmenter = null;
+    }
+    if (segmenter) {
+      try {
+        var segments = segmenter.segment(raw);
+        for (var segment of segments) {
+          if (/^\s+$/.test(segment.segment)) {
+            if (units.length > 0 && !units[units.length - 1].sepAfter) {
+              units[units.length - 1].sepAfter = " ";
+            }
+            continue;
+          }
+          units.push({
+            text: segment.segment,
+            sepAfter: "",
+            wordLike: segment.isWordLike === true
+          });
+        }
+        return units;
+      } catch (err) {
+        units = [];
+      }
+    }
+    var buffer = "";
+    var flush = function () {
+      if (buffer) {
+        units.push({ text: buffer, sepAfter: "", wordLike: true });
+        buffer = "";
+      }
+    };
+    Array.from(raw).forEach(function (ch) {
+      if (/\s/.test(ch)) {
+        flush();
+        if (units.length > 0 && !units[units.length - 1].sepAfter) {
+          units[units.length - 1].sepAfter = " ";
+        }
+        return;
+      }
+      if (CJK_CHAR_RE.test(ch) || BREAK_CLOSING_PUNCT.test(ch) || BREAK_OPENING_PUNCT.test(ch)) {
+        flush();
+        units.push({ text: ch, sepAfter: "", wordLike: CJK_CHAR_RE.test(ch) });
+        return;
+      }
+      buffer += ch;
+    });
+    flush();
+    return units;
+  }
+
+  /** 单元有效宽度 = 文本宽 + 段后空白宽（换行时行尾空格会被 CSS 折叠，这里略微保守）。 */
+  function unitWidths(units, measure) {
+    return units.map(function (unit) {
+      return Number(measure(unit.text + (unit.sepAfter || ""))) || 0;
+    });
+  }
+
+  /** 单个 CJK 单元比一行还宽（长词/无标点长串）时拆成单字，否则 DP 只能让它超宽。 */
+  function splitOverwideUnits(units, maxWidthPx, measure) {
+    var result = [];
+    units.forEach(function (unit) {
+      var width = Number(measure(unit.text + (unit.sepAfter || ""))) || 0;
+      if (width <= maxWidthPx || !CJK_CHAR_RE.test(unit.text)) {
+        result.push(unit);
+        return;
+      }
+      var chars = Array.from(unit.text);
+      chars.forEach(function (ch, index) {
+        result.push({
+          text: ch,
+          sepAfter: index === chars.length - 1 ? (unit.sepAfter || "") : "",
+          wordLike: false
+        });
+      });
+    });
+    return result;
+  }
+
+  /** 贪心换行需要几行（用于「保持当前行数」——重排后行数变了会让字号拟合失效）。 */
+  function greedyLineCount(units, widths, maxWidthPx) {
+    if (!units || units.length === 0) return 0;
+    var lines = 1;
+    var used = 0;
+    for (var i = 0; i < units.length; i += 1) {
+      var width = widths[i];
+      if (used > 0 && used + width > maxWidthPx) {
+        lines += 1;
+        used = width;
+      } else {
+        used += width;
+      }
+    }
+    return lines;
+  }
+
+  /**
+   * 动态规划断行（纯函数，可单测）：把 [units] 断成恰好 [lineCount] 行。
+   *
+   * 代价 = Σ(行宽 − 目标行宽)² + 单单元成行罚 + 末行过短罚 + 超宽重罚
+   *        − 标点后断行折扣（≥0）+ 行首收尾标点/行尾开括号重罚。
+   * 无解（装不下、单元数不够）返回 null —— 调用方保持原文本，不赌。
+   */
+  function breakBalancedLines(units, widths, lineCount, maxWidthPx) {
+    var n = units.length;
+    var lines = Math.max(1, Math.min(BREAK_MAX_LINES, Math.round(Number(lineCount) || 1)));
+    if (n === 0 || lines <= 1 || n < lines) return null;
+    var prefix = new Array(n + 1);
+    prefix[0] = 0;
+    for (var i = 0; i < n; i += 1) prefix[i + 1] = prefix[i] + widths[i];
+    var total = prefix[n];
+    var target = total / lines;
+    var INF = 1e12;
+
+    var cost = [];
+    var back = [];
+    for (var k = 0; k <= lines; k += 1) {
+      cost.push(new Array(n + 1).fill(INF));
+      back.push(new Array(n + 1).fill(-1));
+    }
+    cost[0][0] = 0;
+    for (var line = 1; line <= lines; line += 1) {
+      // 第 line 行至少得有 line 个单元；后面还要留 (lines - line) 个单元。
+      for (var end = line; end <= n - (lines - line); end += 1) {
+        var best = INF;
+        var bestStart = -1;
+        for (var start = line - 1; start < end; start += 1) {
+          var previous = cost[line - 1][start];
+          if (previous >= INF) continue;
+          var width = prefix[end] - prefix[start];
+          var lineCost = previous + Math.pow(width - target, 2);
+          if (width > maxWidthPx) {
+            lineCost += Math.pow(width - maxWidthPx, 2) * BREAK_OVERFLOW_WEIGHT + BREAK_OVERFLOW_FLAT;
+          }
+          var unitsOnLine = end - start;
+          var firstText = units[start].text;
+          var lastText = units[end - 1].text;
+          if (unitsOnLine === 1) lineCost += BREAK_SINGLE_UNIT_PENALTY;
+          if (end === n && unitsOnLine <= 2) lineCost += BREAK_SHORT_LAST_PENALTY;
+          if (BREAK_CLOSING_PUNCT.test(firstText.charAt(0))) lineCost += BREAK_FORBIDDEN_PENALTY;
+          if (BREAK_OPENING_PUNCT.test(lastText.charAt(lastText.length - 1))) lineCost += BREAK_FORBIDDEN_PENALTY;
+          if (BREAK_CLOSING_PUNCT.test(lastText.charAt(lastText.length - 1))) lineCost -= BREAK_PUNCT_BONUS;
+          if (lineCost < best) {
+            best = lineCost;
+            bestStart = start;
+          }
+        }
+        cost[line][end] = best;
+        back[line][end] = bestStart;
+      }
+    }
+    if (cost[lines][n] >= INF) return null;
+    var rows = new Array(lines);
+    var cursor = n;
+    for (var rowIndex = lines; rowIndex >= 1; rowIndex -= 1) {
+      var startIndex = back[rowIndex][cursor];
+      if (startIndex < 0) return null;
+      var row = "";
+      for (var index = startIndex; index < cursor; index += 1) {
+        row += units[index].text + (units[index].sepAfter || "");
+      }
+      rows[rowIndex - 1] = row.replace(/\s+$/, "");
+      cursor = startIndex;
+    }
+    return rows;
+  }
+
+  /** 对「已有换行的文本」按可用宽度数实际行数（每段各算一次贪心换行）。 */
+  function countGreedyLines(text, maxWidthPx, measure, tokenize) {
+    var raw = String(text || "");
+    if (!raw || !(maxWidthPx > 0)) return 0;
+    var total = 0;
+    raw.split("\n").forEach(function (segment) {
+      var trimmed = segment.trim();
+      if (!trimmed) return;
+      var units = (tokenize || segmentTextForBreaking)(trimmed);
+      if (!units || units.length === 0) return;
+      total += greedyLineCount(units, unitWidths(units, measure), maxWidthPx);
+    });
+    return total;
+  }
+
+  /**
+   * 组合入口：分词 → 测宽 → DP → 用 `\n` 连接。
+   * @param {string} text 归一空白后的译文（不允许已含 `\n`）
+   * @param {number} lineCount 目标行数（调用方按「当前渲染行数」给）
+   * @param {number} maxWidthPx 可用宽度（内容宽 = 盒子宽 − 左右内边距）
+   * @param {function(string):number} measure 文本宽度测量
+   * @param {function(string):Array} [tokenize] 分词（测试可注入）
+   * @returns {string|null} 断好的文本；不行返回 null（调用方保持原文本）
+   */
+  function formatBalancedLines(text, lineCount, maxWidthPx, measure, tokenize) {
+    var raw = String(text || "").replace(/\s+/g, " ").trim();
+    var lines = Math.round(Number(lineCount) || 0);
+    if (!raw || lines <= 1 || lines > BREAK_MAX_LINES || raw.indexOf("\n") >= 0) return null;
+    if (!(maxWidthPx > 0) || typeof measure !== "function") return null;
+    var units = (tokenize || segmentTextForBreaking)(raw);
+    if (!units || units.length <= lines) return null;
+    units = splitOverwideUnits(units, maxWidthPx, measure);
+    var rows = breakBalancedLines(units, unitWidths(units, measure), lines, maxWidthPx);
+    if (!rows) return null;
+    return rows.join("\n");
+  }
+
+  /** canvas 测量缓存（同一字号只用一套 font 串）。 */
+  var measureCanvasContext = null;
+
+  /**
+   * 文本宽度测量（px）。canvas `measureText` 优先；不可用时按字宽估算兜底
+   * （CJK ≈ 1em，其余 ≈ 0.55em）——估算只影响均衡与断点选择，硬约束由字号拟合兜底。
+   */
+  function measureTextPx(text, fontSizePx, node) {
+    var value = String(text || "");
+    if (!value) return 0;
+    try {
+      if (!measureCanvasContext && typeof document !== "undefined" && document.createElement) {
+        var canvas = document.createElement("canvas");
+        measureCanvasContext = canvas && canvas.getContext ? canvas.getContext("2d") : null;
+      }
+      if (measureCanvasContext) {
+        var weight = String((node && node.dataset && node.dataset.mtFontWeight) || "600");
+        var family = "\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif";
+        try {
+          var style = node && typeof getComputedStyle === "function" ? getComputedStyle(node) : null;
+          if (style && style.fontFamily) family = String(style.fontFamily);
+        } catch (err) {
+          // 拿不到就用默认字体族（宽度略有出入，不影响断点决策的大局）。
+        }
+        measureCanvasContext.font = weight + " " + fontSizePx + "px " + family;
+        return Number(measureCanvasContext.measureText(value).width) || 0;
+      }
+    } catch (err) {
+      measureCanvasContext = null;
+    }
+    var width = 0;
+    Array.from(value).forEach(function (ch) {
+      width += CJK_CHAR_RE.test(ch) ? fontSizePx : fontSizePx * 0.55;
+    });
+    return width;
+  }
+
+  /**
+   * 就地重排一个文字节点（在字号拟合之后调用）。
+   *
+   * 约束「重排前后行数不变」：行数变 = 文字块高度变 = 刚拟合好的字号失效。
+   * 断点用词边界 + 标点禁则；断不开（无解/竖排/跨图固定字号）就什么都不做。
+   * 幂等：同一 (原文, 宽, 字号) 只算一次；宽度/字号变化时按**原文**重算。
+   */
+  function rebalanceTextNode(node, widthPx, fontSizePx) {
+    if (!node || !node.dataset || !node.classList) return;
+    if (node.classList.contains("mt-jp-vertical")) return;
+    if (Number(node.dataset.fixedFontPercent) > 0 || node.dataset.stitchOverflow === "true") return;
+    var raw = node.dataset.translated || "";
+    var content = node.querySelector ? node.querySelector(".mt-bubble-content") : null;
+    if (!raw || !content || !(widthPx > 8) || !(fontSizePx > 0)) return;
+    var key = raw + "|" + Math.round(fontSizePx * 10) + "|" + Math.round(widthPx);
+    if (node.dataset.mtRebalanceKey === key) return;
+    node.dataset.mtRebalanceKey = key;
+    var measure = function (text) { return measureTextPx(text, fontSizePx, node); };
+    var contentWidth = Math.max(8, widthPx - 2 * BUBBLE_PADDING_X_EM * fontSizePx);
+    var current = String(content.textContent || "");
+    var lineCount = countGreedyLines(current, contentWidth, measure);
+    if (lineCount <= 1) return;
+    var formatted = formatBalancedLines(raw, lineCount, contentWidth, measure);
+    if (!formatted || formatted === current) return;
+    if (countGreedyLines(formatted, contentWidth, measure) !== lineCount) return;
+    content.textContent = formatted;
+    console.log(
+      "MTBREAK rebalance bubble=" + (node.dataset.mtLayer || node.dataset.index || "?") +
+        " lines=" + lineCount + " text=" + formatted.replace(/\n/g, "⏎").slice(0, 40)
+    );
+  }
+
   /**
    * 竖排判定：原文含韩文/拉丁且不像日文 → 横排；日文且高宽比 ≥ 0.82 → 竖排；
    * OCR 明确给出 vertical=true 时直接竖排（宽扁气泡不会被误转，writing-mode 不涉及旋转）。
-   */
-  function shouldUseVerticalLayout(bubble, displayText) {
+   */  function shouldUseVerticalLayout(bubble, displayText) {
     if (bubble.vertical === true) return true;
     var originalText = String(bubble.original_text || "").trim();
     if (originalText && /[\uac00-\ud7afA-Za-z]/.test(originalText) && !looksLikeJapaneseText(originalText)) {
@@ -765,7 +1126,15 @@
       node.style.setProperty("--mt-adaptive-bg", String(coverBubble.bg_color));
     }
     if (bgType === "none") {
-      if (coverBubble.patch_url) {
+      if (bubble.flat_cover === true) {
+        // **不透明实底盖板**（2026-10-11 用户要求：「现在会有残影，不要这样的，而是用实体的
+        // 背景遮挡」）。宿主在没有清理图纹理时（速度优先模式关闭「精细擦字」，或清理图建失败）
+        // 直接下发 flat_cover：这里用采样出来的气泡底色铺一块 100% 不透明的底，原文一点不露。
+        // 代价是背景纹理变成纯色 —— 这是「只要显示出来译文就行」的路线上明确接受的取舍；
+        // 贴片/清理图那两条路保持原样（有纹理时仍然用纹理，老场景没有这个字段 → 行为不变）。
+        node.dataset.coverFill = "flat";
+        node.style.setProperty("--mt-adaptive-bg", String(bubble.bg_color || "rgba(255,255,255,0.96)"));
+      } else if (coverBubble.patch_url) {
         // 跨图续排的擦字贴片：独立小图 100% 铺满补丁框（patch_box 在外层 clip 节点上）。
         node.style.setProperty("--mt-cleaned-image", maskCssValue(coverBubble.patch_url));
         node.style.setProperty("--mt-cleaned-size-x", "100%");
@@ -984,8 +1353,10 @@
     clip.style.top = (bounds.y + bounds.h / 2) + "%";
     clip.style.width = bounds.w + "%";
     clip.style.height = bounds.h + "%";
-    clip.style.transform = "translate(-50%, -50%)" +
-      (polygon || (geometry && geometry.tilted) ? "" : " rotate(" + rotation.toFixed(2) + "deg)");
+    // 裁剪层恒为世界坐标轴对齐：倾角只由 quad 的 clip-path 表达（与下面「斜排实底」
+    // 的注释同一口径）。此前这里在「无四边形」时额外 rotate 了整层 —— 与 clip-path
+    // 叠加等于转两次；竖排（±90°）与噪声（≤2°）现在都不旋转，rotate 只会帮倒忙。
+    clip.style.transform = "translate(-50%, -50%)";
     clip.style.transformOrigin = "center center";
     // 斜排文字绝不能退回轴对齐矩形：拿到四边形就用它裁剪；
     // 无倾角时裁剪结果等于原蓝框，视觉与轴对齐一致。
@@ -1251,9 +1622,9 @@
       var fixed = Math.round(Number(imageHeightPx) * fixedPercent / 100 * 10) / 10;
       var fixedProbe = prepareMeasureProbe(node, width, height, text, fixed);
       if (!isProbeOverflowing(fixedProbe)) return fixed;
-      var fixLow = FONT_MIN;
+      var fixLow = FONT_ABS_MIN;
       var fixHigh = fixed;
-      var fixBest = FONT_MIN;
+      var fixBest = FONT_ABS_MIN;
       for (var fixStep = 0; fixStep < FONT_BINARY_STEPS; fixStep += 1) {
         var fixMid = (fixLow + fixHigh) / 2;
         fixedProbe.style.fontSize = fixMid + "px";
@@ -1265,7 +1636,7 @@
         }
       }
       var fixSafety = vertical ? FONT_SAFETY_VERTICAL : FONT_SAFETY;
-      return Math.round(Math.max(fixBest * fixSafety, FONT_MIN) * 10) / 10;
+      return Math.round(Math.max(fixBest * fixSafety, FONT_ABS_MIN) * 10) / 10;
     }
     var originalH = Number(getOriginalTextHeight(node, height, imageHeightPx)) || 0;
     var range = resolveFontSizeRange(height, originalH);
@@ -1276,15 +1647,18 @@
     var cachedSize = fontFitCache.get(cacheKey);
     if (Number.isFinite(cachedSize)) {
       var cachedProbe = prepareMeasureProbe(node, width, height, text, cachedSize);
-      if (isProbeOverflowing(cachedProbe)) expandForTextOverflow(node, width, height, cachedProbe);
+      if (isProbeOverflowing(cachedProbe)) {
+        logFontExpansion(node, width, height, cachedSize, cachedProbe, "cache");
+        expandForTextOverflow(node, width, height, cachedProbe);
+      }
       return cachedSize;
     }
 
     resetOverflowExpansion(node);
     var probe = prepareMeasureProbe(node, width, height, text, startSize);
-    var low = FONT_MIN;
-    var high = startSize;
-    var best = FONT_MIN;
+    var low = FONT_ABS_MIN;
+    var high = Math.max(startSize, FONT_ABS_MIN);
+    var best = FONT_ABS_MIN;
     for (var step = 0; step < FONT_BINARY_STEPS; step += 1) {
       var mid = (low + high) / 2;
       probe.style.fontSize = mid + "px";
@@ -1296,14 +1670,34 @@
       }
     }
     var safety = vertical ? FONT_SAFETY_VERTICAL : FONT_SAFETY;
-    var safeSize = clamp(best * safety, FONT_MIN, maxFont);
+    var safeSize = clamp(best * safety, FONT_ABS_MIN, maxFont);
     probe.style.fontSize = safeSize + "px";
     if (isProbeOverflowing(probe)) {
+      // 到绝对下限仍装不下才撑开（极端：框比一个字还小）。撑开是最后手段，
+      // 会把译文画出原文位置 —— 必须留下诊断，下一份日志能直接定位是哪个气泡、差多少。
+      logFontExpansion(node, width, height, safeSize, probe, "floor");
       expandForTextOverflow(node, width, height, probe);
     }
     var normalized = Math.round(safeSize * 10) / 10;
     rememberFontFit(cacheKey, normalized);
     return normalized;
+  }
+
+  /**
+   * 撑开兜底的诊断（2026-10-12）：走到这里 = 缩到 8px 下限仍装不下，节点要被撑出
+   * 原文位置了。打出「哪个气泡、框多大、字实际需要多大、最终几号」，下一份 logcat
+   * 能直接回答「是框给小了还是译文太长」。
+   */
+  function logFontExpansion(node, width, height, fontSize, probe, reason) {
+    var meta = node && node.dataset;
+    var id = (meta && meta.mtLayer) || (meta && meta.index) || "?";
+    console.log(
+      "MTFONT expand reason=" + reason + " bubble=" + id +
+        " box=" + width + "x" + height +
+        " need=" + Math.ceil(probe.scrollWidth) + "x" + Math.ceil(probe.scrollHeight) +
+        " font=" + fontSize +
+        " text=" + String((meta && meta.translated) || "").slice(0, 24)
+    );
   }
 
   function dynamicStrokeWidth(fontSize) {
@@ -1580,6 +1974,13 @@
       var fitted = fitBubbleFontSize(node, bubbleWidthPx, bubbleHeightPx, rect.height);
       node.style.fontSize = fitted.toFixed(1) + "px";
       applyStrokeWidth(node, fitted);
+      // 字号定了之后做一次「词边界 + 像素宽」均衡重排（2026-10-14）：
+      // 保持行数不变，只换断点；断不开就保持现状（见 rebalanceTextNode）。
+      try {
+        rebalanceTextNode(node, bubbleWidthPx, fitted);
+      } catch (err) {
+        // 重排失败不能拖垮渲染：保持原断行。
+      }
     });
   }
 
@@ -1920,6 +2321,50 @@
   // 入口
   // ---------------------------------------------------------------------------
 
+  /**
+   * 排版框重叠诊断（2026-10-12，只记日志不改行为）。
+   *
+   * 用户截图里「两份译文叠在同一处」可能有两种成因：宿主分组层把两个气泡的排版框
+   * 算到了一起（框本身重叠），或接缝层与场景层各画了一份。这条日志把「同一 root 内
+   * 两个文字节点的排版框大面积交叠」直接打出来 —— 下一份 logcat 就能区分：
+   * MTGEOM 有输出 = 宿主下发的框本身重叠（查分组/接缝归属）；没有 = 渲染层自己画重了。
+   *
+   * 阈值 0.5：排版框是字形框朝气泡方向外扩过的产物，相邻气泡轻微相交属正常；
+   * 交叠面积超过较小框的一半才值得报告。斜排气泡的轴对齐外接框相交更多，可能误报
+   * —— 所以只记日志，绝不作为行为的判据。
+   */
+  function logTextOverlap(textNodes, context) {
+    for (var i = 0; i < textNodes.length; i += 1) {
+      for (var j = i + 1; j < textNodes.length; j += 1) {
+        var a = textNodes[i];
+        var b = textNodes[j];
+        if (!a || !b || !a.dataset || !b.dataset) continue;
+        var ax = Number(a.dataset.xPercent) || 0;
+        var ay = Number(a.dataset.yPercent) || 0;
+        var aw = Number(a.dataset.wPercent) || 0;
+        var ah = Number(a.dataset.hPercent) || 0;
+        var bx = Number(b.dataset.xPercent) || 0;
+        var by = Number(b.dataset.yPercent) || 0;
+        var bw = Number(b.dataset.wPercent) || 0;
+        var bh = Number(b.dataset.hPercent) || 0;
+        var ix = Math.max(0, Math.min(ax + aw, bx + bw) - Math.max(ax, bx));
+        var iy = Math.max(0, Math.min(ay + ah, by + bh) - Math.max(ay, by));
+        var inter = ix * iy;
+        var minArea = Math.min(aw * ah, bw * bh);
+        if (inter <= 0 || minArea <= 0) continue;
+        var ratio = inter / minArea;
+        if (ratio < 0.5) continue;
+        console.log(
+          "MTGEOM overlap " + context + " ratio=" + (Math.round(ratio * 100) / 100) +
+            " a=" + ((a.dataset.mtLayer || a.dataset.index) || "?") + " " +
+            Math.round(ax) + "," + Math.round(ay) + " " + Math.round(aw) + "x" + Math.round(ah) +
+            " b=" + ((b.dataset.mtLayer || b.dataset.index) || "?") + " " +
+            Math.round(bx) + "," + Math.round(by) + " " + Math.round(bw) + "x" + Math.round(bh)
+        );
+      }
+    }
+  }
+
   function applyScene(payload) {
     injectCss();
     var imageId = String(payload && payload.image_id || "");
@@ -1955,16 +2400,26 @@
       if (existing) destroyOverlay(existing);
       return JSON.stringify({ ok: true, rebuilt: true, bubbles: 0 });
     }
+    logTextOverlap(textNodes, "scene=" + imageId);
 
     var layer = ensureLayerOnHost(target);
     var root = document.createElement("div");
     root.className = "mt-overlay-root __mt_scene_root";
     root.dataset.mtOverlay = "true";
     root.dataset.imageId = imageId;
+    // 接缝层顶掉的「两半」在场景**重建**后要继续被顶掉（2026-10-14，用户：「向下划后再次
+    // 向上划的时候可能会出现重复的译文」）。
+    //
+    // 现场：懒加载站点滚动时把 <img> 换成新 blob URL —— 会话按内容指纹复用场景重新下发，
+    // `applyScene` 建新 root，而 `suppressBubble` 摘掉的那半块又回来了；接缝层仍活着
+    // → 同一句台词画两遍（一份来自接缝带、一份来自被贴回来的半块）。
+    // 登记表里的节点在这里**换绑到新 root**（同名 layerId 视为同一块），贴回时依旧有效。
+    var visibleCoverNodes = rebindSuppressedNodes(imageId, root, coverNodes);
+    var visibleTextNodes = rebindSuppressedNodes(imageId, root, textNodes);
     // 所有背景先绘制、所有译文后绘制：相邻蓝框再接近，背景也不能盖住别人的文字。
-    coverNodes.forEach(function (node) { root.appendChild(node); });
-    textNodes.forEach(function (node) {
-      var delay = Math.min(textNodes.indexOf(node) * 34, 320);
+    visibleCoverNodes.forEach(function (node) { root.appendChild(node); });
+    visibleTextNodes.forEach(function (node) {
+      var delay = Math.min(visibleTextNodes.indexOf(node) * 34, 320);
       node.classList.add("mt-stream-enter");
       node.style.setProperty("--mt-stream-delay", delay + "ms");
       root.appendChild(node);
@@ -1986,7 +2441,9 @@
       layer: layer,
       signature: signature,
       cleanedUrl: String(payload.cleaned_url || ""),
-      textNodes: textNodes,
+      // 只登记**留在画面上**的文字层：被接缝层顶掉的半块虽然换绑到了新 root，
+      // 但它此刻不在 DOM 里（见 rebindSuppressedNodes），字号拟合/同步都该跳过它。
+      textNodes: visibleTextNodes,
       lastRect: null,
       fontPending: true,
       // §11 跨图 union 需要原始气泡数据来重建遮罩几何；按 id 存一份，避免二次解析 payload。
@@ -2008,7 +2465,7 @@
     syncOverlayPosition(entry);
     startFrameSync();
     // 流式入场：淡入结束后移除动画类（之后滚动/重建不再触发动画）。
-    textNodes.forEach(function (node, index) {
+    visibleTextNodes.forEach(function (node, index) {
       window.setTimeout(function () {
         if (node.isConnected) {
           node.classList.remove("mt-stream-enter");
@@ -2019,10 +2476,38 @@
     return JSON.stringify({
       ok: true,
       rebuilt: true,
-      bubbles: textNodes.length,
-      covers: coverNodes.length,
+      bubbles: visibleTextNodes.length,
+      suppressed: textNodes.length - visibleTextNodes.length,
+      covers: visibleCoverNodes.length,
       host: entry.layer === layer ? (isDocumentHost(layer.parentElement) ? "document" : "scroll") : "unknown"
     });
+  }
+
+  /**
+   * 场景重建时把「被接缝层顶掉的半块」继续摘掉（2026-10-14）。
+   *
+   * 返回**该挂进新 root**的节点；被顶掉的节点换绑登记表的 parent/node 后不返回
+   * （接缝层失效时 [restoreSeamHalves] 会把它们贴回来 —— 那时它们会被挂到新 root 上）。
+   *
+   * 只在同名 `data-mt-layer` 命中登记表时生效：登记表按 imageId + layerId 记录，
+   * 会话重发的场景与第一次下发的场景同源（同一份 `BrowserSceneBuilder` 数据）。
+   */
+  function rebindSuppressedNodes(imageId, root, nodes) {
+    if (!suppressedHalves.length) return nodes;
+    var kept = [];
+    nodes.forEach(function (node) {
+      var layerId = String((node && node.dataset && node.dataset.mtLayer) || "");
+      var record = layerId ? suppressedHalves.find(function (item) {
+        return item.imageId === imageId && item.layerId === layerId;
+      }) : null;
+      if (!record) {
+        kept.push(node);
+        return;
+      }
+      record.node = node;
+      record.parent = root;
+    });
+    return kept;
   }
 
   /** 由 Kotlin 侧调用：JSON 字符串 → 场景。 */
@@ -2578,6 +3063,7 @@
       if (existing) dropSeam(seamKey);
       return JSON.stringify({ ok: true, rebuilt: true, bubbles: 0, mode: "seam" });
     }
+    logTextOverlap(textNodes, "seam=" + seamKey);
 
     var layer = ensureLayerOnHost(t0);
     var root = document.createElement("div");
@@ -2656,7 +3142,21 @@
     return "visible";
   }
 
+  /**
+   * 把某张图（imageId）的场景层切成**纯展示**：整棵 root 禁用指针事件，触摸穿透到页面。
+   *
+   * 用途：截图翻译的译文是盖在**仍可交互的网页**上的，气泡自带的 click（点一下看原文）
+   * 会吃掉触摸/滚动（用户 2026-10-14 报「影响应用交互」）。活翻译链路不调用它。
+   */
+  function noTouch(imageId) {
+    var root = document.querySelector('.__mt_scene_root[data-image-id="' + String(imageId || "") + '"]');
+    if (!root || !root.classList) return 0;
+    root.classList.add("__mt_no_touch");
+    return 1;
+  }
+
   window.MtOverlay = Object.freeze({
+    noTouch: noTouch,
     applyScene: applyScene,
     applySceneJson: applySceneJson,
     // 接缝覆盖层：一条图缝一个 root，一块盖板 + 一份译文（跨缝不再各画半块）。
@@ -2686,10 +3186,17 @@
     _resolveSeamBand: resolveSeamBand,
     _fitBubbleFontSize: fitBubbleFontSize,
     _resolveFontSizeRange: resolveFontSizeRange,
+    _logTextOverlap: logTextOverlap,
     _resolveCoverQuad: resolveCoverQuad,
     _resolveCoverSegments: resolveCoverSegments,
     _createCoverLayers: createCoverLayers,
     _formatTranslationForOriginalLines: formatTranslationForOriginalLines,
+    // 像素感知均衡断行（2026-10-14）：纯函数入口，供验收测试表驱动。
+    _breakBalancedLines: breakBalancedLines,
+    _formatBalancedLines: formatBalancedLines,
+    _segmentTextForBreaking: segmentTextForBreaking,
+    _countGreedyLines: countGreedyLines,
+    _rebalanceTextNode: rebalanceTextNode,
     _polygonRotationDeg: polygonRotationDeg,
     _sanitizeRenderRotationDeg: sanitizeRenderRotationDeg,
     _shouldUseVerticalLayout: shouldUseVerticalLayout,

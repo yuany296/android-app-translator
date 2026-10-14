@@ -78,7 +78,16 @@ object BrowserSceneBuilder {
         /** 跨图续排的擦字贴片 URL（mtlocal 拦截通道）。 */
         val patchUrl: String? = null,
         /** 贴片目标框（百分比 x/y/w/h），为 null 时贴片语义不生效。 */
-        val patchBox: FloatArray? = null
+        val patchBox: FloatArray? = null,
+        /**
+         * **不透明实底盖板**（2026-10-11 用户要求「不要残影，用实体的背景遮挡」）。
+         *
+         * 只对 `bg_type = "none"`（旁白/压在画面上的文字）有意义：宿主拿不到清理图纹理时
+         * （速度优先模式关闭「精细擦字」，或清理图构建失败），盖板不再留空/贴残影贴片，
+         * 而是直接用 `bg_color`（气泡底色采样）铺一块**100% 不透明**的底把原文盖掉。
+         * 缺省 false = 老行为（透明 + 清理图/贴片）。
+         */
+        val flatCover: Boolean = false
     )
 
     /** 跨页/分片遮罩段：page_id 用于 union/去重，为空时按 index 兜底。 */
@@ -151,6 +160,8 @@ object BrowserSceneBuilder {
         append(",\"fixed_font_percent\":").append(bubble.fixedFontPercent?.let { num(it) } ?: "null")
         append(",\"patch_url\":").append(bubble.patchUrl?.let { quote(it) } ?: "null")
         append(",\"patch_box\":").append(boxObject(bubble.patchBox))
+        // 只在 true 时下发（默认透明盖板，老渲染层没有这个字段 → 行为与改动前一致）。
+        if (bubble.flatCover) append(",\"flat_cover\":true")
         append("}")
     }
 

@@ -35,6 +35,10 @@ class PageTranslationResolver(
         timer: TranslationTimer,
         onTranslatorDownloading: ((Boolean) -> Unit)? = null
     ): TranslationOutcome {
+        // 源语言自动识别（2026-10-14 定稿）：**只提示、不跟随**。识别不符的提示由
+        // `EngineSelectingTextDetector` 写入 `LanguageMismatchHint`（阅读底栏展示）；
+        // 翻译一律按用户配置的语言走，不再用识别结果改写 sourceLanguage。
+        val effective = settings
         val sentenceRepo = ServiceLocator.sentenceTranslationRepository
         val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
             val map = hashMapOf<String, String>()
@@ -51,7 +55,7 @@ class PageTranslationResolver(
                     skipped += 1
                     return@forEach
                 }
-                val lookup = sentenceRepo.lookup(settings.sourceLanguage, settings.targetLanguage, original)
+                val lookup = sentenceRepo.lookup(effective.sourceLanguage, effective.targetLanguage, original)
                 when (lookup.matchKind) {
                     com.manga.translator.store.SentenceCacheMatchKind.EXACT -> {
                         map[original] = lookup.translatedText!!
@@ -99,7 +103,7 @@ class PageTranslationResolver(
             timer.mark("request_send", "stage=translate missing=${missing.size} total=${bubbles.size}")
             val (translated, fallbackHint) = withContext(ioDispatcher) {
                 translateMissing(
-                    settings = settings,
+                    settings = effective,
                     texts = missing.map { it.originalText.replace(Regex("\\s+"), " ").trim() },
                     glossaryEntries = glossaryEntries,
                     timer = timer,
@@ -116,7 +120,7 @@ class PageTranslationResolver(
                         .ifBlank { bubble.originalText }
                         .replace(Regex("\\s+"), " ").trim()
                     translatedByOriginal[bubble.originalText] = value
-                    sentenceRepo.put(settings.sourceLanguage, settings.targetLanguage, bubble.originalText, value)
+                    sentenceRepo.put(effective.sourceLanguage, effective.targetLanguage, bubble.originalText, value)
                 }
                 TranslationResult(
                     bubbles.map { bubble ->
@@ -134,8 +138,8 @@ class PageTranslationResolver(
                             id = "h${now}_${translateKey.take(8)}",
                             timestampMs = now,
                             pageHash = pageHash,
-                            sourceLanguage = settings.sourceLanguage,
-                            targetLanguage = settings.targetLanguage,
+                            sourceLanguage = effective.sourceLanguage,
+                            targetLanguage = effective.targetLanguage,
                             translateFingerprint = translateKey,
                             bubblesJson = serializeResult(historySnapshot)
                         )
@@ -250,7 +254,14 @@ class PageTranslationResolver(
             thinkingBudget = settings.thinkingBudget,
             glossary = glossaryEntries.map { it.source to it.target }
         )
-        return cloud to null
+        // 2026-10-14：重试后仍有句子等于原文（解析失败/截断/模型没翻）时给提示，不再静默。
+        val failed = cloud.failedIndices.size
+        val hint = if (failed > 0) {
+            "云端翻译部分句子未生效（$failed/${texts.size} 句已显示原文）"
+        } else {
+            null
+        }
+        return cloud.translations to hint
     }
 
     fun buildTranslateKey(

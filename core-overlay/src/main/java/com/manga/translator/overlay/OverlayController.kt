@@ -28,6 +28,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
 import com.manga.translator.overlay.erase.ErasePatch
+import com.manga.translator.translate.BalancedLineBreaker
 import com.manga.translator.translate.Bubble
 import kotlin.math.hypot
 import kotlin.math.max
@@ -510,6 +511,20 @@ val tv = if (useVerticalLayout) {
             state.fittedTextSp = fit.textSizeSp
             state.isTruncated = fit.truncated
             state.lineSpacingMultiplier = fit.lineSpacingMultiplier
+            // 像素感知均衡断行（2026-10-14）：字号已定，把贪心断行换成「词边界 + 像素宽均衡」。
+            // 行数必须保持不变（行数变了高度就变、字号拟合失效）；断不开保持贪心。
+            if (!useVerticalLayout && !fit.truncated) {
+                val rebalanced = rebalancedBubbleText(
+                    text = normalizedTranslatedText,
+                    paint = TextPaint(tv.paint),
+                    widthPx = boxW,
+                    lineSpacingMultiplier = fit.lineSpacingMultiplier
+                )
+                if (rebalanced != null) {
+                    tv.text = rebalanced
+                    state.displayText = rebalanced
+                }
+            }
             if (state.isTruncated) {
                 tv.maxLines = 1
                 tv.ellipsize = TextUtils.TruncateAt.END
@@ -1148,6 +1163,45 @@ private fun computeFontSp(boxHeightPx: Float): Float {
         )
     }
 
+    /**
+     * 气泡译文重排（2026-10-14）：按 `paint` 当前字号（= 拟合结果）先数出**贪心行数**，
+     * 再用 [BalancedLineBreaker] 断成同样的行数（词边界 + 像素宽均衡 + 标点禁则）。
+     *
+     * 行数不一致（重排后贪心行数变了）就不用 —— 行数变了高度就变、字号拟合失效。
+     * 竖排/已含换行/单行/断不开返回 null，调用方保持贪心结果。
+     */
+    private fun rebalancedBubbleText(
+        text: String,
+        paint: TextPaint,
+        widthPx: Float,
+        lineSpacingMultiplier: Float
+    ): String? {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || trimmed.indexOf('\n') >= 0 || widthPx <= 8f) return null
+        val layout = StaticLayout.Builder
+            .obtain(trimmed, 0, trimmed.length, paint, widthPx.toInt().coerceAtLeast(1))
+            .setIncludePad(false)
+            .setLineSpacing(0f, lineSpacingMultiplier)
+            .build()
+        val lineCount = layout.lineCount
+        if (lineCount <= 1 || lineCount > BalancedLineBreaker.MAX_LINES) return null
+        val width = widthPx
+        val measure: (String) -> Float = { value -> paint.measureText(value) }
+        val rows = BalancedLineBreaker.breakLines(
+            text = trimmed,
+            lineCount = lineCount,
+            maxWidthPx = width,
+            measure = measure
+        ) ?: return null
+        val joined = rows.joinToString("\n")
+        val greedy = BalancedLineBreaker.countGreedyLines(
+            text = joined,
+            maxWidthPx = width,
+            measure = measure
+        )
+        return if (greedy == lineCount) joined else null
+    }
+
     private fun fitsText(
         text: String,
         templatePaint: TextPaint,
@@ -1156,8 +1210,7 @@ private fun computeFontSp(boxHeightPx: Float): Float {
         maxLines: Int,
         textSizeSp: Float,
         lineSpacingMultiplier: Float
-    ): Boolean {
-        val paint = TextPaint(templatePaint).apply { textSize = spToPx(textSizeSp) }
+    ): Boolean {        val paint = TextPaint(templatePaint).apply { textSize = spToPx(textSizeSp) }
         val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, widthPx.coerceAtLeast(1))
             .setIncludePad(false)
             .setAlignment(Layout.Alignment.ALIGN_NORMAL)

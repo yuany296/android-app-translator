@@ -17,8 +17,35 @@ data class BubbleColors(
      * 原作者给文字加了描边就是一种排版意图，译文的风格要跟原文一致，
      * 不能因为「这次背景恰好是单色」就把描边吞掉。
      */
-    val originalHadOutline: Boolean = false
-)
+    val originalHadOutline: Boolean = false,
+    /**
+     * 外圈一致率（0..1）：文字框外圈采样里，贴着采样底色（距离 ≤ 24）的像素占比。
+     *
+     * 为什么要它（2026-10-13 用户反馈「这个截页处的气泡框是纯色背景，但是它用的是清理图。
+     * 希望处理为 solid」）：区域检测没命中时气泡一律被当成复杂背景（`bg_type=none`），
+     * 盖板从**清理图**（inpaint 产物）裁切 —— 白气泡边上于是出现擦不干净的灰痕。
+     * 外圈一致率就是「这一圈到底是不是一条平底色」的量测值，见 [flatBackground]。
+     */
+    val bgCoverage: Float = 0f
+) {
+    /**
+     * 这块底是不是一条「亮的平底色」→ 允许把盖板换成纯色平涂（`bg_type=solid`），
+     * 不必再走清理图。判据与阈值见 [BubbleBackgroundPolicy]（对齐参考项目
+     * `bubble-colors.js` 的 `adaptiveBackground` 升级）。
+     */
+    val flatBackground: Boolean
+        get() = BubbleBackgroundPolicy.isFlatBrightBackground(bgColor, bgCoverage)
+}
+
+/** 外圈采样结果：底色 + 一致率（见 [BubbleColors.bgCoverage]）。 */
+data class BubbleBackground(
+    val color: Int,
+    val coverage: Float
+) {
+    /** 这条外圈量出来是「亮的平底色」→ 可以把盖板换成纯色平涂（见 [BubbleColors.flatBackground]）。 */
+    val flatBackground: Boolean
+        get() = BubbleBackgroundPolicy.isFlatBrightBackground(color, coverage)
+}
 
 /**
  * 墨色量化桶总数：每通道 6 bit（256 / 4 = 64 级）→ 64³。
@@ -37,23 +64,42 @@ internal const val INK_BUCKET_COUNT = 64 * 64 * 64
  *    在其余桶里找「有色度 + 离背景够远 + 像素数够」的彩色候选让位（2026-09-28 对齐 v4）。
  */
 class BubbleColorExtractor {
+    /**
+     * 只采背景色与外圈一致率（比 [extract] 便宜：不跑墨色桶统计）。
+     *
+     * 用途：`bg_type=none` 的气泡在**擦字/渲染之前**做一次「这块是不是平底色」的复核
+     * （见 [BubbleColors.flatBackground]）—— 是的话升级成 solid，盖板走纯色平涂，
+     * 不再从清理图裁（inpaint 的灰痕正是用户看到的「气泡边上不干净」）。
+     */
+    fun sampleBackground(bitmap: Bitmap, bubble: Bubble): BubbleBackground? {
+        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return null
+        val box = contentBoxPx(bitmap, bubble) ?: return null
+        return sampleBackgroundColor(
+            bitmap,
+            box[0],
+            box[1],
+            box[2],
+            box[3],
+            box[2] - box[0],
+            box[3] - box[1]
+        )
+    }
+
     fun extract(bitmap: Bitmap, bubble: Bubble): BubbleColors {
         if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) {
             return fallbackColors()
         }
-        val rect = BubbleGeometry.contentRect(bubble)
-        val left = ((rect.left / 100f) * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
-        val top = ((rect.top / 100f) * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
-        val right = ((rect.right / 100f) * bitmap.width).toInt().coerceIn(left + 1, bitmap.width)
-        val bottom = ((rect.bottom / 100f) * bitmap.height).toInt().coerceIn(top + 1, bitmap.height)
+        val box = contentBoxPx(bitmap, bubble) ?: return fallbackColors()
+        val left = box[0]
+        val top = box[1]
+        val right = box[2]
+        val bottom = box[3]
         val boxW = right - left
         val boxH = bottom - top
-        if (boxW < 3 || boxH < 3) {
-            return fallbackColors()
-        }
 
-        val bgColor = sampleBackgroundMedian(bitmap, left, top, right, bottom, boxW, boxH)
+        val sampled = sampleBackgroundColor(bitmap, left, top, right, bottom, boxW, boxH)
             ?: return fallbackColors()
+        val bgColor = sampled.color
         val inkColor = sampleInkColor(bitmap, left, top, right, bottom, bgColor)
         val textColor = chooseReadableTextColor(inkColor.color, bgColor)
         val strokeColor = if (relativeLuminance(textColor) < LUMINANCE_SPLIT) {
@@ -65,11 +111,23 @@ class BubbleColorExtractor {
             textColor = textColor,
             strokeColor = strokeColor,
             bgColor = bgColor,
-            originalHadOutline = originalHadOutline(inkColor, textColor)
+            originalHadOutline = originalHadOutline(inkColor, textColor),
+            bgCoverage = sampled.coverage
         )
     }
 
-    private fun sampleBackgroundMedian(
+    /** 文字内容框（像素，左闭右开）；退化到 <3px 时返回 null。 */
+    private fun contentBoxPx(bitmap: Bitmap, bubble: Bubble): IntArray? {
+        val rect = BubbleGeometry.contentRect(bubble)
+        val left = ((rect.left / 100f) * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val top = ((rect.top / 100f) * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val right = ((rect.right / 100f) * bitmap.width).toInt().coerceIn(left + 1, bitmap.width)
+        val bottom = ((rect.bottom / 100f) * bitmap.height).toInt().coerceIn(top + 1, bitmap.height)
+        if (right - left < 3 || bottom - top < 3) return null
+        return intArrayOf(left, top, right, bottom)
+    }
+
+    private fun sampleBackgroundColor(
         bitmap: Bitmap,
         left: Int,
         top: Int,
@@ -77,7 +135,7 @@ class BubbleColorExtractor {
         bottom: Int,
         boxW: Int,
         boxH: Int
-    ): Int? {
+    ): BubbleBackground? {
         val thicknessX = (boxW * RING_RATIO).toInt().coerceAtLeast(1)
         val thicknessY = (boxH * RING_RATIO).toInt().coerceAtLeast(1)
         val rs = IntArray((boxW * 2 * thicknessY + boxH * 2 * thicknessX).coerceAtMost(MAX_BG_SAMPLES))
@@ -115,14 +173,42 @@ class BubbleColorExtractor {
             }
         }
         if (count < MIN_BG_SAMPLES) return null
-        val sliceR = rs.copyOf(count)
-        val sliceG = gs.copyOf(count)
-        val sliceB = bs.copyOf(count)
-        sliceR.sort()
-        sliceG.sort()
-        sliceB.sort()
-        val mid = count / 2
-        return Color.rgb(sliceR[mid], sliceG[mid], sliceB[mid])
+        // 主导色桶（2026-10-11 用户：「白气泡上贴了一块灰的」）：环采样常被污染 ——
+        // 框比气泡的锯齿轮廓大时，底部环采到气泡外的灰天空；逐通道中位数取到
+        // 「白 × 灰」的混合色 → 盖板变成灰的。改为 4bit/通道量化取**众数桶**，
+        // 再对桶内真实像素求均值：纯净环时与中位数一致，被污染时众数 = 气泡真正的底色。
+        val bucketCounts = IntArray(BG_BUCKET_COUNT)
+        val bucketR = IntArray(BG_BUCKET_COUNT)
+        val bucketG = IntArray(BG_BUCKET_COUNT)
+        val bucketB = IntArray(BG_BUCKET_COUNT)
+        for (index in 0 until count) {
+            val r = rs[index]
+            val g = gs[index]
+            val b = bs[index]
+            val bucket = (r shr 4) shl 8 or ((g shr 4) shl 4) or (b shr 4)
+            bucketCounts[bucket]++
+            bucketR[bucket] += r
+            bucketG[bucket] += g
+            bucketB[bucket] += b
+        }
+        var best = 0
+        for (bucket in 1 until BG_BUCKET_COUNT) {
+            if (bucketCounts[bucket] > bucketCounts[best]) best = bucket
+        }
+        val bestCount = bucketCounts[best]
+        if (bestCount == 0) return null
+        val color = Color.rgb(bucketR[best] / bestCount, bucketG[best] / bestCount, bucketB[best] / bestCount)
+        // 外圈一致率（2026-10-13）：贴着主导色的采样像素占比。这是「这块底是不是一条平底色」
+        // 的唯一量测依据（见 [BubbleColors.flatBackground]），所以直接在**原始环采样**上算 ——
+        // 与主导色同源，纯净白气泡 ≈ 1.0，被插画/网点污染的外圈会明显低于阈值。
+        val ring = IntArray(count)
+        for (index in 0 until count) {
+            ring[index] = Color.rgb(rs[index], gs[index], bs[index])
+        }
+        return BubbleBackground(
+            color = color,
+            coverage = BubbleBackgroundPolicy.ringCoverage(ring, count, color)
+        )
     }
 
     /**
@@ -384,6 +470,8 @@ class BubbleColorExtractor {
         const val RING_RATIO = 0.08f
         const val MAX_BG_SAMPLES = 8192
         const val MIN_BG_SAMPLES = 16
+        /** 背景主导色桶数：4bit/通道 → 16³（见 [sampleBackgroundMedian] 的众数桶口径）。 */
+        const val BG_BUCKET_COUNT = 16 * 16 * 16
         const val MAX_INK_SAMPLES = 8192
         const val MIN_INK_SAMPLES = 8
         const val INK_DISTANCE_THRESHOLD = 42f

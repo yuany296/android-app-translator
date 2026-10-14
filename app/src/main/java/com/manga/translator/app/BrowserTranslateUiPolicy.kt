@@ -86,12 +86,15 @@ object BrowserTranslateUiPolicy {
      *
      * 有意**不**写「点某按钮…」这类教学句，除非确实还没有任何译文 ——
      * 那种情况下用户需要知道下一步做什么。
+     *
+     * 2026-10-12 第三轮：底栏的「翻译/停止」「原文｜译文」都搬走了（前者成悬浮球、
+     * 后者进 ⋮ 菜单），文案随之改成指**球**与**球上菜单**，不再指向已不存在的底栏按钮。
      */
     fun idleHint(mode: BrowserViewMode, hasRender: Boolean, pageLoaded: Boolean): String = when {
-        !pageLoaded -> "打开漫画网页后点「翻译」"
-        mode == BrowserViewMode.ORIGINAL && hasRender -> "原文显示中 · 点「译文」显示译文"
+        !pageLoaded -> "打开漫画网页后点球翻译"
+        mode == BrowserViewMode.ORIGINAL && hasRender -> "原文显示中 · 点球上菜单切译文"
         mode == BrowserViewMode.ORIGINAL -> "原文显示中"
-        hasRender -> "译文已显示 · 点「原文」看原图"
-        else -> "点「翻译」自动翻完整页"
+        hasRender -> "译文已盖上 · 点球可停止"
+        else -> "点球自动翻完整页"
     }
 }
