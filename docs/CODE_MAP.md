@@ -4,7 +4,7 @@
 > 与 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 的分工：那份讲**模块职责与主链路入口**（宏观），
 > 这份讲**逐个文件一句话职责 + 对应日志**（微观）。改架构时更新那份，加/改文件时更新这份。
 >
-> 最近更新：2026-10-03（窗口内改动：合并判据收严、跨切片配对校验、接缝收到侧吸收）
+> 最近更新：2026-10-12（窗口内改动：内嵌浏览器「截图翻译」改为 WebView 视口自截，免系统授权 —— 悬浮球 ⋮ 菜单不再接首页 MediaProjection 链路）
 
 ---
 
@@ -68,7 +68,8 @@ grep -rn "cross_prep" app/src/main/java       # Windows 下可用 Select-String
 Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cross_prep'
 ```
 
-浏览器会话另有 `EmbeddedBrowser` 这个 Tag（`scene_ok` / `seam_dispatch` / `band_pair` / `scan` …）。
+浏览器会话另有 `EmbeddedBrowser` 这个 Tag（`scene_ok` / `seam_dispatch` / `band_pair` / `scan` …）；
+截图翻译同 Tag（`shot_start` / `shot_ok` / `shot_fail` / `shot_drop` / `shot_empty` / `shot_reshow`）。
 
 ---
 
@@ -100,7 +101,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/PageTranslationResolver.kt` | 翻译调度：句子缓存 → 引擎分支 → 回写历史 | `resolveTranslations` / `buildTranslateKey` | `sentence_cache`、`translate_local`、`mode=baidu`、`mode=cloud` |
 | `core-translate/MlKitLocalTranslator.kt` | ML Kit 本地翻译（语言对支持/模型下载） | `translate` / `isSupported` | `translate_local`、`translate_local_fallback`、`translate_local_skip` |
 | `core-translate/BaiduTranslateClient.kt` | 百度翻译专用接口（整页多句一次请求 + 签名） | `translate` | `mode=baidu` |
-| `core-translate/OpenAiVisionClient.kt` | OpenAI 兼容客户端：**现在只用于翻译**（+设置页拉模型列表）；术语表以 `buildGlossaryLine` 注入提示词 | `translateTexts` / `fetchAvailableModels` / `buildGlossaryLine` | `mode=cloud`；单测 `GlossaryPromptTest` 钉住术语表行格式；⚠️ OCR 方法已无调用方（见 §7） |
+| `core-translate/OpenAiVisionClient.kt` | OpenAI 兼容客户端：**现在只用于翻译**（+设置页拉模型列表）；术语表以 `buildGlossaryLine` 注入提示词 | `translateTexts` / `fetchAvailableModels` / `buildGlossaryLine` | `mode=cloud`；**原文回退三件套**（2026-10-14）：瞬时错误退避重试 `request_retry_transient`、解析失败/截断拆批 `translate_split_retry`/`translate_parse_retry`/`translate_parse_giveup`、单句重试 `sentence_retry`；返回 `TextTranslationOutcome`（`failedIndices` → 上层提示）；单测 `GlossaryPromptTest`/`OpenAiVisionClientTest`；⚠️ OCR 方法已无调用方（见 §7） |
+| `core-translate/BalancedLineBreaker.kt` | **像素感知均衡断行**（词边界 + 标点禁则 + 行宽约束）：三条渲染链路同权重 | `breakLines` / `countGreedyLines` / `segmentWithIcu` | 纯逻辑 + 单测；与 JS `breakBalancedLines` 同代价函数（悬浮球/整图 PNG/网页 DOM 断行一致） |
 
 ### 3.3 悬浮球链路（`app`）
 
@@ -117,8 +119,9 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
-| `MainActivity.kt` | Compose 外壳（底栏 tab：首页/浏览器/术语表/翻译历史）、权限引导、服务启停 | `MainTab` | 浏览器 tab → `EmbeddedBrowserScreen` |
-| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 | `startSession` / `runTranslationSession` | `session_start`、`scan pending=`、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail` |
+| `MainActivity.kt` | Compose 外壳（底栏 tab：首页/浏览器/术语表/翻译历史）、权限引导、服务启停 | `MainTab` | 浏览器 tab → `EmbeddedBrowserScreen`（不再传截图入口，见下行） |
+| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=`、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42） |
+| `SeamRaceBand.kt` | 晚邻接竞态「接缝带补建」的纯逻辑：文本+几何匹配跨缝明的两半、给出带几何与待摘 id、盖板避让同图其它气泡 | `findMatch` | 纯逻辑 + 单测 `SeamRaceBandTest`；日志 `seam_race_band`（会话侧） |
 | `BrowserScanScript.kt` | 注入网页的扫描脚本：找图、坐标契约、宿主标记、像素提取 | `SCAN_JS` / `EXTRACTOR_JS` | `site_adapter`、`scan` |
 | `BrowserSceneBuilder.kt` | 场景 JSON 生产者（普通场景 + 接缝带场景）= Kotlin↔JS 契约 | `buildSceneJson` / `buildSeamSceneJson` | 渲染层字段以它为准 |
 | `WebtoonImageTranslator.kt` | **浏览器链路核心管线**：拼接→OCR→归属→翻译→擦字→场景/贴片 | `translateImage` / `translateStitched` | `slice_classify`、`seam_verdict`、`cross_prep`、`incoming_absorbed`、`render_done` |
@@ -126,6 +129,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
+| `CoverOutlinePolygon.kt` | **纯色盖板轮廓多边形**（墨迹守卫 + 整体外扩）：不许裁进字形带，防锯齿/露原文 | `build` | 纯逻辑 + 单测 `CoverOutlinePolygonTest`；日志 `cover_outline b0=rows/drop/clamp/dil`；替换旧 `interiorOutlinePolygonPercent` |
 | `HandoffTextMatch.kt` | 移交可用性的**文本证据**（字符重合度 ≥0.7 才算同一句） | `explainedByHandoff` | `incoming_decision`；纯逻辑 |
 
 ### 3.5 渲染层（`core-overlay` + 网页 JS）
@@ -133,7 +137,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
 | `core-overlay/OverlayController.kt` | 悬浮球链路渲染：悬浮球、气泡视图、擦字贴片、浏览/调整态 | `renderBubbles` / `showFloatingButton` | 详见 §4 core-overlay |
-| `app/src/main/assets/mt-overlay-renderer.js` | **网页侧渲染层**：擦原文、画译文、接缝带、loading 卡 | `MtOverlay.applySceneJson` / `applySeamSceneJson` / `suppressBubble` / `showLoadingJson` | 契约见 §4 渲染层 JS |
+| `app/src/main/assets/mt-overlay-renderer.js` | **网页侧渲染层**：擦原文、画译文、接缝带、loading 卡 | `MtOverlay.applySceneJson` / `applySeamSceneJson` / `suppressBubble` / `showLoadingJson` | 契约见 §4 渲染层 JS；2026-10-14 新增像素感知均衡重排 `rebalanceTextNode`（日志 `MTBREAK`）+ 纯函数 `_breakBalancedLines`/`_formatBalancedLines` |
 
 ---
 
@@ -158,7 +162,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `TextAlignment.kt` | 从逐行框推断左/中/右对齐 | `infer` / `normalize` | 纯逻辑 + 单测 |
 | `TextTiltEstimator.kt` | 无四边形时用墨迹最小外接矩形估倾角；`TextInkBounds` 收紧文字框 | `estimateRectFromLuma` / `TextInkBounds.findInBitmap` | 日志 `ink_tilt`；luma 版可单测 |
 | `NonTranslatableText.kt` | 判定语言中立文本（数字/时间/URL/符号）免翻译 | `isNonTranslatable` | 纯逻辑 + 单测 |
-| `OpenAiVisionClient.kt` | OpenAI 兼容云端客户端：**翻译** + 模型列表 | `translateTexts` / `fetchAvailableModels` | 日志 TAG `VisionClient`；⚠️ OCR 三方法死代码（见 §7） |
+| `BalancedLineBreaker.kt` | 像素感知均衡断行（词边界 + 标点禁则 + 行宽约束） | `breakLines` / `countGreedyLines` / `segmentWithIcu` | 纯逻辑 + 单测 `BalancedLineBreakerTest`；与渲染层 JS `breakBalancedLines` 同权重 |
+| `OpenAiVisionClient.kt` | OpenAI 兼容云端客户端：**翻译** + 模型列表 | `translateTexts` / `fetchAvailableModels` | 日志 TAG `VisionClient`；`request_retry_transient`/`translate_split_retry`/`translate_parse_retry`/`sentence_retry`（2026-10-14 原文回退三件套）；⚠️ OCR 三方法死代码（见 §7） |
 | `BaiduTranslateClient.kt` | 百度翻译专用接口（整页多句一次请求 + 分批限流） | `translate` / `toBaiduLanguage` | 上游日志 `mode=baidu`；TAG `BaiduTranslate` 定义了但未打点 |
 | `LocalTranslator.kt` | 本地离线翻译接口（含模型下载/磁盘探测） | `isSupported` / `translate` / `downloadModel` | 实现方 `MlKitLocalTranslator` |
 | `MlKitLocalTranslator.kt` | ML Kit 端侧翻译：语言对模型下载 + 逐句容错 | `translate` / `prewarm` | 日志 TAG `MlKitLocalTranslator`、`mlkit_translate_*`；上游 `translate_local*` |
@@ -191,8 +196,10 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | 文件 | 一句话职责 | 关键入口 | 备注 |
 |---|---|---|---|
 | `BackgroundOutlinePolicy.kt` | 按清理图亮度跨度决定译文要不要加描边 | `needsOutline` / `isBusy` | 只被浏览器链路 `WebtoonImageTranslator` 调用；日志 `outline_need`（plain/busy/outline/solid）；`isBusy` 等纯逻辑可单测 |
+| `BubbleBackgroundPolicy.kt` | 「这块底算不算亮的平底色」判据（决定盖板纯色平涂） | `isFlatBrightBackground` / `isBright` / `ringCoverage` | 2026-10-13 新增；阈值对齐参考项目 `bubble-colors.js`；日志 `solid_upgrade count=… evidence=ring…/flat…`；纯逻辑可单测 |
+| `BubbleInteriorScanner.kt` | 从字形框向外量容器内部：逐行可用宽度 + 轮廓剖面 + 底色一致率 | `scan` / `Interior.widthCapPx` / `Interior.isFlatBrightContainer` / `Interior.profileRows` | 2026-10-13 新增；排版框收窄（`ink_tilt` 的 `interior_cap=`）与纯色盖板裁剪（`region_polygon`）都靠它；纯逻辑核心 `scanWith` 可单测 |
 | `BubbleAdjustment.kt` | 单个气泡的用户调整量（位移/字号/描边） | `BubbleAdjustment` | `OverlayController.renderBubbles` 的 load/save 回调；持久化在 `PageOverlayAdjustmentRepository` |
-| `BubbleColorExtractor.kt` | 采样背景中值色与墨色，产出译文配色 | `extract` / `chooseReadableTextColor` | 日志 `sampled_colors b0=#文字色/#底色`（浏览器）/ `bubble_colors count=`（悬浮球）；配色判据是 internal 纯函数可单测 |
+| `BubbleColorExtractor.kt` | 采样背景中值色与墨色，产出译文配色 | `extract` / `sampleBackground` / `chooseReadableTextColor` | 日志 `sampled_colors b0=#文字色/#底色`（浏览器）/ `bubble_colors count=`（悬浮球）；`sampleBackground` 额外给出外圈一致率（`BubbleColors.bgCoverage`/`flatBackground`）；配色判据是 internal 纯函数可单测 |
 | `BubbleRegionDetector.kt` | OpenCV 亮斑轮廓框出候选气泡区域 | `detect` | 日志 TAG `BubbleRegionDetect`；调用方计时 `bubble_region_stats`；**注意**：整页浅色会被检成大亮块，`isSolidBubbleRegion` 会因此退回 `none` |
 | `BubbleRenderState.kt` | 单个译文视图的可变渲染状态 | `BubbleRenderState` | 仅 `OverlayController` 使用 |
 | `EraseStrategy.kt` | 擦字策略/质量档位枚举 | `EraseStrategy` / `EraseStrategyPolicy` | ⚠️ `RenderQualityProfile` **无读取方 = 死代码** |
@@ -273,7 +280,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 
 | 常量 | 值 | 含义 |
 |---|---|---|
-| `FONT_MIN / FONT_MAX / FONT_ABS_MAX` | 10 / 52 / 120 px | 字号下限 / 常规上限 / 绝对上限 |
+| `FONT_ABS_MIN / FONT_MIN / FONT_MAX / FONT_ABS_MAX` | 8 / 10 / 52 / 120 px | 二分**绝对下限**（缩到 8px 仍溢出才撑开节点并打 `MTFONT expand`）/ 兜底下限 / 常规上限 / 绝对上限（2026-10-12 字号自适应收口：装不下先缩字号，撑开只留给极端框） |
 | `FONT_BINARY_STEPS` / `FONT_SAFETY`（竖排 0.92） | 9 / 0.96 | 二分拟合次数 / 安全系数 |
 | `STROKE_RATIO` | 0.085（clamp 1.8~4.2） | 描边宽 = 字号 × 0.085 |
 | `SEAM_MAX_PAGE_GAP_PX` | **3 px** | 接缝带允许的两切片间隙；超过即 `page_gap` → 退回「两半各画一份」（2026-10-03 由 1.5 放宽，阅读器留 2px 边距就误判） |
@@ -315,10 +322,11 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/.../HandoffTextMatchTest.kt` | 移交文本证据（真机两形态 0.83 / 0.54） |
 | `app/.../SeamBandGeometryTest.kt` | 接缝带几何与盖板外扩 |
 | `app/.../BrowserSceneBuilderTest.kt` / `BrowserScanScriptTest.kt` | Kotlin↔JS 契约 |
+| `app/.../BrowserScreenshotTranslateTest.kt` | 截图翻译的几何采集/锚点/贴图 JS 契约（免授权链路） |
 | `app/.../EraseTargetsTest.kt` | 「读不出就别动」判据 |
 | `app/.../BubbleFontRulesTest.kt` | 译文字号规则 |
 | `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` | 会话/无障碍/底栏状态表 |
-| `app/src/test/js/mt-overlay-acceptance.test.js` | 渲染层验收（node + `dom-stub.js`，含接缝/恢复/加载卡） |
+| `app/src/test/js/mt-overlay-acceptance.test.js` | 渲染层验收（node + `dom-stub.js`，含接缝/恢复/加载卡 + 字号自适应缩放/MTGEOM 重叠诊断） |
 | `core-store/...`（术语表/历史/浏览器数据） | 持久化与归一化 |
 | `core-overlay/...`（背景描边/取色/写出区域/清理图墨迹） | 擦字与配色判据 |
 | `app/src/androidTest/**`（探针） | 真机：ML Kit 置信度/语言混排、Paddle 复杂背景/斜排竖排/性能 |
@@ -376,4 +384,8 @@ adb logcat -s TranslationPerf:V EmbeddedBrowser:V     # 只看翻译链路日志
 node scripts/serve-verify.mjs .verify/web 8899        # 本地验证页服务（配合 adb reverse）
 python scripts/verify-browser-page.py --url http://127.0.0.1:8899/<页>.html `
     --out .verify/xx.png --logcat .verify/xx.logcat --settle 35
+# 渲染层排障（2026-10-12）：debug 包已开 WebView 远程调试 —— 读覆盖层真实几何
+adb forward tcp:9222 localabstract:webview_devtools_remote_$(adb shell pidof com.manga.translator.app)
+node scripts/cdp-eval.mjs "document.querySelectorAll('.__mt_scene_root').length"
+# ⚠️ pidof 取当前进程；模拟器上可能残留旧进程的 devtools socket，连错就读到僵尸场景
 ```

@@ -1712,3 +1712,569 @@ topH=129 时：可见部分重叠 96% 被算成 56% < 阈值 60% → 本图把�
   这条与 2026-09-30「0.82× 偏小」是同一个字号口径问题的另一侧，需要单独收口。
 - **条带截断自动重裁**未做（本轮只加了 `seam_strip_short` 检测与日志）。
 - 两切片源像素尺寸不同时的接缝带 scale 口径未处理（仍靠 2% 显示宽度检查兜底）。
+
+## 2026-10-11 「精细擦字（原 inpaint 清理图）」开 vs 关：实测差异与耗时
+
+> ⚠️ 本条记录的是**改造前**的行为（关闭时旁白仍会建整页清理图）。当天下午按用户要求改成硬分工 ——
+> 关闭 = 完全不建清理图 —— 见下面《2026-10-11 第二轮》；本条的耗时数字只作历史对照，结论 1/2 已过时。
+
+用户问题（逐字）：
+
+> 那个清理图模式和关闭 inpaint 的时候有什么区别。检测一下用时。
+
+### 1. 差异本体（先把概念对齐——开关同时改两件事）
+
+「精细擦字」= `SettingsRepository.isBrowserInpaintCleanEnabled()`（默认开，**只作用于内嵌浏览器链路**；
+悬浮球链路 `TranslateOrchestrator.prepareVisuals` 恒定 `OPENCV_WHEN_AVAILABLE`，没有这个开关）。
+分支都在 `WebtoonImageTranslator.prepareVisuals`：
+
+| | 开（清理图模式） | 关（关闭 inpaint） |
+|---|---|---|
+| 整页清理图 | **总是**建（`includeSolid=true`）；纯色气泡走「直填背景色」不进 inpaint（2026-10-11 起） | **只在页面里存在旁白/透明（`bg=none`）文字块时**才建（`includeSolid=false`）；整页全是纯色气泡才真正跳过（日志 `cleaned_image skipped=all_solid`） |
+| 逐气泡擦字策略 | `OPENCV_WHEN_AVAILABLE` | `FAST_ONLY` |
+| 纯色气泡背景来源 | 从清理图裁切（`cleaned_patched=N`） | 逐块取色快速贴片（`fast=N`；`cleaned_patched` 只剩旁白那几块） |
+| 旁白/透明文字块背景 | 清理图裁切 | **一样是清理图裁切**，不会退回纯色块 |
+
+即：**「关闭 inpaint」不等于「完全不跑 inpaint」**——只要画面上有旁白/压在背景上的文字，
+整页 inpaint 照跑；关闭只让**纯色气泡**不再从清理图取背景。设置菜单里关闭时的副标题
+「逐块取色贴背景，**不跑 inpaint**」只对纯色气泡成立，文案偏窄（已记入 HumanTODO）。
+
+日志判据：`erase_mode inpaint_clean=… policy=…`、`cleaned_image built…/skipped=all_solid`、
+`erase_apply … fast=/edge=/opencv=/cleaned_patched=`。
+
+### 2. 实测（模拟器 emulator-5554，逐轮冷内存缓存）
+
+夹具（`.verify/web`）：`solid-only.png`（800×2100，3 个纯色气泡、无旁白）、`v-tilt.html`→`syn1.png`
+（900×1400，2 纯色 + 2 旁白）、`big.html`→`big1.png`（1600×2400，3 纯色 + 4 旁白）。
+每轮 `force-stop` + 重开页面（清掉 `CleanedImageProcessor`/`TieredEraseProcessor` 的内存缓存），
+翻译走句缓存（`sentence_cache_hit=true`）→ 变量只剩擦字这一侧。切换顺序 开/关 交替，各 3 轮。
+
+| 夹具 | 开：清理图阶段 | 开：擦字阶段 | 关：清理图阶段 | 关：擦字阶段 | 整页总耗时（开 / 关，中位） |
+|---|---|---|---|---|---|
+| solid-only 800×2100 | 273 / 286 / 345 ms | 18–24 ms | **2 / 12 ms**（`skipped=all_solid`） | 116–182 ms | 1423 / 1420 ms |
+| syn1 900×1400 | 176 / 234 / 237 ms | 9–14 ms | 138 / 166 / 272 ms | 53–64 ms | 1580 / 1629 ms |
+| big1 1600×2400 | 433 / 516 / 699 ms | 6–10 ms | 487 / 565 / 596 ms | 66–70 ms | 1968 / 1994 ms |
+
+结论：
+
+1. **只有「整页都是纯色气泡」时，关闭才真正省掉整页 inpaint**：清理图阶段 273–345 ms → 2–12 ms，
+   但逐气泡快速贴片多花 ~100–160 ms，**净省约 0.1–0.2 s**（该页整页 1.4 s 量级，≈10%）。
+2. **有旁白/透明气泡的页面（长条漫常见）：耗时基本无差别** —— 整页清理图两边都要建
+   （关闭时也打 `cleaned_image built … include_solid=false`，旁白仍靠它取背景），
+   清理图阶段的差异落在噪声内；整页总耗时差（±0.1–0.3 s）由本地 OCR（0.5–1.2 s）波动主导。
+   实测同批气泡两边 `cleaned_patched` 分别 7/7（开）与 3/7（关）——省的是纯色那 3 块的裁切，
+   而裁切本身只要 ~10 ms。
+3. **真正的差别在背景来源与质量指标上**（逐轮一致，不是噪声）：
+
+   | 夹具 | 开：`erase_dark_replace_ratio` / `erase_quality` | 关：同 |
+   |---|---|---|
+   | solid-only | 0.000 / `residual_avg=0.00 residual_max=0.00` | **0.329** / `residual_avg=0.20 residual_max=0.44 residue=1` |
+   | big1 | 0.000 / `0.00 / 0.00` | 0.268 / `0.01 / 0.02`（worst=solid） |
+   | syn1 | 0.000 / `0.00 / 0.00` | 0.218 / `0.01 / 0.02`（worst=solid） |
+
+   即：开启时纯色气泡背景来自整页 inpaint 的清理图（纹理连续、残留 0）；关闭时是「逐块取色 +
+   墨色替换」，重写了 22%–33% 的候选像素，在合成大色块夹具上残留率最高到 0.44。
+   注：浏览器默认走 `DOM_SCENE`（覆盖层渲染），纯色气泡另外还有一层平涂盖板，
+   这 0.44 在**最终像素上**是否可见，需要真机/肉眼确认（已写进 HumanTODO）。
+4. 内存缓存命中时（同一页来回滚动）`cleaned_image` ≈ 0 ms（LRU 键 `pageHash|include_solid`，
+   开/关是不同的键，切开关必然重建一次），所以开关的成本只在「每张图第一次翻」时出现。
+
+### 3. 复现方式（新脚本）
+
+```bash
+python -m http.server 8899 --bind 127.0.0.1 --directory .verify/web   # 宿主机起验证页
+adb -s emulator-5554 reverse tcp:8899 tcp:8899
+python scripts/bench-erase-timing.py --url http://127.0.0.1:8899/solid-only.html \
+    --outdir logs/erase-bench-solid --rounds 3 --order on,off --cold --shot
+python scripts/bench-erase-timing.py --analyze logs/erase-bench-solid
+```
+
+产物：`logs/erase-bench-solid/`（含 `roundN_on/off.logcat` + 截图）、`logs/erase-bench-tilt/`、
+`logs/erase-bench-big/`；分析脚本按 traceId 算「阶段增量」（`cleaned_image` 阶段 =
+`cleaned_image` − `erase_targets`，`erase` 阶段 = `erase_apply` − `erase_mode`）。
+
+- 本轮新增夹具：`.verify/web/solid-only.{png,html}`（从 `big1.png` 左列裁出的「只有纯色气泡、
+  没有旁白」页面——用来暴露「关闭才真正省掉整页 inpaint」这条路径）。
+- 环境还原：跑完已把「精细擦字」恢复为**默认开**、停掉临时 `python -m http.server 8899`。
+  （`adb reverse tcp:8899` 仍保留，方便复跑。）
+
+## 2026-10-11 第二轮：把「精细擦字」的两条路线分工硬化（开 = 最接近原画 / 关 = 只求速度）
+
+用户要求（逐字）：
+
+> 我想要的是开启精细擦字的时候最符合原文。关闭的时候只考虑速度，不考虑效率，只要显示出来译文就行。
+
+上面那条实测暴露的问题：关闭开关时**只有「整页纯色气泡」才真省**，一有旁白就照样建整页清理图
+（旁白要从清理图取背景）—— 用户要的「关闭 = 只求速度」根本没兑现。本轮把它改成硬分工。
+
+### 1. 代码改动
+
+| 位置 | 改动 |
+|---|---|
+| `WebtoonImageTranslator.prepareVisuals` | `needsCleanedImage = includeSolidInpaint`（不再带 `|| any(non-solid)`）→ **关闭时一张清理图都不建**：不跑整页 TELEA inpaint、不导出整页 JPEG、背景描边判据拿不到背景（旁白一律保留描边，安全缺省） |
+| 同上（新增）| `exportFastPatches()`：关闭时把每个 `bg=none`（旁白/压在画面上的文字块）气泡的**逐气泡擦字贴片**编码成 PNG，经 mtlocal 短 URL 下发，渲染层用 `patch_url` + `patch_box` 100% 铺满补丁框当盖板背景 |
+| `WebtoonImageTranslator.buildScene` | `cleaned_url == null` 时给 `bg=none` 气泡挂 `patchUrl`/`patchBox`（纯色气泡不需要：`.mt-bg-solid::before` 画的是采样底色平涂）|
+| 同上（顺带修）| **贴片下标错位隐患**：`erasePage` 的 `bubbleId` 是「传进去那个列表」的下标，而传进去的是 `isWorthErasing` 过滤后的列表，下游（`patchFor`/擦字质量统计/跨图移交）用的却是未过滤下标 —— 一有气泡被过滤就会贴错。现在按「擦字目标 → 原下标」重编 |
+| `TranslationPerf` 日志 | 关闭时 `cleaned_image: … skipped=fast_mode`（以前误记成 `skipped=all_solid`）；`render_scene … cleaned=false patches=N`（N = 场景里带贴片盖板的气泡数）|
+| 设置菜单副标题 | 「整页重画背景，最接近原画（慢）」/「只求快：不做整页重画，纯色平涂 + 逐块贴背景」|
+
+### 2. 实测（模拟器 emulator-5554，冷内存缓存，3 夹具 × 各 3 轮，开/关交替）
+
+同一页面、同一批气泡、翻译走句缓存；关这一侧的 `cleaned` 阶段基本为 0（只剩一次判断）。
+
+| 夹具 | 开：建清理图 | 关：建清理图 | 开：擦字 | 关：擦字 | 阶段净差（关−开） |
+|---|---|---|---|---|---|
+| `solid-only` 800×2100（3 纯色） | 246 / 363 / 598 ms | **1 / 2 / 4 ms**（`skipped=fast_mode`） | 9–13 ms | 114–131 ms | **约 −250 ms/张** |
+| `syn1` 900×1400（2 纯色+2 旁白） | 138 / 259 / 424 ms | **1 / 13 / 33 ms** | 10–11 ms | 109–217 ms | **约 −120 ms/张** |
+| `big1` 1600×2400（3 纯色+4 旁白） | 671 / 787 / 846 ms | **5 / 15 / 21 ms** | 9–52 ms | 170–188 ms | **约 −630 ms/张** |
+
+- 关闭省下的是**整页 inpaint + 整页 JPEG 导出**（随面积走：800×2100 ≈ 0.25–0.6s，1600×2400 ≈ 0.7–0.85s），
+  多花的是逐块局部填充（~0.1–0.2s）；净下来每张**快 0.12–0.63s**。
+- 整页总耗时（含本地 OCR 0.9–2.3s 的波动）中位数：`solid-only` 1757 → 1473 ms；
+  `big1` 3786 → 2955 ms（−22%）；`syn1` 2125 → 2136 ms（该页 OCR 波动更大，阶段差被淹没）。
+- 观感侧的指标差（关闭 = 逐块贴片）：`erase_dark_replace_ratio` 0.296–0.559（开 = 0.000）、
+  纯色大色块夹具上 `residual_avg=0.20 / max=0.44`（开 = 0.00/0.00）—— 这是「只求速度」的价钱，用户已接受。
+
+### 3. 渲染层证据（真 DOM 回读，`v-tiltonly.html` 单个斜排旁白）
+
+`.verify/dom-cover-probe.py` 把页面 `mtdump.js` 的 `MTDUMP`（tag = `chromium`，抓日志时必须带这条
+filterspec）解析出来，直接看盖板实际用的背景图：
+
+```
+关闭：{"layer":"b0:cover","cls":"mt-cover-clip","bgImg":"url(\"https://mtlocal.overlay/p12234782732900.png\")"}
+开启：{"layer":"b0:cover","cls":"mt-cover-clip","bgImg":"url(\"https://mtlocal.overlay/c12257745452000.jpg\")"}
+```
+
+即：关闭 = **逐气泡 PNG 贴片**（`p…png`），开启 = **整页清理图 JPEG**（`c…jpg`）。
+两种模式下旁白都被盖住，不存在「原文露着」；`scene_ok bubbles=N` 正常。
+
+### 4. 回归
+
+- `node app/src/test/js/mt-overlay-acceptance.test.js` → **ALL_OK 192/192**（新增 §15：patch_url + patch_box
+  盖板的裁剪层尺寸/中心与 100% 铺满，3 条断言）。
+- `./gradlew :app:assembleDebug test` → **BUILD SUCCESSFUL**（四个模块 JVM 测试）。
+- 模拟器三轮 × 三夹具（`logs/erase-bench2-*`，含截图）：关闭时 `cleaned_image skipped=fast_mode`、
+  `render_scene cleaned=false patches=N`、`scene_ok` 齐全。
+
+> ⚠️ 本节的「关闭时挂逐气泡擦字贴片」在当天被下面《第三轮》取代：贴片是局部边缘填充，
+> 笔画边缘会留残影，用户要求改成不透明实底遮挡。
+
+## 2026-10-11 第三轮：关闭模式的盖板改成**不透明实底**（不再用贴片，消残影）
+
+用户反馈（逐字）：
+
+> 现在会有残影。不要这样的，而是用实体的背景遮挡
+
+根因：上一轮关闭模式给 `bg=none` 气泡挂的是**逐气泡擦字贴片**（局部边缘填充，`FAST_ONLY`）。
+贴片本身带着「没擦净的笔画」——实测残墨比 `residual_avg` 0.01–0.20（合成色块夹具最高 0.44），
+盖到页面上就是残影。用户要的是「一块实心背景把原文挡住」，不需要纹理。
+
+### 1. 改动
+
+| 位置 | 改动 |
+|---|---|
+| `BrowserSceneBuilder.SceneBubble` | 新增 `flatCover: Boolean = false`；JSON 只在 true 时下发 `"flat_cover":true`（老渲染层没有这个字段 → 行为不变） |
+| `mt-overlay-renderer.js` | `createCoverNode`：`bg_type=none && flat_cover` → `dataset.coverFill="flat"` + `--mt-adaptive-bg = bg_color`（**优先于** patch_url / 清理图分支）；新增 CSS `.mt-bubble.mt-cover-only[data-cover-fill="flat"]{background:var(--mt-adaptive-bg,…)!important;background-image:none!important}`（选择器比 `.mt-bg-none` 与 `[data-cleaned-layers="2"]` 都更具体） |
+| `WebtoonImageTranslator.buildScene` | `useFlatCover = cleanedUrl == null` → `bg=none` 气泡下发 `flatCover=true`；删掉 `exportFastPatches()`（不再需要逐气泡 PNG 编码，顺带更快） |
+| `TranslationPerf` 日志 | `render_scene … cleaned=… patches=N flat=M`（M = 用不透明实底遮挡的气泡数）|
+| 触发面 | 除了「关闭精细擦字」，**清理图构建/导出失败**时也走这条兜底（以前是透明盖板 → 原文露着）|
+
+### 2. 真实 Blink 里的计算样式（Chrome + 同一个渲染层文件）
+
+`.verify/web/flatcover.html`（`python -m http.server 8901` 服务仓库根、页面里 `<script src="/app/src/main/assets/mt-overlay-renderer.js">`）
+
+```
+flat_cover=true  → coverFill=flat  adaptive=#f3e9d2  computedBgColor=rgb(243,233,210)  computedBgImage=none  opacity=1
+老行为(无字段)   → coverFill=""     adaptive=""       computedBgColor=rgba(0,0,0,0)    computedBgImage=none  opacity=1
+```
+
+即：下发 `flat_cover` 的盖板在真 Blink 里就是**一块不透明纯色**（`background-image:none`，不会再走
+清理图/贴片通道），没下发的仍然保持老行为（透明）。CSS 特异性实测生效。
+
+### 3. 模拟器实测（新构建，冷内存缓存，夹具 1600×2400 / 800×2100，各 3 轮）
+
+日志证据：关闭时 `render_scene … cleaned=false patches=0 flat=4`（4 个 `bg=none` 气泡全部实底遮挡）；
+开启时 `cleaned=true … flat=0`（纹理路线没动）。
+
+| 夹具 | 开：建清理图 | 关：建清理图 | 开：擦字 | 关：擦字 | 整页总耗时（开 / 关，中位） |
+|---|---|---|---|---|---|
+| 1600×2400（纯色3+旁白4） | 520 / 590 / 981 ms | **2 / 3 / 8 ms** | 7–35 ms | 95–140 ms | 2632 / **1874** ms（−29%） |
+| 800×2100（纯色3，无旁白） | 243 / 287 / 330 ms | **1 / 2 / 7 ms** | 10–69 ms | 124–144 ms | 1450 / **1281** ms（−12%） |
+
+阶段净差：省下整页 inpaint+JPEG 导出 0.28–0.98 s，多花逐块局部填充 0.1–0.2 s → **净快 0.16–0.47 s/张**。
+（擦字贴片仍照常生成：跨图续排与整图模式还要用；关闭模式下它不再上屏。）
+
+### 4. 回归
+
+- `node app/src/test/js/mt-overlay-acceptance.test.js` → **ALL_OK 201/201**（§15 两条：flat_cover 实底优先、
+  跨图 `patch_url` 贴片语义仍可用）。
+- `BrowserSceneBuilderTest` 新增 `flat cover flag is emitted only when set`（26/26 通过）。
+- `./gradlew :app:assembleDebug test` → **BUILD SUCCESSFUL**。
+- 模拟器（`logs/erase-bench3-*`，含截图）：`flat=4` / `flat=0` 与开/关一一对应，`scene_ok` 齐全。
+
+## 2026-10-12 内嵌浏览器：悬浮球加 ⋮ 胶囊 + 菜单瘦身到 120dp（画布 → 工程）
+
+把画布 `730751285322573` 屏 `11:3` / `11:220` / `23:153` 的定稿落到工程（用户指令：「应用到现在的项目里」）。
+
+### 1. 改动
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| 顶栏网址框 | Box h44 / r12 / 单行文字 | Row h40 / r20 / `#EEF1F7`，`[锁 14dp（仅 https）][网址 14sp][✕ 14dp 清除]` |
+| 顶栏「回家」按钮 | 地球 `MtBrowserIcon` | **浏览器窗口** `MtBrowserWindowIcon`（新增；地球会被读成「网络/语言/系统浏览器」，且紧挨齿轮抢语义） |
+| 悬浮球 | 48dp 圆，无阴影 | 48dp 圆 + `shadow(6.dp, CircleShape)` |
+| **新增 ⋮ 胶囊** | 无 | 44×36 / r18；收起 = 白 96% 底 + `#E4E8F0` 描边 + 黑点；展开 = `#E8F1FE` 底 + `#2563EB` 描边 + 蓝点。**点击 = 开/关菜单**（长按球的老手势保留） |
+| ⋮ 菜单 | 「视图开关 h44」+「截图翻译 h40」两行，宽 104 | 白卡 120×102 / r14 / 描边 + 阴影；`行·截图翻译 h44`（`MtScanIcon` 20dp + 14sp）+ `分段·原文译文 h34`（段 h28 / r8 / 13sp） |
+| 底栏 | 两行：行1 导航+状态、行2 原文｜译文分段 | **单行 h48**，padding 8 / gap 4，只留 后退·前进·刷新 + 状态文字；`navigationBarsPadding()` |
+| 状态行文案 | 「点『翻译』自动翻完整页」等指向底栏按钮 | 统一指向悬浮球/球上菜单（`BrowserTranslateUiPolicy.idleHint`） |
+| 悬浮球默认停靠点 | 内容区高度 30% | **贴内容区底部、球底距底 16dp**（`DEFAULT_BOTTOM_MARGIN_DP`） |
+
+新增三个 ImageVector（`ui/MtUi.kt`）：`MtBrowserWindowIcon`(20) / `MtLockIcon`(14) / `MtScanIcon`(24)。
+新增 `BrowserFloatingBallPolicy` 常量：`CAPSULE_WIDTH_DP=44` `CAPSULE_HEIGHT_DP=36` `CAPSULE_GAP_DP=10`
+`MENU_WIDTH_DP=120` `MENU_HEIGHT_DP=102` `DEFAULT_BOTTOM_MARGIN_DP=16`，以及 `capsuleTop` / `capsuleLeft` / `expandsUpward`。
+
+### 2. 为什么改默认停靠点（不是顺手改）
+
+画布定稿里「胶囊在上、菜单在上」的构图，前提是**球落在内容区下半部** —— `expandsUpward` 判定为真时菜单才朝上长。
+原来默认 30% 高度时球在上半部，菜单会朝下长，与画布正好相反。改成贴底后两者一致（实测见下）。
+
+### 3. 单测（`:app:testDebugUnitTest --rerun-tasks`，90 tasks 全部 executed）
+
+```
+TOTAL tests=226  fail=0  skip=0        （logs/quality-20261012-ball-menu/*.xml）
+  BrowserFloatingBallPolicyTest      14/14   ← 本轮新增
+  BrowserTranslateUiPolicyTest        8/8    ← idleHint 口径更新
+```
+
+新增 `BrowserFloatingBallPolicyTest`（此前该策略**没有任何单测**）：菜单尺寸 = 画布定稿值、
+胶囊贴球上方留 10dp、顶边放不下时翻到球下方、与球同心、`menuLeft` 随停靠侧翻转且夹在容器内、
+`menuTop` 按上下半部翻转、默认点落在下半部（防「菜单朝下长」回潮）。
+
+### 4. 模拟器实测（Pixel_8 / emulator-5554 / 1080×2400 / 420dpi → 2.625 px/dp）
+
+夹具：`.verify/web/lezhin_like.html`（`adb reverse tcp:8899`，`scripts/serve-verify.mjs` 已有实例在 8899）。
+截图与量测脚本：`logs/ardot-verify/`（`app-v2-collapsed.png` / `app-v2-expanded.png` / `pngcrop.py` / `compare-11-3.png`）。
+
+| 元素 | 画布定稿 | 实测 | 结论 |
+|---|---|---|---|
+| 球 | 48×48，r24，`#3B82F6` | 126×126 px = **48.0 dp** | ✅ |
+| ⋮ 胶囊 | 44×36，r18 | 115×95 px = **43.8×36.2 dp** | ✅ |
+| 胶囊↔球间距 | 10 | 26 px = **9.9 dp** | ✅ |
+| 胶囊横向 | 与球同心 | 中心 x 均 = 1012 px | ✅ |
+| 菜单白卡 | 120×102，r14 | 宽 315 px = **120.0 dp**；高 8+44+8+34+8 = 102 | ✅ |
+| 卡片↔球横向间距 | 10 | 949−923 = 26 px = **9.9 dp** | ✅ |
+| 行·截图翻译 | h44 / padding 8 | 273×116 px = **104×44.2 dp** | ✅ |
+| 分段·原文译文 | 轨道 h34 / 段 h28 | 段 49–50×28 dp，轨道内容区 98×28 | ✅ |
+| 底栏 | h48 / padding 8 / gap 4 / 图标 40 | 第一个图标中心 28.0 dp；图标中心间距 116 px = **44.2 dp**（=40+4） | ✅ |
+| 顶栏网址胶囊 | h40 / r20 | 105 px = **40.0 dp**；左内边距 48 px = 18.3 dp（=返回 40 + 8） | ✅ |
+| 状态行 | 12sp `#8B93A5` | 「点球自动翻完整页」单行、浅灰 | ✅ |
+
+构图一致性：球贴底后展开菜单**朝上长**（卡片底 2032 px vs 球顶 2040 px），胶囊在球正上方 —— 与画布 `11:3` 同构。
+`logs/ardot-verify/compare-11-3.png` 为「画布 `11:3` ‖ 真机」并排图。
+
+顶栏网址框在 `http://` 页面**不显示锁头**（画布 `11:3` 是 `kakaopage.com` 故有锁）—— 这是既定逻辑（仅 https 显示），不是缺失。
+
+### 5. 顺带修的画布不一致
+
+画布 `11:3` 底栏提示（`23:80`）还是旧文案「点『翻译』自动翻完整页」，而同批的 `11:220`（`23:95`）已改成
+「译文已盖上 · 点球可停止」。已把 `23:80` 统一为「点球自动翻完整页」。
+
+### 6. 未覆盖 / 待定
+
+- **已翻译态**的菜单（「译文」选中 + 亮态、非 0.4 透明度）未在真机复现：需要真实翻译（配置厂商 key）。
+  截图里「原文/译文」偏灰是 `modeToggleEnabled=false` 的既定置灰，不是渲染问题。
+- 真实 **https** 站点下锁头的显示未验（本轮夹具是 http）。
+- 球「运行中变红 + 白方块」的展开态（菜单 + 红球同时出现）未截图。
+- 画布 `2:3` 里的**底栏 tab 图标**（`5:20`）仍是地球 —— 它旁边有文字「浏览器」故不歧义，是否一起换成窗口图标**待用户定**。
+
+
+## 2026-10-13 三连修验证：重复译文 / 纯色泡用清理图 / 译文戳出气泡框
+
+执行者：OpenCode（DeepSeek V4.1 Flash）。设备 emulator-5556（1080x2400 / 420dpi），debug 包。
+
+### 1. 单测
+
+```
+:core-overlay:testDebugUnitTest      55 tests（新增 BubbleBackgroundPolicyTest 7 + BubbleInteriorScannerTest 8）
+全模块 testDebugUnitTest             TOTAL tests=537  fail=0  errors=0
+node app/src/test/js/mt-overlay-acceptance.test.js   ALL_OK 210/210（新增 §16 场景重建后抑制仍生效 9 条）
+```
+
+### 2. 椭圆白气泡夹具（用户第 2/3 条）
+
+夹具：`.verify/web/ellipse-bubble.html` + `ellipse-bubble.png`（生成脚本 `scripts/make_ellipse_bubble_fixture.py`：
+600x460，灰云背景 + 白椭圆泡 + 4 行韩文）。驱动：`scripts/verify-browser-page.py --url http://127.0.0.1:8899/ellipse-bubble.html`。
+
+| 阶段 | 关键日志 | 结果 |
+|---|---|---|
+| 修前（旧包） | `erase_target idx=0 keep=Y bg=none`、`render_scene … cleaned=true`、无 `solid_upgrade` | 盖板从 inpaint 清理图裁切：气泡内外一圈灰痕；译文左右戳出椭圆（`.verify/70_before_shot.png`） |
+| 修后（新包） | `solid_upgrade count=1 evidence=b0=ring0.82/flat0.99`、`ink_tilt … interior_cap=401x347 mid=475`、`scene_ok bubbles=1` | 盖板纯白 + 按容器轮廓裁剪；译文在椭圆内（`.verify/74_after_shot.png`） |
+
+实测像素校验（`.verify/74_after_shot.png`）：椭圆轮廓外 **0** 个「明显在轮廓外」的深色像素
+（v = ((x-cx)/a)^2+((y-cy)/b)^2 > 1.06 的深色点计数为 0），译文包围盒从修前的 757px 宽收到 624px。
+
+### 3. 接缝 + blob 轮换夹具（用户第 1 条）
+
+夹具：`.verify/web/seam-rotate.html`（`seamLine2A/B.png` 两张切片 + 每 6s 把 `<img>` 换成新 blob URL，
+复现 Lezhin 滚动时的元素重建 → 会话 `content_reuse` 重发场景）。
+
+- 日志：每次轮换 `content_reuse … seam=true` → `scene_ok … rebuilt=true` → `seam_dispatch … ok=true` →
+  `seam_suppress image=mt1 bubbles=1 removed=2`（抑制在重建后重新生效）；共 5 轮。
+- DOM 探针（CDP，150ms 采样 x 202 次，跑 30s）：含跨缝台词的节点**最多 1 个**
+  （`{max:1, ids:["mt2:b0:text"]}`），`_overlays` 稳定为 `mt1/mt2` 两条。
+
+### 4. 未覆盖
+
+- 真机站点（Lezhin）复测需要用户会话：见 `HumanTODO.md` 2026-10-13 条目；
+- 斜排气泡的排版框收窄（本轮跳过）；轮廓剖面 18 行的台阶（1~2px）。
+
+
+## 2026-10-14 「悬浮球点不动」= 点球停止时 SIGABRT（§31 遗留崩溃）
+
+执行者：OpenCode（DeepSeek V4.1 Flash）。设备 emulator-5556（1080x2400 / 420dpi），debug 包。
+
+### 1. 复现（全自动，脚本化 start/stop）
+
+| 轮次 | 操作 | 结果 |
+|---|---|---|
+| 0 | 点球（开始） | `ball_primary_tap` + `session_start`，pid 不变 |
+| 1 | 再点（停止） | `session_stop` → **`Fatal signal 6 (SIGABRT)`**、`Force finishing MainActivity`、pid 消失 |
+| 2 | — | 前台回到桌面 |
+
+### 2. 根因（tombstone + `logcat -b crash`）
+
+```
+Abort message: 'No pending exception expected: kotlinx.coroutines.JobCancellationException:
+                StandaloneCoroutine was cancelled (Throwable with no stack trace)'
+#04 art::Thread::AssertNoPendingException
+#05 art::ClassLinker::FindClass          ← pending 异常未清时解析类
+#09 art::interpreter::FindFieldSlow
+#13 com.manga.translator.app.EmbeddedBrowserScre…（解释器帧）
+#29 kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith
+#31 androidx.compose.ui.platform.AndroidUiDispatcher.performTrampolineDispatch
+```
+
+`stopSession()` 里的 `job.cancel()` 把 `JobCancellationException` 送进会话的 suspend 状态机；
+ART 解释器对「异常传播中 + 首次解析字段」直接 abort。与 Todolist §31 记录的未修 SIGABRT 同源。
+
+### 3. 修复后复测（同脚本）
+
+- 连点 3 轮 start/stop：pid 不变、无 SIGABRT；`session_stop … cooperative=true`；
+  日志 `ball_primary_tap running=false/true/false` 与真实状态一致（修复前恒为 false）。
+- 会话运行中「离开网页」（组合销毁）：pid 不变、无 SIGABRT；`browser_dispose deferred_destroy=…`。
+- 系统悬浮球（首页「启动服务」，`appops set … PROJECT_MEDIA allow` 放行录屏）：
+  点球 → `translate_local ok=mlkit count=6` + 覆写渲染成功；译文层在时再点 →
+  `floating_tap_restore_original`；全程无崩溃。
+
+### 4. 回归
+
+```
+全模块 testDebugUnitTest             TOTAL tests=537  fail=0  errors=0
+node app/src/test/js/mt-overlay-acceptance.test.js   ALL_OK 210/210
+```
+
+### 未覆盖
+
+- `CaptureForegroundService` 的 `translateJob?.cancel()`（`onDestroy` / `resetActiveSession`）
+  未改（语义上确实要中断），只补了 `floating_tap_busy` 诊断；
+- 「停止」的完全即时性：协作式停止最多晚一个轮询间隔（1.2s）退出。
+
+
+## 2026-10-14（第二轮）「超出太多了吧」：白底同色页面 + 块内多行
+
+执行者：OpenCode（DeepSeek V4.1 Flash）。设备 emulator-5556（1080x2400 / 420dpi），debug 包。
+
+### 1. 新夹具（复刻用户截图）
+
+`scripts/make_white_ellipse_fixture.py` → `.verify/web/white-ellipse.html/png`
+（白面板 + 上高椭圆泡（原文占上半 4 行韩文）+ 下气泡；与用户附图同构）。
+
+### 2. 修复前（`.verify/93_after.png` + `93_after.logcat`）
+
+```
+solid_upgrade: count=2 evidence=b0=ring0.70/flat0.99 b1=ring0.87/flat0.99
+refine_boxes: b0=338x164@75,508  b1=420x210@100,135
+ink_tilt: |b0 interior_cap=213x659 mid=620 |b1 interior_cap=620x600 mid=620
+          |b0 lineH=41.0 lines=4 |b1 lineH=70.0 lines=3
+```
+
+- 「容器」= 整页白底（`mid=620` = 页宽）→ 逐行最窄处算成 213px → 排版框被压成窄柱；
+- `b1` 行数 3（实际 4）→ 行高 70（真值 42.5）→ 字号翻倍；
+- 排版框还保留 15%/侧 的外扩 → 译文的行比原文宽 30%。
+  截图：两个气泡的译文都比原文大、整块戳出气泡。
+
+### 3. 修复后（`.verify/95_after.png` + CDP 实测）
+
+| 气泡 | 字号 | 行数 | 原文行高% | 排版框(CSS) | 内容(CSS) |
+|---|---|---|---|---|---|
+| b0 | 34.8px | 4 | 5.85%（=41px） | 224x180 | 200x169 |
+| b1 | 34.8px | 4 | 6.07%（=42.5px） | 278x187 | 255x169 |
+
+译文与原文同字号、内容完全落在气泡内（`interior_cap` 不再出现 = 白底同色页面按「无容器证据」
+处理，排版框 = 原文文字框宽度）。
+
+### 4. 回归
+
+- 灰云椭圆夹具（`.verify/96e.png`）：容器仍有边界 → 被采信；行数修对后 cap 按**每行**取
+  （401 → 333）→ 译文比原文略小、不越出轮廓（用户规则：装不下才缩字号）。
+- 单测：全模块 **542 通过 / 0 失败**（新增 `TextLayoutMetricsTest` 2 条、`BubbleInteriorScannerTest`
+  3 条）；JS 验收 **210/210**。
+
+### 5. 未覆盖
+
+- 逐行可用宽度只下发一个「最窄值」，长译文的字号会比理论最优再小一点；
+- 斜排气泡不吃这套规则。
+
+## 2026-10-14（第三轮）原文回退三件套 + 像素感知均衡断行 + 盖板轮廓墨迹守卫
+
+### 1. 单测与 JS 验收
+
+- Gradle 全模块：**569 通过 / 0 失败**（52 个测试类；新增 `CoverOutlinePolygonTest` 8 条、
+  `BalancedLineBreakerTest` 9 条、`OpenAiVisionClientTest` 新增 6 条）；
+- JS 验收：**219/219**（`node app/src/test/js/mt-overlay-acceptance.test.js`，新增均衡断行 9 条）。
+
+### 2. 盖板轮廓（C：锯齿 + 盖不住原文）模拟器复现与验证
+
+夹具：`.verify/web/ellipse-bubble.html`（灰云背景椭圆泡，容器可量到）+ emulator-5556。
+
+```
+solid_upgrade: count=1 evidence=b0=ring0.78/flat1.00
+ink_tilt:      |b0 interior_cap(cover_outline_only)=333x343 mid=471 |b0 lineH=36.0 lines=4
+cover_outline: b0=rows18/drop0/clamp5(+19px)/dil2        ← 5 行轮廓本会切进字形带，被墨迹守卫回扩
+render_scene:  owned=1 cleaned=true patches=0 flat=0
+```
+
+- 修复前该气泡的 `region_polygon` 会按容器最窄处（333px，比字形带 457px 窄 124px）裁剪，
+  切进字形区 → 缺口处原文/背景透出（用户截图里的「锯齿 + 不实心 + 盖不住原文」）；
+- 修复后 CDP 实测 `--mt-region-clip` 覆盖字形带（左缘 ~0.44%、右缘 ~99.6%，两端 4.5%/95.9%
+  仍贴合椭圆轮廓），截图 `.verify/mt_cover_fix.png`：译文 4 行（8/8/9/9 字）、无孤字行、原文无残留。
+
+### 3. 原文回退（A）与均衡断行（B）的验证口径
+
+- A：`OpenAiVisionClientTest` 钉住「瞬时错误判据（0/408/425/429/5xx）」与
+  「解析失败标记（垃圾文本/缺 key/截断 JSON）」；请求级重试路径靠真机日志闭环
+  （`request_retry_transient` / `translate_split_retry` / `translate_parse_retry` / `sentence_retry`）。
+- B：JS 端用注入式分词/测宽做表驱动（词不被劈开、标点禁则、标点优先、末行不孤字、行数保持）；
+  Kotlin 端 `BalancedLineBreakerTest` 同口径；三链路（DOM/悬浮球/整图 PNG）都走「保持贪心行数」重排。
+
+### 4. 未覆盖
+
+- 「模仿原文逐行断点」需要原文逐行文本（本轮只带行数）；
+- 竖排不重排；悬浮球手动放大字号后不重排。
+
+## 2026-10-14（第四轮）截页晚邻接竞态「三覆盖层」补带（Todolist §42）
+
+### 1. 夹具与复现
+
+`.verify/web/seam-race.html`：`seamLine2A.png` + **延迟 90s 插入**的 `seamLine2B.png`
+（模拟懒加载：A 处理完时 B 还没出现）。复现日志：
+
+```
+A: slice_classify detected=1 owned=1 cross=0        → 整块画掉（覆盖层 1）
+B: band_prep band=90 incoming=0
+   slice_classify detected=2 owned=2 orphan_adopted=1 → 整段认领重画（覆盖层 2）
+   seam_scene mode=none（A 没建带）
+```
+
+### 2. 修复后（模拟器）
+
+```
+seam_race_band own=mt1 next=mt2 ok=true prev=b0 cur=b0 score=0.94 band=213x156@130,182
+seam_dispatch   own=mt1 next=mt2 ok=true bubbles=1 covers=1
+seam_suppress   image=mt1 bubbles=1 removed=2
+seam_suppress   image=mt2 bubbles=1 removed=2
+```
+
+- CDP：`__mt_seam_root=1`；可见文字节点 = 接缝带 1 份 + 下方气泡 1 份；
+  A 的重复块被摘（`visibility:hidden`、离屏 x=-823）。
+- 截图 `.verify/mt_seam_race_fixed2.png`：跨缝句「笼子!! 要死或返回连接门或两个，只有两个。」
+  一块盖板 + 一份译文、缝口无截断、不溢出；下方气泡「即使你得到一个徽 / 章…」完整
+  （修复前被带盖板压掉第一行，见 `.verify/mt_seam_race_fixed.png`）。
+- 中间踩坑记录：第一次补带因为 A 泡底 96.7% < 阈值 97% 被拒（`seam_race_skip reason=no_match
+  prev[y+h=96.7] cur[y=0.0] best=0.94`）——阈值放宽到 8% 并把该几何写进单测；
+  第二次盖板压到下一个气泡（认领框比真实气泡高），加「避让同图其它气泡」收边。
+
+### 3. 测试
+
+- `SeamRaceBandTest` 8 条（匹配/不误伤/事务几何/盖板避让/不同图像素尺寸换算）；
+- 全模块单测 **577 通过 / 0 失败**；JS 验收 **219/219**。
+
+### 4. 未覆盖
+
+- 非实底跨缝句不补带（需要上一张清理图纹理）；斜排跨缝句不补带；
+- A 泡离缝 > 8% 时不匹配（宁可漏补，不乱摘）。
+
+## 2026-10-14（第五轮）图片重建（新 blob URL）后的接缝重复：补带兜底进贴回分支
+
+用户步骤：翻到下面 → 滑回上面 → 图片重新加载 → 同一句出现两份。
+
+修复：`EmbeddedBrowserScreen` 的「原文→译文」贴回分支在 `afterScenePlaced` 之后
+补一次 `tryLateSeamBand`（与翻译路径同源：几何贴边 + 文本匹配 ≥0.7，用当前元素 id 下发）。
+
+夹具：`seam-race.html` 追加「150s 后用新 blob URL 重建两张图」。模拟器实测（emulator-5556）：
+
+```
+16:12:44 SEAMRACE rebuilt
+16:12:50 seam_dispatch own=mt3 next=mt4 ok=true bubbles=1 covers=1
+16:12:50 seam_suppress image=mt3 bubbles=1 removed=2
+16:12:53 seam_suppress image=mt4 bubbles=1 removed=2
+```
+
+CDP：可见 = 带 1 份（s0:text，[135,187,205,95]）+ 下方气泡 1 份（b0:text）；
+旧带节点（race0）0 尺寸已失效；A 的重复块 hidden。截图 `.verify/mt_seam_reshow.png` 无重复。
+全模块单测 **577 通过 / 0 失败**；JS 验收 **219/219**。
+
+## 2026-10-14（第六轮）截图翻译「Lezhin 正文抓不到」：改用 PixelCopy 采集
+
+用户发现：Lezhin 的正文（GPU 合成层的漫画图）在截图翻译里读不出，两个 OCR 引擎都读不出
+→ 采集侧问题。根因：`webView.draw(Canvas)` 只画**软件层**，站点把正文图提升成 GPU 合成层时
+那部分内容不在软件层里（抓到的图缺正文）。
+
+修复：`EmbeddedBrowserScreen.startScreenshotTranslation` 改用 **PixelCopy**（读窗口真实合成像素，
+GPU 层也在内，不需要系统权限）；失败自动回退「临时切软件层再 draw」。
+`shot_capture` 日志新增 `src=pixelcopy|software` 便于区分。
+
+两个设备都已安装（emulator-5556 + 真机 AN3GUT4A22006400）。
+
+## 2026-10-15 翻译历史：搜索 / 改译文 / 作废缓存（新增功能）
+
+用户反馈：截页被错误合并后，错误的「原文 → 译文」进了句子缓存，之后遇到同一原文一直复用错译。
+本次给翻译历史加「搜索 + 改译文 + 作废」，并把改写**同步回句子缓存**（关键：只改历史快照没用）。
+
+**改了什么**
+
+- `core-store/SentenceTranslationRepository`：新增 `remove(SentenceCacheKey)` / `remove(Collection)` ——
+  单条 / 批量作废缓存（批量一次落盘）。
+- `core-store/TranslationHistoryRepository`：新增 `bubbleRefAt` / `pageBubbleRefs` / `updateBubbleTranslation`
+  + 顶层 `parseHistoryBubbles`；`rewriteBubble`（internal，纯函数）只改 `translatedText` / `edited`，
+  `x/y/w/h/bgType` 等渲染字段原样保留。
+- `app/HistoryScreen`：顶部搜索框（按原文 / 译文过滤 + 命中高亮，最多标 20 处）、展开区逐句列出
+  原文 / 译文 + 行尾「改」、修改译文弹层（原文只读 + 译文可编辑 + 保存 + 作废这句缓存）、
+  展开区底部「作废本页缓存」、绿色「已修正」标记。
+- `app/MainActivity`：三个回调接线（改译文同时 `sentenceRepo.put`；作废走 `sentenceRepo.remove`）+ toast 反馈。
+
+**自动化证据**
+
+| 项 | 结果 |
+| --- | --- |
+| `:core-store:testDebugUnitTest` | 12 个测试类全绿（新增 `HistoryBubbleEditTest` 5 例：坐标保留 / 越界返回 null / 坏 JSON / edited 解析 / 空 JSON） |
+| `:app:testDebugUnitTest` | 257 通过 / 0 失败 |
+| `:app:compileDebugKotlin` + `:app:assembleDebug` | BUILD SUCCESSFUL；dex 含 `TranslatorApplication`（非坏档） |
+
+**装机验证（emulator-5554，Pixel_8，1080×2400，真实历史 145 条）**
+
+1. **搜索**：输入 `Chapter` → 「找到 2 条」，列表由 145 条过滤为 2 条；展开后 `Chapter Two` /
+   `Open Chapter 2` 命中处品牌蓝高亮（`logs/ardot-verify/history-search-expanded.png`）。
+2. **改译文**：弹层把「작품을 불러오고 있습니다.」的译文改成 `。HELLO` → 保存后列表显示新译文 +
+   绿色「已修正」；**文件级核对**：`mt_sentence_translation.json` 里同句译文同步为 `。HELLO`
+   （这是根治「错误被反复复用」的关键一环）。
+3. **作废本页**：对「韩文 · 4 个气泡」那条点「作废本页缓存」→ 句子缓存条数 468 → 464，
+   该页 4 句全部从缓存消失（下次遇到会重新调翻译）。
+
+**未覆盖**
+
+- 弹层里的「作废这句缓存」与批量走同一个 `remove` API，装机时只验了批量入口
+  （单句入口因模拟器 IME 遮挡坐标未点中），两者逻辑同源。
+- 未在真机复测（本次为模拟器 + 真实历史数据）。
+- 历史列表里的「原文」是当时 OCR 的结果；「原文本身就被错拼」的条目目前只靠用户自己看出来，
+  界面上没有自动标记（见 HumanTODO）。

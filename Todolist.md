@@ -1,5 +1,980 @@
 # Todolist
 
+## 45. 新功能 UI 按画布定稿落地 + 语言识别收敛为「只提示」（2026-10-14 深夜，§44 的后续）
+
+画布定稿（`浏览翻译弹层-终版v2` / `首页-完整版v2` / `语言提示-底栏规格`）落到代码。
+
+### 一、语言自动识别：只提示、不动作（用户裁定「其他的就算了」）
+
+- **删掉两个自动行为**：`EngineSelectingTextDetector` 不再换模型重跑 OCR（`refineByDetectedLanguage`/
+  `pickBetter`/`scriptCharsOf` 整体删除）；`PageTranslationResolver` 不再让翻译源语言跟随识别结果
+  （`effective` 恒等于用户配置）。翻译始终按用户选的语言走。
+- **保留提示**：首遍 OCR 文本的脚本族与配置源语言**不同族**时写入新文件
+  `app/LanguageMismatchHint.kt`（Compose `mutableStateOf`，IO 线程写、组合读），
+  阅读底栏空闲时显示「语言可能选错了 · 页面是 X」（12sp Warning 橙 #D97706）；
+  会话进行中让位给进度文案；`onPageStarted` 清除（提示只属于当前页面）。
+  日志 `lang_hint configured= detected= mismatched=`。
+- **开关删除**：`SettingsRepository.isAutoDetectSourceLanguageEnabled`/`set…` 与
+  `KEY_AUTO_DETECT_SOURCE_LANGUAGE` 移除（默认开、无 UI，不需要 pref）。首页 OCR 卡与
+  齿轮弹层的「自动识别语言」行、「低质量时用多模态重读」行（弹层里的）都删了。
+
+### 二、弹层（BrowserSettingsSheet）改版
+
+- 「网页文字翻译」从动作行改成 **Tonal 按钮**（h44 r12 `#E8F1FE`、15sp SemiBold 蓝字，
+  画布 32:55），位置上移到语言对之下、设置分隔线之上；三态：网页文字翻译 → 翻译中…（禁用）→
+  恢复页面原文。旧 `BrowserSheetActionRow`（箭头/「…」）删除。
+- 开关统一走 `MtUi.kt` 新组件 `MtSwitch`（品牌蓝轨 + 白滑块）——修掉弹层裸用 M3 `Switch`
+  的默认紫轨。`MtTonalButton` 增加 `enabled` 禁用态（灰底弱字）。
+- 「精细擦字」开态副标题 = 用户定稿原文「可点击翻译直接切换原图。」（逐字用）。
+
+### 三、首页改版
+
+- OCR 卡删掉两行开关（自动识别语言 / 低质量时用多模态重读）。
+- 新增**「多模态重读」区块**（与 OCR 服务同级）：「启用」开关行（副标题「本地读不好时交给云端重读
+  （需配 API）」，写 `lowQualityVisionOcr` pref）+「配置档案」行。
+- **配置档案是独立选择（23:59 用户纠偏：不是共用当前翻译配置，而是共用档案库）**：
+  - 没选档案 = 跟随翻译配置（翻译走云端才生效，与历史行为一致，老用户无感）；
+  - 选了档案 = 重读用**那个档案**的厂商 / Base URL / Key（`ServiceLocator.resolveVisionApiConfig`），
+    **翻译选 ML Kit / 百度也照样能重读**（旧的 `translateEngine == CLOUD` 硬闸删除）；
+  - 指针复用现成的 `lastOcrProfileName`（rename/delete 已由仓库维护）；弹层为多模态打开时
+    标题变「选择多模态重读档案」、顶部多一条「跟随翻译配置」可回到跟随态、选中只记指针**不套用全局**；
+  - 模型名 = 所选档案的「多模态识别模型」，留空跟随该档案的翻译模型；
+  - 日志 `vision_ocr_request profile= model= provider=`（能看出用的哪套 API）。
+- `MtPrefSwitchRow` 补上行内边距（左 16 / 右 12，对齐 `MtListRow`）并把名称改成 13sp 次级色——
+  修掉「文字贴卡片边」的丑源。
+
+## 44. 四个新功能 + 两个修复：语言自动识别 / 低质量多模态回退 / 网页文字翻译 / 短行合并修复 / 地址栏跟随（2026-10-14 深夜）
+
+用户点名四项（「1.网站语言自动识别 2.低质量的识别进行多模态模型识别 3.网页文字翻译（参考项目）
+4.合并有问题：只有两个字的短行合并不到，参考参考文件」），外加一条新 bug（收藏页里站内跳转后
+顶栏地址不刷新）。
+
+### 一、短行合并不到（对应用户第 4 条，也是 §43 待取证第 2/3 条的可修部分）
+
+- **根因**（`core-translate/OcrBlockMergeRules.kt`）：2026-10-03 收严时把参考项目的
+  「`widthRatio ≥ 0.35` **或** 边缘/中心对齐」改成了「宽度比是**硬闸**（不足直接拒）+ 且」——
+  只有几个字的短行（气泡末行、CAUTION 带）宽度比必然 < 0.35，即使居中/贴左也在对齐检查
+  **之前**就被拒了。本轮读参考项目 `ocr-lines.js#shouldMergeLocalPaddleParagraphLines` 确认：
+  最终判决是 `widthRatio ≥ 0.35 || leftAligned || rightAligned || centerClose`（「或」）。
+- **修**：删掉宽度比硬闸，短行走「边缘对齐或中心接近即可并入段落」；两样都没有仍拒
+  （`knownRegionRelaxesAlignmentButNotGap` 的两气泡现场回归不受影响 —— 那对宽度比 1.0、
+  但既不对齐也不中心接近，靠的还是对齐闸而非宽度闸）。`sameKnownRegion` 的放宽保持原样。
+- 单测：`OcrBlockMergeRulesTest` 新增 3 条（居中短末行合并 / 贴左短末行合并 /
+  错位短块仍拒）。
+
+### 二、网站语言自动识别（用户第 1 条）
+
+- **新纯逻辑 `core-translate/SourceScriptDetector.kt`**：脚本判定对齐参考项目
+  `shared/languages.js#resolveSourceLanguage`——谚文≥2 → ko、假名≥1 → ja、汉字≥2 →
+  zh-cn/zh-tw（繁体专用字区分）、拉丁≥6 → en；优先级 ko > ja > zh > en；证据不足返回 null。
+  另有 `recognitionFamily`（Paddle 的 rec 模型只有 ZH/JA/KO、en 走 ZH；ML Kit 的识别器
+  en 单独一族）。
+- **OCR 换模型重跑**（`ServiceLocator.EngineSelectingTextDetector`）：首遍结果的语言与配置
+  **不同族**且证据 ≥2 字符时，用识别出的语言重跑一遍，两遍里「目标脚本字符」多的胜出
+  （打平取重跑）。日志 `lang_detect configured= detected= first= rerun= chosen=`。
+- **翻译源语言跟随**（`PageTranslationResolver.resolveTranslations`）：气泡文本检测出的语言
+  与配置不符（≥2 字符）时，句子缓存/引擎分发/历史记录全按生效语言走；配置的语言选择器
+  退化为「识别不出来时的回退」。日志 `translate_source_autodetect`。
+- **开关**：`SettingsRepository.isAutoDetectSourceLanguageEnabled`（独立 pref，默认开），
+  首页 OCR 卡 + 浏览器齿轮弹层各一行「自动识别语言」。
+
+### 三、OCR 低质量回退多模态（用户第 2 条）
+
+- **新纯逻辑 `core-translate/OcrQualityGate.kt`**：判据对齐参考项目
+  `background/modules/vision-ocr.js` 的低质量词修复——①块空/文本空；②Paddle 平均分
+  < 0.62 或弱分块（<0.72）占比 > 0.5；③读出的文字里连一个期望语言的字符都没有
+  （en 不做脚本检查，拉丁哪儿都有，必误报）。
+- **接入**（`EngineSelectingTextDetector`）：闸门通过且**云端 API 已配置**（translateEngine
+  = CLOUD + baseUrl/key 非空）时，整图走现成的 `OpenAiVisionClient.detectTextBlocks`
+  （此前无生产调用方）重读；「目标脚本字符更多才替换」（`visionBeatsLocal`）。
+  位图超 4MP 等比缩小后编码 JPEG（`encodeBitmapForVision`）。空结果连续 3 次多模态也读不出
+  就不再对「空」触发（防无字漫画反复烧 API），任意一次有收获即复位。
+  日志 `ocr_vision_fallback local= vision= took= replace=`。
+- **开关**：`SettingsRepository.isLowQualityVisionOcrEnabled`（默认开；没配云端 API 时是
+  纯 no-op），首页 OCR 卡 + 齿轮弹层各一行「低质量时用多模态重读」。
+
+### 四、网页文字翻译（用户第 3 条，参考项目 webpage-* 模块的 WebView 平移）
+
+- **新模块 `app/BrowserWebpageTextScript.kt`**：页面侧 `window.__mtWebpageText`
+  （collect/apply/restore）：
+  - 筛选对齐参考项目 `webpage-scanner.js`：黑名单标签（SCRIPT/STYLE/CODE/PRE/TEXTAREA/
+    INPUT/…，**BUTTON 不排除**——普通按钮文字要翻）、contenteditable、隐藏节点、插件自身
+    UI（`[data-mt-id]/.__mt_overlay/.mt-overlay-root/...`）、纯标点/URL/代码形态；
+    上限 1200 节点；
+  - 回填**直接替换 `nodeValue`**（不包 span，参考项目 webpage-node-state.js 的理由：
+    包 span 破坏站点 CSS/hydration），保留原文首尾空白；守卫：节点仍在文档且当前值
+    仍等于原文（页面自己改过就跳过——模拟器实测 h1 被站点脚本改写后 restore 正确跳过）；
+  - 安装与调用分两次 evaluate（不走 eval，严格 CSP 的站点会拦）。
+- **Kotlin 链路**（`EmbeddedBrowserScreen.startWebpageTextTranslation`）：收集 → 页面级
+  语言判定（页面语言 == 目标语言则整页跳过）→ 按批（24 段/1600 字符谁先到谁切）走
+  **`PageTranslationResolver`**——句级缓存/术语表/引擎分发/历史与漫画链路完全同源，
+  同一句话两条链路共享缓存 → 每批一 evaluate 回填（边翻边贴）。状态行走底栏状态行。
+  齿轮弹层动作行「翻译页面文字」↔「恢复页面原文」两态；页面跳转（onPageStarted）复位。
+  与漫画图链路互不干扰（图链路只碰 img/canvas，这里只碰文本节点）。
+- 单测：`BrowserWebpageTextScriptTest` 8 条（解析/切批/超长单段成批/载荷拼装/JS 入口名）。
+- **模拟器端到端**（emulator-5554，夹具 `.verify/web/webpage-text.html`）：
+  `webpage_text_plan collected=5 batches=1 lang=en target=zh-cn` →
+  `webpage_text_batch applied=5` → 标题/两段正文/按钮/链接全部中文、隐藏文本与 script 代码
+  被跳过、状态行「已翻译 5 段网页文字」；「恢复页面原文」`restored=4`（h1 被页面自己改过，
+  守卫正确跳过）→ 文本全部回到英文（截图 `.verify/47_translated.png` / `50_restored.png`）。
+
+### 五、地址栏不跟随站内跳转（用户新报 bug）
+
+- **根因**：地址胶囊显示 `pageUrl`，而它只在 `onPageStarted` 里更新；SPA 站内跳转
+  （pushState/replaceState）不触发任何 WebViewClient 回调（代码注释里其实早已注意到
+  这个特性，只是没处理地址显示）。
+- **修**：`EmbeddedBrowserScreen` 的 WebViewClient 补 `doUpdateVisitedHistory`——URL 变化时
+  只刷新 `pageUrl` 与站点适配器，**不动**渲染层注入/译文层/会话（页面没重载）。
+- **模拟器验证**：夹具内 `history.pushState` 跳转 → 日志
+  `url_updated source=doUpdateVisitedHistory`、顶栏地址同步变成新 URL（`.verify/48_pushstate.png`）。
+
+### 六、验证汇总
+
+- 单测全模块通过（`core-translate` 含 `SourceScriptDetectorTest` 8 条 +
+  `OcrQualityGateTest` 8 条 + `OcrBlockMergeRulesTest` 3 条新增；`app` 含
+  `BrowserWebpageTextScriptTest` 8 条）；JS 验收 **223/223**（渲染层本轮未动）；
+  `:app:assembleDebug` 通过，APK 已装 emulator-5554 并完成上述端到端验证。
+- 日志 tag 汇总：`lang_detect` / `translate_source_autodetect`（EngineSelecting）、
+  `ocr_vision_fallback`（EngineSelecting）、`webpage_text_*`（EmbeddedBrowser）、
+  `url_updated`（EmbeddedBrowser）。
+
+### 未做 / 下一轮
+
+1. **语言识别对 OCR「首遍即垃圾」的场景覆盖有限**：配置 en（默认）+ Paddle 走 ZH 模型读
+   韩文页，若首遍输出全是垃圾（无谚文证据），换模型重跑不会触发——这条链路靠第 III 节的
+   多模态回退兜底（需配云端 API）。要不要给 auto 加「先探测一遍」的轻量 pass，等真机日志。
+2. 多模态回退目前按**整页**重读（参考项目按低置信词裁小图修复，更省 token）；
+   等真机确认触发频率后决定要不要做词级裁剪。
+3. 网页文字翻译 v1 没有视口优先调度（参考项目 viewport/near/background 三级队列）、
+   没有逐节点语言跳过（只有页面级判定）、没有双语模式——先验证实用性再决定加不加。
+4. §43 其余各条（斜排 deskew 取证 `paddle_lines_all`、同一句两处等）不变，仍等真机取样。
+
+## 43. 用户 2026-10-14 夜间实测 6 条（安卓内嵌浏览器，Lezhin）：第 1 条已修，其余已定位待取证（2026-10-14）
+
+### 报障清单（原始截图顺序）
+
+| # | 症状 | 状态 |
+| --- | --- | --- |
+| 1 | 气泡原文透过译文可见（盖板时有时无/只盖一部分）——「同款问题」 | **已修**（本节） |
+| 2 | 同一句被画两处：一个窄竖条（逐字换行）+ 正确的气泡 | 待取证（本节四、1） |
+| 3 | 一行文字太少时不与相邻文字框合并（CAUTION 带、断行孤字同源） | 待取证（本节四、2） |
+| 4 | 斜排原文（报纸页 ~20°）不跟随：盖板/译文都是水平大块 | 待排期（本节四、3） |
+| 5 | 译文本身出错：「只是只是把把东西落在落在家里了。水水」 | 待取证（本节四、4） |
+| 6 | 盖板/译文框太大（远超原文气泡） | 部分随第 1 条修复（本节二） |
+
+### 一、第 1 条的根因（已定位、已修）
+
+`mt-overlay-renderer.js#resolveCoverQuad` 少了参考项目 `cover-geometry.js` 的两条硬门槛，
+`rotation_deg ≈ ±90` 被当成「斜排」→ **外接框被旋转 90°**：盖板变成**横条**（竖列原文大面积
+露出）、外框还被撑成横跨画面的包围盒（第 6 条同源）。而 ±90 的语义是**竖排方向**，不是「歪了」——
+检测器（`PaddleQuadGeometry.rotationDeg`：取较长边方向）对高而窄的框一律给 ±90°，
+`TextQuadGeometry.quadOf` 把它原样写进 `Bubble.rotationDeg`（浏览器链路只有
+`pixelTiltDegFromPercentQuad` 那条（接缝部件）带了 60° 上限）。
+
+- 修复（`app/src/main/assets/mt-overlay-renderer.js`）：
+  1. 新增 `COVER_ROTATION_NOISE_DEG = 2`，`rotationTilted = |rot| > 2 && |rot| < 60`
+     （与 `RENDER_ROTATION_VERTICAL_MIN_DEG` 同一口径）；
+  2. 无四边形分支与兜底分支的 `rotateBoxQuad` 也跟着 `rotationTilted` 走（竖排/噪声不旋转）；
+  3. 裁剪层不再额外 `rotate()`（倾角只由 quad 的 clip-path 表达，此前会转两次）。
+- 回归闸门（`app/src/test/js/mt-overlay-acceptance.test.js` §17，4 条）：
+  - 竖排（89.97° + 竖列四边形）盖板必须**高 > 宽**、无四边形时同理；
+  - 亚 2°（-0.6°）必须**不旋转**且框 = 原框；
+  - 真斜排（12°）行为不变（形状走 clip-path、不叠加节点旋转）。
+- **已验证用例会红**：把渲染器临时改回修复前口径 → `FAILED 3/223`（两条竖排用例显示盖板
+  变成 `60.0% × 10.0%` 的横条、噪声用例框被撑到 `40.10% × 10.42%`）；恢复后
+  `ALL_OK 223/223`。
+
+### 二、与第 6 条的关系
+
+±90° 被旋转会同时产生「横条盖板」和「外框被撑成包围盒」两种形态（旋转后 bounds 交换宽高）。
+第 6 条里那种「白盒远大于气泡」若仍能复现，按本节四、5 取样 —— 剩下可能是盖板框取到了
+容器/背景估计（§39/§40 那一类），与倾角无关。
+
+### 三、待真机复测
+
+- [ ] 同款现场（Lezhin 53 话附近、译文盖住原文的那些气泡）重新翻译后：原文是否被完全盖住、
+      盖板尺寸是否贴合原文；`adb logcat -s EmbeddedBrowser:V TranslationPerf:V` 抓
+      `scene_ok` 一行；有 `rotation_deg≈±90` 的气泡重点看。
+
+### 四、其余各条的定位与需要的取证
+
+**已取样现场（用户唯一能复现的：47 话 13/74 页，含报纸斜排标题 + 多处跨页碎片）**
+
+真机实测（emulator-5554，2026-10-14 07:34，`TranslationPerf` / `EmbeddedBrowser`）：
+
+```
+ocr_blocks_all  blocks=5 img=1280x2720 :: … ˌ 네 번째 살인미수에서 @188,1956,1019x452 ˌ …
+ink_tilt        |b0 lineH=452.7 quad=0.0 lines=1 lb=0 poly=0 maskQuad=0 vertical=false
+slice_classify  d0=cross（跨下边界）…
+seam_dispatch   own=mt39 next=mt29 ok=true bubbles=1 covers=1 texts=[네 번째 살인미수에서 벗어 아→远离第四次谋杀的人数]
+```
+DOM 探针（CDP）：接缝带 root `mt39|mt29` 里那个气泡的
+`data-original = "네 번째 살인미수에서 벗어 아니 레온 데븐포트"`、译文 `远离第四次谋杀的人数`、
+框 `97.51% × 93.39%` —— 就是用户截图里那块「横着盖住报纸」的东西。
+
+**两条根因（同一条链）**：
+1. **识别把倾斜的标题读坏了**：真实标题是「네 번째 살인미수에서 벗어**난** 레온 데븐포트」，
+   倾斜 ~12°；参考项目在 OCR 服务侧做 deskew（结果 JSON 里 `deskew: true`，本轮离线复跑
+   同一张图读出的就是正确的 `에서 벗어`），**安卓端本地 PaddleOCR 只处理 ±90° 方向**
+   （`PaddleQuadGeometry.selectBestOrientation`），小角度倾斜不 deskew → `난` 被读成 `아니`
+   → 原文被污染 → 译文跟着错（同一页更早一次渲染译文还是对的「脱身的莱昂·达文波特」）。
+   这一类同时解释了用户 #5（译文莫名其妙）的形态。
+2. **倾角没有传给渲染层**：`ink_tilt` 里 `quad=0.0 poly=0`（`TextQuadGeometry` 只对**单框**组合
+   透传 polygon/rotationDeg；跨页合并 / 多框块一律 null），于是那块大标题按轴对齐渲染成
+   水平大块（用户 #4 的形态），盖板 = 整条接缝带（97.5% × 93.4%）。
+
+**下一步（按此顺序做）**：
+- ~~B. 倾角**多框也透传**~~ ✅ **已做（2026-10-14）**：`PaddleOcrBlockMerger.mergeGroupToBlock`
+  对「组内每框都带四边形、倾角落在 2°..60°、互相偏差 ≤8°」的合并组，写回**最小外接矩形**
+  四边形（`mergedTiltQuadOf`，像素空间绕公共角转正取 AABB 再转回）；倾角不一致 / 缺四边形 /
+  竖排（≥60°）仍保持轴对齐（原 2026-09-29 的顾虑不变）。`TextBlock` 没有 rotationDeg 字段，
+  倾角由消费端从四边形算（`TextQuadGeometry.rotationDeg` + 渲染层 aspect 校正）。
+  单测：`PaddleOcrBlockMergerTest` 新增 3 条（一致倾角保留 12°、角度矛盾丢弃、竖排/缺框丢弃）
+  并把原有 `mergedGroupDropsPolygonToAvoidWrongTilt` 改成「不一致才丢」的口径；
+  `:core-translate:testDebugUnitTest` 143 通过 / `:app:testDebugUnitTest` 249 通过 / JS 验收 223。
+- A. **「난 → 아니」到底是识别器输出还是合并引入**（还没定，先取证）：合并前新增行级日志
+  `PaddleOcrLocalTextDetector` → `paddle_lines_all raw=N img=WxH :: 文本@x,y,WxH,rot=角度 ˌ …`
+  （`adb logcat -s PaddleOcr:V`）。判断口径：若 `아니` 已出现在某一行里 → 是检测/识别（crop 或
+  条带拼接）的问题，再看那一行的 `rot=` 与框位置；若行里没有、只有合并后才有 → 是后聚合。
+  拿到这一行再决定要不要在本地 PaddleOCR 里加小角度 deskew（对齐参考项目 `crop_geometry.py`）。
+- C. 之后再看接缝带那条 `texts=[…]` 的框是否还需要按倾角收窄。
+
+1. **同一句两处（窄竖条 + 气泡）**：竖条 = 合并后的整段文本被塞进**小气泡的窄框**（逐字换行），
+   另一处 = 长气泡自己那份。嫌疑顺序：`BubbleFirstRegionPlanner` 的分组/区域归属
+   （小气泡 region 抢到整段文本）→ `buildBubblesFromAssignment` 的框来源。
+   需要：复现页日志（`ocr_blocks_all` / `block_merge_reject` / `bubble_first_result_stats`）。
+2. **短行不合并**：判据在 `BubbleFirstRegionPlanner`（间隙/重叠/中心距）；上面那两组行块
+   （间隙 22px ≈ 0.46 行高、重叠 0.67）在本轮实测数据里属于**应该合并**的一类，
+   若真机没合并，说明卡在**区域归属**（气泡区域优先）而不是纯邻接判据 —— 先用
+   `block_merge_reject` 那一行确认卡在哪条。
+3. **斜排原文（可做，方向已明确）**：把倾角证据从「单框 polygon」放宽到**多框合并块**：
+   在**像素空间**对合并块的各框角点取「最长一致边方向」（各框倾角互相在 ±8° 内才采信），
+   写进 `Bubble.rotationDeg`；渲染侧已支持 aspect 校正后的斜排（`applyAspectCorrectedTilt`），
+   盖板侧本轮已修竖排/噪声两条门槛，只差喂进倾角。
+4. **译文出错（叠词 + 물건→水）**：两种可能一眼可分 ——（a）送翻译的**原文**本身就重复
+   （合并把同一段读了两遍）；(b) 翻译引擎（本地 ML Kit？）复读。需要：该页 + 当前翻译引擎设置 +
+   同一页换 API 引擎的对照截图。
+5. **盖板太大**：需要 `ink_tilt` / `cover_outline` 两行（容器量测与轮廓裁剪结果）+ 截图，
+   用来判断是「字形框本身量大了」还是「轮廓裁剪被放弃后退回矩形」。
+
+## 42.截页「三覆盖层」（晚邻接竞态）已修：B 侧补建接缝带（2026-10-14）
+
+### 用户报障（承接 §40 未做项）
+
+> 截页那里有三个覆盖层：①「笼子!!死了全速」= 第一二行的译文、位置正确；
+> ②「[笼子!! 要退出连接…」= 吸收了上面的文字、整段译文，但**起点在第二页开头**、
+> 整块向下**超出气泡框**；③「即使你…」位置正确。
+> 截断出现在①和②中间、第二行底部偏上一点。
+
+### 复现（新夹具 `.verify/web/seam-race.html`）
+
+与 `seam-after-line2.html` 同一素材，但**下半张切片延迟 90 秒插入**（模拟懒加载：
+上一张处理完时下一张还没出现）→ 模拟器稳定复现：
+- A（`seamLine2A.png`）：`slice_classify owned=1 cross=0` → 整块画掉（覆盖层 1，根被 `overflow:hidden` 裁在缝上 = 用户说的「截断」）；
+- B（`seamLine2B.png`，迟到 90s）：`orphan_adopted=1` → 整段认领重画（覆盖层 2，从缝口起排 → 向下溢出）；
+- `seam_scene mode=none`（A 没建带）、`incoming=0`（没有移交）→ 没有任何机制消掉重复。
+
+### 修复（方向 A + 门控收窄）
+
+1. 新纯逻辑 `app/SeamRaceBand.kt`：把「A 贴底的泡 + B 贴顶的泡」按**文本（[HandoffTextMatch]
+   字符覆盖率 ≥ 0.7）+ 几何（A 泡 y+h ≥ 92%、B 泡 y ≤ 8%）**匹配，给出接缝带几何
+   （上一张图像素系、跨两张图）、带内百分比的排版/盖板框与两个待摘 id；
+2. `EmbeddedBrowserScreen`：B 的场景上屏后调 `tryLateSeamBand` —— 触发条件全部收窄
+   （B 有紧邻上一张、A/B 场景都在屏、A 没带过带、B 泡是实底、文本匹配过），
+   命中就补发一条与正常路径同构的接缝带（`seam_dispatch` 复用），成功后
+   `seam_suppress` 摘掉 A/B 两边重复块，并登记 `seamBySrc`（「原文→译文」贴回时会重发）；
+3. 盖板避让：带盖板 = A/B 盖板并集，**被当前图其它气泡的顶/底收边**——
+   认领框常比真实气泡高一点，不收边会盖掉下一个气泡的第一行（夹具实测并截图确认）。
+
+### 验证（emulator-5556）
+
+```
+seam_race_band own=mt1 next=mt2 ok=true prev=b0 cur=b0 score=0.94 band=213x156@130,182
+seam_dispatch   own=mt1 next=mt2 ok=true bubbles=1 covers=1
+seam_suppress   image=mt1 bubbles=1 removed=2
+seam_suppress   image=mt2 bubbles=1 removed=2
+```
+
+CDP：`__mt_seam_root=1`，可见节点 = 接缝带 1 份 + 下方气泡 1 份，A 的重复块 `visibility:hidden`
+（离屏 -823px）。截图 `.verify/mt_seam_race_fixed2.png`：跨缝句一块盖板 + 一份译文、
+缝口无截断、不再溢出；下方气泡首行「即使你得到一个徽」完整（修复前被带盖板压掉）。
+单测：`SeamRaceBandTest` 8 条；全模块 **577 通过 / 0 失败**；JS 验收 **219/219**。
+
+### 未做 / 下一轮
+
+1. 非实底（旁白/插画底）跨缝句不补带（需要上一张的清理图纹理，竞态时已回收）——
+   仍会双画；要修得让上一张的清理图带存活一小段（或改用本图的纹理做带）；
+2. 斜排跨缝句不补带（四边形/倾角在带坐标系里要整套重算）；
+3. 若 A 的泡底 < 92%（离缝较远）但确实是同一句，不匹配（宁可漏补，不乱摘）。
+
+### 二修（用户 2026-10-14 追加：翻下去再滑上来、图片重新加载后同一句出现两次）
+
+**原因**：阅读器把 `<img>` 换成新 blob URL（新元素 / 新 `data-mt-id`）后，接缝带的
+`seamBySrc` 注册按**旧 src** 对不上 → 既找不到带（不重发），两半的抑制登记也失效 →
+「原文→译文」贴回 / 重新翻译后，同一句又画两遍。
+
+**修**：贴回分支补一次与翻译路径同源的 `tryLateSeamBand`（按几何贴边 + 文本匹配，
+用**当前**元素 id 下发带并重新登记两边的抑制）。
+
+**验证**：夹具 `seam-race.html` 增加「150s 后用新 blob URL 重建两张图」；
+emulator-5556 实测：重建后 `seam_dispatch own=mt3 next=mt4 ok=true` +
+`seam_suppress image=mt3 removed=2` / `image=mt4 removed=2`，
+CDP 可见节点 = 带 1 份 + 下方气泡 1 份（旧带节点 0 尺寸已失效），
+截图 `.verify/mt_seam_reshow.png`：无重复。
+
+## 41.「原文回退 + 断行孤字/断在词中 + 盖板锯齿露原文」三连修（2026-10-14）
+
+### 用户报的症状（三项）
+
+> 1. 用 API 翻译的时候经常出现原文回退。是因为没有重试机制，还是等待时间太短？
+> 2. 排版有问题，会出现有些行只有一两个字的状况。字最好模仿原文，不能模仿就直接均匀点。
+> 3. （截图）背景不是实心的、呈锯齿状，无法完全盖住原文；断行把「讨厌它」劈成「讨｜厌它」。
+
+### 定位
+
+1. **原文回退**（`OpenAiVisionClient`）：
+   - 超时本身很宽裕（read 120s），有重试阶梯但只覆盖「思考参数/`response_format` 被拒」两种降级；
+   - 瞬时错误（超时/429/5xx）直接抛 → 整页「翻译失败，已显示原文」；
+   - **解析失败静默整批返回原文**（`translate_parse_fallback`，用户无感知）；关思考时 `max_tokens=2048`
+     对一页多句的 JSON 容易截断 → 非法 JSON → 命中该静默分支。
+2. **排版**：三条渲染链路各自贪心断行（CSS / StaticLayout），字符数均衡只在「行数 > 1」的
+   JS 路径上有，且按字数不按像素宽、断点可落在词中间。
+3. **盖板锯齿/露原文**（`interiorOutlinePolygonPercent`）：纯色盖板按「容器逐行轮廓」裁剪，
+   轮廓只有「弦宽过滤」一道防线 —— 走向被笔画卡住的窄行照样进多边形，
+   **裁切切进字形区**（缺口处原文/背景透出来；逐行台阶 = 锯齿）。
+
+### 修复
+
+1. **原文回退三件套**（`core-translate/OpenAiVisionClient.kt`，2026-10-14）：
+   - 瞬时错误退避重试：连接失败/超时（无响应）、408/425/429/5xx → 最多 3 次、600ms×n 退避，
+     日志 `request_retry_transient`；
+   - 解析失败/截断重试：`finish_reason=length` 或 JSON 解析失败 → 多句**对半拆批**（≤2 层，
+     日志 `translate_split_retry`），单句换 `json_format=false` 重发（`translate_parse_retry`）；
+     仍失败才 `translate_parse_giveup`；
+   - 单句粒度重试：解析成功但「译文 == 原文」的句子单独再发一次（`sentence_retry`），
+     与缓存层 `skip_noop` 同判据；返回 `TextTranslationOutcome.failedIndices` →
+     `PageTranslationResolver` 给出「云端翻译部分句子未生效（N/M 句已显示原文）」提示（不再静默）；
+   - `max_tokens` 跟着句子数走（`max(2048, 句数×96)`，上限 8192）。
+2. **像素感知均衡断行**（三条链路统一，2026-10-14）：
+   - 新纯逻辑 `core-translate/BalancedLineBreaker.kt`（ICU 词典分词 + 实测宽度 DP：
+     词边界断行、标点禁则[行首不出现收尾标点/行尾不留开括号]、标点后断行折扣、
+     单单元成行/末行过短罚、行宽约束）+ 单测 `BalancedLineBreakerTest`；
+   - JS 渲染层同权重实现（`breakBalancedLines`/`formatBalancedLines`/`rebalanceTextNode`，
+     日志 `MTBREAK`）：字号拟合后按**当前行数**重排（行数不变才采用），canvas 测宽、
+     退化到字宽估算；`source_line_count` 仍用于挂载时的首排；
+   - 悬浮球链路 `OverlayController.rebalancedBubbleText`、整图 PNG `WebtoonImageTranslator.balancedDrawText`
+     同样「保持贪心行数」重排（断不开保持现状）。
+3. **盖板轮廓加固**（`app/CoverOutlinePolygon.kt`，替换 `interiorOutlinePolygonPercent`）：
+   - **墨迹守卫**：落在文字行带内的轮廓行不许窄于该行带的字形框（多行按行带分别守），
+     窄了就往回扩 —— 裁剪永远不切进字形区，「缺口/露原文」从根上消除；
+   - 整体外扩（行高 5%，钳 2–6px）吃掉抗锯齿/亚像素误差；
+   - 端行延到盖板上下沿、弦宽过滤、退化整体放弃（落回矩形）等既有行为保留；
+   - 诊断一行 `cover_outline b0=rows/drop/clamp(+px)/dil`（每张图一条）。
+
+### 验证
+
+- 单测全模块 **569 通过 / 0 失败**（新增 `CoverOutlinePolygonTest` 8 条、`BalancedLineBreakerTest` 9 条、
+  `OpenAiVisionClientTest` 新增 6 条：瞬时错误判据 + 解析失败标记）；
+- JS 验收 **219/219**（新增均衡断行 9 条）；
+- 模拟器（emulator-5556，`ellipse-bubble.html` 灰云椭圆夹具）：`solid_upgrade` 后
+  `cover_outline: b0=rows18/drop0/clamp5(+19px)/dil2` —— 5 行轮廓本会切进字形带，被守卫回扩；
+  DOM 探针 `--mt-region-clip` 已覆盖字形带（此前会被 333px 的容器最窄处裁掉一截）；
+  截图：译文 4 行、无孤字行、原文无残留。
+
+### 未做 / 下一轮
+
+1. 「模仿原文逐行断点」需要把**原文逐行文本**（`sourceLines`）随 Bubble 带下来（当前只有行数），
+   本轮先落到「均匀 + 词边界」，逐行模仿留待后续；
+2. 竖排（`mt-jp-vertical` / `VerticalTextView`）不参与重排（列方向均衡语义不同）；
+3. 悬浮球链路的重排按**拟合字号**计算，用户手动放大字号（`fontScale`）后不重排。
+
+## 40.「字号/位置以原文为基准」落法 + 盖板不实心修复 + 截页三覆盖层定位（2026-10-14）
+
+### 用户规则（本轮一切改动的依据）
+
+> 1. 译文的位置和字号，以原文为基准。不要为了「让译文更合适」去改 layoutRect，也不要横向或纵向收窄。
+> 2. 唯一的例外：译文太长、按原文字号装不下时，才自适应缩小字号。
+> 3. 不要顺手改别的东西；有别的问题先说，不要直接改。
+
+### 改动一：排版框 = 字形框原样（§39 口径的收口）
+
+`resolveFinalBubbles` 里 layoutRect 不再做任何加工：删掉 ±0.2 行高的垂直外扩、删掉
+interiorCap 的横向扩宽（1.3×/容器）与纵向削高——那些都是在挪译文。字号基线本就来自
+四边形厚度/字形框，不受排版框影响；装不下由渲染层二分缩字号（唯一允许的调整）。
+`resolveInteriorCap` 的逐行扫描**保留**，但只喂盖板轮廓裁剪（regionPolygonPercent，防椭圆白肩），
+不再参与排版。验收：文字在盒内双居中，对称改动不移动中心；短译文位置/字号与改前一致。
+
+### 改动二：逐行框贯通——字号与盖板的「原文」量准（用户截图：译文比原文大 1/3、白盒戳出气泡）
+
+**根因**（`ink_tilt` 探针钉死）：同一张图上 4 行泡 `lineH=45.3`、相邻 5 行泡 `34.9` ——
+ML Kit 块级框偏松（含行距内边距，粘到气泡描边时 OTSU 收不回来），「块框高 ÷ 行数」把字号
+基线系统性放大 ~1/3，盖板（= 块框 + pad）随之比原文大一圈。
+
+**修**：ML Kit 自带的逐行 boundingBox 贯通到消费点：
+- `TextBlock.lineBoxes` / `Bubble.lineBoxes`（百分比，坐标系同 x/y/w/h；Paddle/合并泡为 null 走老路径）；
+- `MlKitLocalTextDetector` 带出逐行框（除回检测缩放）；`BubbleFirstRegionPlanner.buildBubbleFromBlocks`
+  与 `WebtoonImageTranslator.buildLocalBubbleFromGroup` 换算成百分比；
+- `resolveFinalBubbles`：**字形区 = 行框并集**（横排；斜排仍用墨迹最小外接矩形）、
+  **字号基线 = 行高中位数**（竖排取列宽，`TextLayoutMetrics.medianLineBoxDimPx`，中位数抗单行离群）；
+  老口径（块框 ÷ 行数）只在拿不到逐行框时兜底。
+- 单测：`TextLayoutMetricsTest` +4 条（中位数/偶数取上中位/竖排列宽/退化框跳过）。
+
+### 改动三：盖板「不实心/原文露出」（用户截图两例：韩文透过盖板可见）
+
+**根因**（CDP 取证）：实底盖板 = `::before` 画 `--mt-adaptive-bg`，被 `--mt-region-clip`
+（容器逐行轮廓多边形）裁剪。OCR 原框紧贴文字时，`BubbleInteriorScanner` 的扫描行**每行都穿过
+密集字形**，走向被行内字间空隙卡住，量出的「弦」是字间空隙（真机取证：左边界在 37%↔48% 之间
+来回跳），多边形自交成锯齿 → 盖板整块被裁没、原文全露。违反该函数自己注释的原则
+「宁可不裁，也不能把盖板裁出缺口、露出原文」。
+
+**修**：`interiorOutlinePolygonPercent` 加逐行弦宽防线——弦 < 最大弦 ×45%（`OUTLINE_ROW_MIN_CHORD_RATIO`）
+的行按文字噪声丢弃；可用行不足 3 行整体放弃，落回矩形盖板（整块盖住原文，白肩是可接受的次坏解）。
+另外容器扫描输入改回宽松的精修内容框（行框并集会让每行都穿过文字，见 `resolveFinalBubbles` 注释）。
+
+### 验证（emulator-5556，Lezhin gamesal 第 1 话）
+
+- 어린아이 泡（原症状现场）：修复前韩文全露、无盖板；修复后白色盖板完全盖住原文，
+  译文两行贴原文位置、字号与原文一致（`.verify/90_chordfix.png`）。
+- 逐行框生效：探针 `lb=N` 与 `lines=N` 全对齐，行高离群值（45+）消失；
+  「这就是在这…」泡字号 22.9px → 18.1px（回到原文量级）。
+- 接缝 7/8 页终态：笼子泡一段完整译文贴原文、无叠影无溢出；악질들泡 3 行贴原文（`.verify/92_seam_final.png`）。
+- 全模块单测通过（新增 4 条）。
+
+### 未做 / 下一轮：截页「三覆盖层」（用户 2026-10-14 详细报障，已定位未修）
+
+用户描述与本轮日志对上的链条：**晚邻接竞态**。
+1. 页 7 在邻接建立前就完成翻译提交（`scene_ok … cross=0`；`band_pair adjacent=true` 晚 2ms）→
+   自己渲染泡上半（覆盖层 1「Ceilie 是!!死了全速」，位置正确）；
+2. 页 8 首扫后 `seam_strip_sentence_cut` 触发条带加高重跑（2544→2688），重跑检出跨上边界泡 →
+   `seam_dispatch own=mt6 next=mt7` 建带，带文本 = 吸收后的**整段**译文，带框被 `limitTop=topH`
+   夹到缝上 → 整段译文从缝口起排 → 盖板+译文向下溢出气泡（覆盖层 2，用户描述完全吻合）；
+3. 没有任何机制回溯抑制页 7 已渲染的 own 泡 → 1+2 同时在屏。
+下一轮方向（任一）：A. 带挂载时按吸收文本/几何回溯隐藏前页同泡；B. 邻接晚到时用缓存内容+新条带
+重跑前页归属（content_reuse 已有缓存，只缺重跑触发）；C. 下边界附近泡在邻图缺席时暂缓渲染。
+另：覆盖层 1 的「Ceilie」是 ML Kit 对「케이지라고요」的本地译名质量问题，与几何无关。
+
+## 39.「超出太多了吧」：白底同色页面量不到气泡轮廓 + 块内多行被算成一行（2026-10-14）
+
+### 用户报的症状（附前后对照图）
+
+> 「这里为什么会这样。超出太多了吧。这个位置」
+> 译文比原文大一截、整块（连字号）戳出气泡；同一页另一个气泡也一样。
+
+### 定位（模拟器复刻：白底面板 + 高椭圆泡 + 原文只占上半）
+
+新夹具 `scripts/make_white_ellipse_fixture.py` → `.verify/web/white-ellipse.html`。
+第一次复刻（`.verify/93_after.png`）完全重现用户截图，日志给出两个根因：
+
+1. **「容器」量成了整页白底**：气泡是白的、面板也是白的 → 走向跨过那 3px 描边后**同一颜色**，
+   于是一路走到画面边缘。`ink_tilt` 里 `interior_cap=213x659 mid=620` —— 中点行宽 620 =
+   整页宽；逐行最窄处算出一个乱值 213（撞上椭圆描边的切线行）→ 排版框被压成一根 213px 窄柱
+   → 译文挤成 6 行、整块戳出气泡。
+2. **译文允许比原文宽 30%**：排版框 = 字形框每侧外扩 15%（朝气泡外框方向）。白底页面上
+   量不到轮廓时，这个外扩就是纯粹的溢出预算（真机：4 行原文 420px 宽 → 译文铺满 464px，
+   而气泡弦长只有 409）。
+3. **ML Kit 把两行并成一个块 → 行数少算一行**：`lineCount=3`（实际 4 行）→
+   `行高 = 框高 ÷ 行数` 从 42.5 变 70 → `font_height_percent` 翻倍 → 译文字号大一截。
+
+### 修复
+
+1. **`BubbleInteriorScanner.Interior.isTrustworthyContainer`**（新）：容器「贴着画面边缘」或
+   「比字形框宽 > 2× / 高 > 2.6×」= 量到的是页面/面板，不是气泡 → 不采信（不收窄、也不外扩）。
+   灰云背景上的椭圆泡（容器有边界）仍然采信 ✓。
+2. **横向外扩必须有证据**（`WebtoonImageTranslator.resolveFinalBubbles`）：
+   排版框从字形框出发，**默认就是字形框宽度**；只有量到可信容器时才允许扩到
+   `min(1.3×字形宽, 容器逐行最窄处)`。删掉了 `growTowardOuter`（连同它 15% 的溢出预算）。
+   依据：用户 2026-10-13 定的规则「字号跟原文，装不下才自适应缩小」—— 译文不该占**比原文更大**
+   的面积。
+3. **`TextLayoutMetrics.countVisualLines` 改成「按组求和块内行数」**：块自带的 `lineCount`
+   （ML Kit = `block.lines`）以前被丢掉，两行并一块只算一行 → 行高翻倍 → 字号翻倍。
+   单测 `blockSpanningTwoLinesCountsBoth` / `lineCountOneKeepsLegacyBehaviour` 钉住。
+
+### 验证
+
+- 夹具复刻 → 修复后同页（`.verify/95_after.png`）：两个气泡的译文都是**原字号**
+  （CDP：`font=34.8px`，`lines=4`，`srcPct=6.07`（= 42.5px 行高，真值 44）），
+  内容完全落在气泡内；修复前是同页的 70px 行高 + 5 行戳出气泡。
+- 回归（灰云椭圆夹具 `.verify/96*`）：容器仍被采信，逐行最窄处按**每行**收窄
+  （行数修对后 cap 从 401 变 333）→ 译文比原文略小、但不越出轮廓（用户规则：装不下才缩）。
+- 单测全模块 **542 通过 / 0 失败**（新增 2 条行数用例 + 3 条容器可信度用例）；
+  JS 验收 **210/210**。
+
+### 未做 / 下一轮
+
+1. 逐行最窄处是「单值上限」：译文所有行都被最窄那一行（通常是首行/末行）约束，
+   字号可能比理论最优小一点。要更贴可以给渲染层下发**逐行可用宽度**（现在只下发一个宽度）；
+2. 斜排（四边形）仍走原口径，不吃这套收窄/外扩规则。
+
+## 38.「悬浮球点不动」= 点球停止时 SIGABRT（§31 遗留崩溃定位并修复）（2026-10-14）
+
+### 用户报的症状
+
+> 「不知道为什么悬浮球点不动」
+
+### 复现与定位（模拟器 emulator-5556，本轮全自动）
+
+- 点球**开始**翻译：正常；**再点一次（停止）**：进程 `Fatal signal 6 (SIGABRT)`，
+  `Force finishing activity com.manga.translator.app/.MainActivity` → 画面回到桌面。
+  连续 3 轮 start/stop 复现率 100%，用户看到的正是「点球之后什么都没了/点不动」。
+- tombstone（`/data/tombstones` + `logcat -b crash`）钉死根因：
+
+```
+Abort message: 'No pending exception expected: kotlinx.coroutines.JobCancellationException:
+                StandaloneCoroutine was cancelled (Throwable with no stack trace)'
+#04 art::Thread::AssertNoPendingException
+#05 art::ClassLinker::FindClass            ← 异常还在 pending 时解析「冷路径」里的类/字段
+#09 art::interpreter::FindFieldSlow
+#13 …app.EmbeddedBrowserScre…（解释器帧）
+#29 kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith
+#31 androidx.compose.ui.platform.AndroidUiDispatcher.performTrampolineDispatch
+```
+
+  即：**取消异常穿过会话的 suspend 状态机**，ART 解释器在「pending 异常 + 首次解析某个字段」
+  时触发断言 → abort。会话每次运行都是新进程里的**第一次**走取消路径，所以必现。
+  与 §31 记录的那条未修 SIGABRT（`String cannot be cast to Function0` 的 pending 异常）是同一处。
+
+### 修复（`EmbeddedBrowserScreen.kt`）
+
+1. **协作式停止**：`stopSession` 不再 `job.cancel()`，只 `session.token += 1`
+   （会话在下一轮 `onSessionActive()` 检查时自己退出，最多等一个 1.2s 轮询间隔）；
+   旧会话收尾期间不再写状态行（`reportStatus` 加 token 守卫）、不再上屏/登记结果
+   （结果出口加 token 检查 + 回收跨图贴片，避免每停一次漏一批位图）。
+2. **会话专用作用域** `sessionScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)`：
+   不再用 `rememberCoroutineScope()`（它在组合销毁时会取消协程 → 同样的崩溃路径）。
+   截图翻译 / 截图贴回也改用它（同样会碰 WebView）。
+3. **离开页面不再立刻 destroy WebView**：`onDispose` 先把 token 置停，等会话真正结束
+   （`job.invokeOnCompletion` → `mainHandler.post`）才 `webView.destroy()` + 取消会话作用域；
+   避免「会话还卡在 evaluateJavascript 里、WebView 已被销毁」的第二条崩溃路径。
+4. 悬浮球手势 lambda 的**陈旧状态**修复：`pointerInput(Unit)` 的 lambda 只在首次组合创建，
+   直接读 `running/reShowBusy/onPrimaryTap` 会永远停在第一次的值（实测：点「停止」时日志里
+   `running` 仍是 false）。改用 `rememberUpdatedState`；贴回中忽略点击时也补一条日志
+   （`ball_tap_ignored reason=reshow_busy`，以前是静默忽略）。
+5. 系统悬浮球链路（`CaptureForegroundService`）补诊断：`translateJob` 在跑时的点击以前**静默
+   return**，现在打 `floating_tap_busy overlay_active=…`（「点不动」排查时能区分「没收到点击」
+   与「收到了但被挡掉」）。
+
+### 验证
+
+- 模拟器（新包）：start → stop → start 连点 3 轮 **pid 不变、无 SIGABRT**；
+  会话运行中「离开网页」→ pid 不变、无崩溃；日志 `session_stop … cooperative=true`；
+  点球时 `ball_primary_tap running=true/false` 与真实状态一致（修复前恒为 false）。
+- 系统悬浮球（首页「启动服务」+ appops 放行录屏）：点球 → 翻译并覆写成功；译文层在时再点 →
+  `floating_tap_restore_original`；全程无崩溃。
+- 单测全模块 **537 通过 / 0 失败**；JS 验收 **210/210**。
+
+### 未做
+
+- 协作式停止让「停止」最多晚 ~1.2s 生效（球立刻变回可点、状态行立刻显示「已停止 · 译文保留」，
+  只是后台可能还在跑完手上这一张）。要更快只能在取消路径上做手术（风险高，见上）。
+- `CaptureForegroundService` 的 `translateJob?.cancel()`（onDestroy / resetActiveSession）保持原样：
+  语义上确实要中断，且本轮无法在设备上稳定复现那两条路径的崩溃；已补诊断，等下一份日志。
+
+## 37.「重复译文 / 纯色泡却用清理图 / 译文戳出气泡框」三连修（2026-10-13）
+
+### 用户报的三条（截图 + 文字）
+
+1. **「向下划后再次向上划的时候可能会出现重复的译文」**；
+2. **「这个截页处的气泡框是纯色背景，但是它用的是清理图。希望处理为 solid」**；
+3. **「ML Kit 的 OCR 识别有的时候文字会超出气泡框」**、**「paddle 的识别的清理图是在正常的位置，但是文字不会自适应缩小」**。
+
+### 修复
+
+1. **接缝抑制在场景重建后失效**（`mt-overlay-renderer.js`）：懒加载站点滚动时把 `<img>` 换成新
+   blob URL（内容不变）→ 会话按内容指纹复用场景重新下发 → `applyScene` 建新 root，被
+   `suppressBubble` 摘掉的那半块又跟着回来了；接缝带还活着 → 同一句台词画两遍。
+   修：`rebindSuppressedNodes` —— 同名 `data-mt-layer` 的抑制登记在重建时**换绑到新 root**
+   （`rebuilt.suppressed=N` 上进诊断），接缝层失效时仍能贴回新 root。
+   另修**贴回路径拿错「下一张」**（`EmbeddedBrowserScreen`）：重发接缝时用的是「扫描顺序的下一张」
+   而不是几何紧邻的那一张（扫描序不保证是文档序）→ `PendingSeam.nextSrc` 对不上 → 接缝层不重发、
+   被它顶掉的半块也不补摘 = **永久两半各画一份**。现在与正常翻译路径共用
+   `SeamNeighbourPolicy.successor`。
+2. **纯色气泡走清理图**（`bubble_region_stats detected=0` 的页面占多数 → 所有气泡 `bg_type=none`
+   → 盖板从 inpaint 清理图裁切 → 白气泡边上留灰痕）。修：**量出来的**平底色判据升级成 `solid`
+   （对齐参考项目 `bubble-colors.js` 的 adaptiveBackground），两条证据任一成立即可：
+   ① 外圈一致率 ≥ 0.92 且底色够亮（`BubbleBackgroundPolicy`）；
+   ② 容器内部量测（`BubbleInteriorScanner.Interior.isFlatBrightContainer`）—— 真机夹具实测
+   外圈只有 0.82（OCR 框比气泡宽，环的两端落在气泡外），靠内部一致率 0.99 升级成功。
+   日志 `solid_upgrade count=1 evidence=ring0.82/flat0.99`。
+3. **译文戳出气泡框**（排版框 = 字形框每侧扩 15%，而气泡轮廓不是矩形；ML Kit 的块级框还偏松）。
+   修：`BubbleInteriorScanner` 从字形框中心向外逐行量容器边界（跨笔画、撞轮廓即停），
+   按**原文字行数**分带取最窄可用宽度 → 排版框宽度上限（`ink_tilt` 的 `interior_cap=`）；
+   另外把逐行轮廓折成 `region_polygon` 下发给渲染层，**纯色盖板按轮廓裁剪** ——
+   否则椭圆/圆角泡收腰处会在轮廓外露出一块白肩（真机夹具实测 445px 框比轮廓宽 18px/侧）。
+   只在量到「不比字形框窄的容器」且底色亮、内部一致率 ≥ 0.92 时生效；斜排（四边形/倾角 > 2°）
+   跳过（逐行量的是水平弦）。装不下由渲染层按既有规则缩字号（用户规则：字号跟原文，装不下才缩）。
+
+### 验证
+
+- 单测：全模块 **537 通过 / 0 失败**（新增 `BubbleBackgroundPolicyTest` 7 条、
+  `BubbleInteriorScannerTest` 8 条）；JS 验收 **210/210**（新增 §16 场景重建后抑制仍生效 9 条）。
+- 模拟器（emulator-5556，debug 包）：
+  - 新夹具 `.verify/web/ellipse-bubble.html`（椭圆白气泡 + 灰云背景 + 4 行韩文；生成脚本
+    `scripts/make_ellipse_bubble_fixture.py`）。修前（旧包）：盖板是 inpaint 灰痕、译文左右戳出椭圆
+    （`.verify/70_before_shot.png`）；修后：`solid_upgrade … ring0.82/flat0.99`、
+    `interior_cap=401x347`、盖板纯白且按轮廓裁剪、译文在椭圆内（`.verify/74_after_shot.png`）。
+  - 新夹具 `.verify/web/seam-rotate.html`（接缝链 + 每 6 秒轮换 blob URL，复现「滚动重建」）：
+    30 秒内含 5 次轮换/重建，DOM 探针 202 次采样里同一句台词**最多只有一份**
+    （`{max:1, ids:["mt2:b0:text"]}`），日志每次都是 `content_reuse` + `seam_suppress … removed=2`。
+
+### 未做 / 下一轮
+
+1. `interior_cap` 目前只对轴对齐气泡生效（斜排走原口径）—— 斜排需要按基线方向量弦；
+2. 轮廓剖面取 18 行（`PROFILE_MAX_ROWS`），椭圆上仍能看到 1~2px 的台阶；要更贴可以插值；
+3. 真机复测项见 `HumanTODO.md`（7/8 页交界 + 上下滚动各一次）。
+
+## 36.blob 轮换打断移交链：按内容指纹换绑（2026-10-12 续二）
+
+### 用户复核抓到的残留（第 7/8 页 케이지泡四份乱文：韩文残影 +「要么」+「我回到连接门或只有两个！」+「门或有两件事！」）
+
+§35 收尾后用户真机复查，케이지泡仍乱。本轮 65_verify 日志钉死链条：
+
+1. 页 7 处理完、登记移交（`incomingCrossSrc=页7`）；
+2. **站点把页 7 `<img>` 换成新 blob URL** → 重扫，src 失配 →
+   `incoming_dropped reason=no_prev count=2` —— **把自己刚登记的移交清掉**；
+3. 页 7 换 URL 后走 content_reuse 复用场景（不重建移交）；
+4. 页 8 incoming=0 → 缝上残行（케이지下半「접속게이트로…」）不被抑制 → 自己翻出
+   坏译文「我回到连接门或只有两个！」叠在接缝带半句上，韩文残影同源。
+
+### 修复（`EmbeddedBrowserScreen.kt`）
+
+- 登记移交时记**来源图内容指纹**（`incomingCrossSrcFp = currentContentKey`）；
+- 消费点新增换绑分支：src 失配但 `incomingCrossSrcFp == 当前图指纹` = 同一张图换了
+  URL → **换绑 src 保留移交**（`incoming_rebind` 日志），本图不消费；content_reuse
+  命中路径同样生效（换绑判定在命中分支之前）。
+- 语义：移交跟随**内容**而非 URL——站点换 URL 不再打断接缝链。
+
+### 模拟器终验（`.verify/65_final.png`，同页对比 §35 的 64_final.png）
+
+- 케이지泡：四份乱文 → **一整句「[笼子!! 要退出连接，死亡或返回连接门或有两件事！」
+  居中无叠影**；日志 `seam_dispatch ok=true bubbles=1`（不再拆半句）、页 8
+  `incoming=1`、擦除贴片 `px=[181,0~511,172]` 落点正确。
+- 악질들泡：中文完整、韩文擦净（§35 修复保持）。
+
+### 遗留小瑕疵（下一轮打磨项）
+
+- 악질들盖板比译文矮一点（第一行顶部有轻微裁切痕）：incoming 的擦除/盖板框沿用
+  第 7 页条带里看到的（偏矮），可对 `contentRect` 做 growBubbleToTextHeight 同款
+  行数扩展。
+- 「지금 이 상황」泡译文超出白盖板（§35 已记录，渲染层缩字号判定口径）。
+
+### 36b.横向收窄试错与回退（2026-10-12 续三，用户裁决）
+
+曾尝试把排版框横向也收到字形框 ∓0.2 行高（想消「지금 이 상황」泡译文戳出白框）——
+**用户真机对比后判定负优化**：악질들泡译文第一行被上方接缝盖板裁掉一截。已回退
+（横向保持 15% 外扩），回退后同页验证：两泡各自一份完整译文，且右上角残留叠影
+（§36 指纹换绑修复的增益）也消失。教训：横向外扩「探出盖板落在气泡白底上」的
+原有取舍是对的——白盖板只盖字形框，文字探出落白底不可见；真正的问题（지금 이
+상황 泡戳出**气泡轮廓**）出在渲染层 z 序/轮廓判断，与外扩无关，需另查。
+
+## 35.接缝修复第二批：移交坐标系统一 + handed_tail 退役 + 吸收高度护栏（2026-10-12 续）
+
+### 用户真机逐步确认的三轮进展（gamesal 第 7/8 页交界，同一页反复验收）
+
+1. **악질들泡（下方泡）中文叠韩文** → 修①「handed_tail 不再移交」后**真机确认修好**
+   （用户截图：韩文擦净、中文完整）。
+2. **케이지泡「笼子!!死了全速」叠影** → 修②「sourceBoxPercent/polygon 拼接系→本图系换算」后
+   **真机确认修好**（用户截图：一份整句译文）。
+3. **악질들泡再次没翻译** → 修③「同行碎片吸收加高度护栏」后模拟器确认修好
+   （`.verify/64_final.png`：中文完整、韩文擦净）。
+
+### 三处根因（同一类：接缝状态在「拼接图坐标系」与「本图坐标系」之间串台）
+
+1. **handed_tail 退役**（`SeamBubbleMerger.kt` 规则 4）：整块落在下条带里的检出不再
+   「认领+移交」。移交框是拼接系百分比，下一张按「上一张本图高」解 → 整体错位一个
+   坐标系；而下一张自己必然完整看到它，交给下一张的 owned 链路坐标天然正确。
+   单测：`tailBlockInBottomBandIsDroppedForNextImage` 等 3 条改新语义。
+2. **移交框/轮廓统一成本图系**（`WebtoonImageTranslator.kt` crossOut 构造）：
+   `sourceBoxPercent` 与 `sourcePolygon` 的 y 从「÷拼接高」换成「减 topH ÷ source 高」，
+   与 contentRect/patchDest 同口径。修前 c0 落在下一张页面外 → 「已被移交」抑制判据
+   （isHandedOverByIncoming 用的是正确的 contentRect）与渲染几何失配 → 缝上残行被
+   下一张又认领又翻一遍（「笼子!!死了全速」叠影）。
+3. **吸收高度护栏**（`SeamIncomingGeometry.isSameLineFragment` 第 4 判据）：移交框是
+   「上一张条带里看到的下半段」，条带够深时它的框能罩住画面里**嵌在它下方的另一个
+   多行气泡**（악질들 118~239 被케이지移交框 0~288 吸走 → 不擦不翻不渲染）。
+   真切缝残片只有半行/一行 → 碎片高度 > 1.6 行直接拒绝。单测：
+   `multiLineBubbleNestedUnderTallHandoffIsNotAbsorbed`。
+
+### 其他改动
+
+- **「识别突然变慢」回归修复**（用户反馈）：等待下一张的分支此前只 `continue` 不 sleep，
+  一轮修复补了 `delay(1200)` 但让每张图最多白等 7.2s。现改为 700ms 步进 +
+  **滚动静止检测**（连续两轮 scrollY 不变 = 用户停住，懒加载不会再来新图，立即放弃）。
+  实测连续滚动场景等待 0.7~1.5s（原 7.2s）。
+- 新增 `ocr_blocks_all` 诊断日志（行块级全量坐标+文本，跨缝排查用）。
+
+### 本轮发现、留给下一轮的（日志 `.verify/64_verify.logcat`、截图 `.verify/64_final.png`）
+
+1. **Lezhin blob 轮换打断移交链**：处理途中站点把 `<img>` 换成新 blob URL（旧 blob
+   detach）→ 重扫后 `incoming_dropped reason=no_prev` 把**自己刚登记的移交**清掉 →
+   下一张 incoming=0 → 缝上残行被下一张自己翻出坏译文（「我回到连接门或只有两个！」）
+   叠在接缝带上。方向：移交/接缝带状态改按**内容指纹**绑定（blob 换新但指纹相同就
+   转移），或 incomingCrossSrc 失配时若「上一张指纹==当前处理图指纹」仍保留。
+2. **排版框超出白盖板**（用户报「这个文字也超出气泡框了」，지금 이 상황 泡）：渲染层
+   「装不下缩字号」的判定框 = 排版框（字形框横向扩 15%），气泡椭圆收腰处文字戳出白框。
+   方向：缩字号判定改用 coverBox（盖板框）或按轮廓收紧排版框。
+
+## 34.「处理接缝直到效果完全正确」：等待分支不 sleep 根因修复 + Lezhin 真站链路验证（2026-10-12）
+
+### 背景（用户目标 + 本轮证据）
+
+> 「/goal 处理接缝直到效果完全正确」「那个处理得很差的截页在第7页和第8页之间。但是不知道你计算的逻辑和网站的逻辑是否一致」「这个界面的接缝处理很正常，但是在漫画真实界面这个接缝的处理是不正常的。」
+
+§33 留下的「接缝跨缝判定从未触发」（`band_pair adjacent=true` 但 `slice_classify cross=0`），
+本轮用真站（Lezhin gamesal 第 1 话第 7/8 页交界，用户点名的页面）钉死根因并修复。
+
+### 根因（一句话）
+
+**会话循环的「等下一张图」分支只 `continue` 不 `delay`**：主循环只在完全空闲时才
+`delay(IDLE_POLL_INTERVAL_MS)`，还有 pending 图时会立刻重扫 —— 6 轮等待在 0.38s 内烧完
+（真机 trace：`band_pair` 20.094 → `band_prep` 20.477），而 Lezhin 懒加载下一张要 3~5s。
+结果处理当前图时下一张永远不在扫描列表 → `botH=0` → `hasBottomBand=false` → 规则 1/3a
+整个跳过 → 缝上气泡判 `owned` 本图渲染，下一张再 `orphan_adopted` 一遍 →
+「一大一小两份译文叠着」（케이지/악질들 页的形态）。
+
+### 修复（`EmbeddedBrowserScreen.kt`）
+
+等待分支补 `delay(IDLE_POLL_INTERVAL_MS)`（与注释「每轮 ~1.2s」对齐）。总等待窗
+6×1.2s=7.2s，覆盖真站 3~5s 的懒加载延迟。真机验证：等待期间下一张图进场
+（`band_pair` 第二次判定 `next_adjacent=true`），随后 `cross=1/2/3` 全部触发。
+
+### 真站验证（gamesal 1 话，ML Kit 引擎，日志 `.verify/60_clean1.logcat` / `60_lz_mlkit2.logcat`）
+
+- `slice_classify cross=3 → crossOut=2 seam=2`；句中截断重跑触发（`cut_allow=144→288`）；
+- `seam_dispatch own=mt2 next=mt3 ok=true bubbles=2 covers=2 texts=[케이지라고요!!…→[笼子!!…] ˌ [악질들한테…→即使你得到…]`
+  —— 用户点名的两个跨缝气泡整句移交；
+- 收到侧判据正确：`d2=suppressed`（被移交泡抑制）、`d5=dropped_top_handed`（上半已画过）；
+- **视觉**：케이지泡现在是一整句中文 + 一块盖板、跨缝连续（修复前上下两份一大一小）。
+
+### 本轮发现、留给下一轮的（日志 `.verify/60_lz_mlkit2.logcat`、截图 `.verify/60_final.png`）
+
+1. **악질들泡（7/8 页第二个泡）中文叠韩文**：CDP 导出第 8 页 `<img>` 原始像素证实
+   该泡**完整在第 8 页顶部 10%~20%，根本不跨缝**。但第 7 页重跑（288px 条带）把它
+   **误吸**进接缝移交（`erase_target idx=1` 文本=악질들整句、框却落在条带边缘），
+   第 8 页又因此抑制了自己的检出（`suppressed_incoming=1`）→ 两边都没人擦韩文，
+   移交来的中文叠在上面。需要收紧「条带检出吸收/移交」判据：检出框必须与条带边缘
+   真实相交（而不是文本被截断就吸收），或对移交泡做「第 8 页自检出复核」——
+   盲改判据风险高，按排障规则留待下一轮带日志闭环。
+2. **第 8 页 OCR 把上一张的中文译文读成检出**（`erase_target idx=6/7` 文本是中文）：
+   时序污染——第 7 页 seam_dispatch 渲染后、第 8 页马上裁它的条带/扫它，把渲染层
+   产物当原文。缓解方向：扫描前清掉接缝带层，或对检出文本做「目标语言过滤」。
+3. **翻译 API 失效（独立问题）**：`translate_response failed=OpenAI-compatible API
+   error: Access denied`（阿里云 qwen key 拒绝）→ 无译文 → `cross_out_probe i0:untranslated`
+   移交被丢。本轮验证期间临时切 ML Kit 本地引擎绕过；**云端 key 需要用户续费/更换**
+   （见 HumanTODO）。
+
+## 33.「你能自己干吗」：模拟器自驱动复现 + 两处几何根因修复（2026-10-12）
+
+### 背景（用户原话 + 截图）
+
+> 「超级有问题的啊。你能自己干吗？我抓了一下，发现有好多。不知道哪个是你需要的。」
+> 截图：译文行超出白色盖板下沿；另有 巨大「方法」/「[설정]」一字一行 形态。
+
+用户抓日志有困难 → 本轮把复现/取证链路全部自动化，**不再需要用户抓日志**：
+1. debug 包开 `WebView.setWebContentsDebuggingEnabled`（`EmbeddedBrowserScreen`，仅 DEBUG）；
+2. 新工具 `scripts/cdp-eval.mjs`（adb forward + CDP Runtime.evaluate，Node 22 原生 WebSocket）
+   —— 直接读 `MtOverlay._overlays`/DOM 的真实几何（排版框 vs 盖板 vs 实际字号）。
+   ⚠️ 模拟器上可能同时有多个应用进程（force-stop 后旧 socket 名仍在），CDP 必须连
+   `pidof` 当前进程，否则读到的是僵尸 WebView 的旧场景（本轮实测踩坑）。
+3. 驱动路径：`am start` → tap 浏览器 tab(413,2254) → 历史第一条(524,1216) → 翻译(702,2258)
+   → swipe 翻页；截图用 `adb exec-out screencap`（⚠️ 息屏后 screencap 返回**旧帧**，
+   状态栏时钟不动就是信号 —— 先 `KEYCODE_WAKEUP`，必要时 HOME+重启 Activity 强制重绘）。
+
+### 根因与修复（都在 `WebtoonImageTranslator.kt`，真机日志 + CDP 实证）
+
+1. **`growBubbleToTextHeight` 折行估算把框撑爆**（用户两轮截图的共同根源）：
+   单行小字气泡（OCR 框 316×25、全页中位行高 36）被「每行可容纳字数」折成 2 行
+   → 框撑到 108px 高 → 扩出来的区域撞上气泡描边、墨迹精修把描边当墨迹收不回
+   → `lineH=108.3` → `font_height_percent=4.51%`（真值 1.04%，CDP 实测）
+   → 译文渲染大 4 倍、盖板伸出气泡外。
+   修：撤掉折行估算（原文行宽 ≤ OCR 框宽是 OCR 的量测结果，该兜底只误伤），
+   只按**硬行数**向下扩；判据抽成纯函数 `growBubbleBottomPx`（`BubbleBoxGrowerTest`
+   6 条单测钉住两代真机现场）。修后同一气泡 `lineH=29.0 / mask=345x29`（trace 16744282）。
+2. **排版框垂直外扩让译文探出盖板**：排版框=字形框每侧扩 15%，DOM 译文在框内**垂直居中**，
+   盖板只盖字形+几px → 译文末行坐在没擦过的画面上（用户截图「超出白盖板下沿」）。
+   修：排版框垂直收到 字形框 ∓ 0.2×行高（descender 级余量），横向保持 15%（帮字号拟合）。
+   译文装不下由渲染层缩字号（8px 下限 + 撑开兜底，§32）。
+
+### 验证
+
+- `:app:testDebugUnitTest` 全绿（含 `BubbleBoxGrowerTest` 6 条）；渲染层验收 **201/201**。
+- 模拟器端到端（gamesal 第 1 话）：笼子页**每个气泡只有一份译文、字号贴原字、不溢出**
+  （修复前同页是一堆互相叠压、大小失控的文字）；`origH_pct` 全部回到 1.0~2.4 区间。
+
+### 本轮发现、留给下一轮的（日志已存 `.verify/55/59_current.logcat`）
+
+- **接缝跨缝判定从未触发**：`band_pair` 全部 `adjacent=true gap=0`，但 `slice_classify`
+  每张 `cross=0` → 跨缝气泡两侧各渲染一份（笼子页「笼子!!死了两份」、방법 页「方法×2」，
+  一大一小上下叠着）。需要查 `edge_window`/配对判据为什么在明显跨缝的气泡上不触发。
+- **[설정] 气泡一字一行**：同 bubble 的另一切片副本呈竖排堆叠（本图副本正常 3 行 34.1px）——
+  疑似另一副本的 vertical 误判（框 h/w≈1.2 越过 0.82 阈值？）待查 `layout_reason`。
+- **flat 盖板取色偏色**：精细擦字=关 时 `flat_cover` 在深色画面上取到浅灰褐（[설정] 页）、
+  白色盖板盖过气泡外的蓝条纹背景（等我。页）——取色环/裁剪轮廓口径待查。
+
+## 32.译文字号自适应收口：装不下先缩字号，缩到 8px 下限才允许撑开（2026-10-12）
+
+### 背景（用户原话 + 截图）
+
+> 「字号大小和气泡框位置有问题。一般情况下，字号要保持和原图一致，但是如果翻译的字很多，
+> 原文的文字位置大小装不下就要进行自适应的缩减大小。」
+
+截图（Lezhin「笼子」那页）里除字号外还有「同一句话两份不同译文叠压」「气泡中部一块黑色矩形」
+两个症状。可落地定因的部分（字号规则）本轮修掉；叠压的几何成因需要一份带新诊断日志的
+logcat 才能钉死（见 HumanTODO 2026-10-12）——盲改几何没有检错闭环，违反排障规则。
+
+### 改动（`app/src/main/assets/mt-overlay-renderer.js`）
+
+1. **缩字号优先**：新增 `FONT_ABS_MIN = 8`（与画布渲染 `BubbleImageRenderer.MIN_FONT_SIZE_PX`
+   同档）。二分拟合下限从 10px 降到 8px——译文装不下原文位置时，先一路缩字号装进去。
+2. **撑开降级为极端兜底**：此前 10px 仍装不下就把节点撑出气泡框（`expandForTextOverflow`），
+   译文叠到邻近气泡/面板上（用户截图里溢出的那几行就是它）。现在只有缩到 8px 仍装不下才
+   撑开，且必须打 `MTFONT expand` 诊断（哪个气泡、框多大、字实际需要多大、最终几号、译文
+   前 24 字）。接缝/跨图的 `fixed_font_percent` 分支同步收紧。
+3. **排版框重叠诊断**（只记日志，不改行为）：普通场景/接缝场景构建时，同一 root 内两个
+   文字节点的排版框交叠超过较小框面积一半 → `MTGEOM overlap`。下一份 logcat 用它区分
+   「宿主分组下发的框本身重叠」还是「渲染层自己画重」。
+4. 夹具 `.verify/font-shrink-check.html`：A（装得下=原字号）/ B（译文约 ×2 → 缩字号装进
+   原框，实测 22.9px、不撑开）/ C（框小译文巨长 → 8.6px 贴地拟合、不撑开）三场景真浏览器
+   验证。夹具第一版把气泡画成与文本框等大的椭圆，椭圆收腰处必然「文字戳出轮廓」
+   （用户当场指出）——已改成「轮廓 > 排版框」的真实几何关系。
+
+### 验证
+
+- `node app/src/test/js/mt-overlay-acceptance.test.js` **197/197**（新增 §7.1 缩字号优先
+  不撑开 + MTFONT 诊断断言、§7.2 MTGEOM 重叠诊断断言；§7 原有「强制溢出」分支改为钉
+  8px 绝对下限）。
+- 测试顺带抓出一个诊断函数自身的 bug：不相交的框 `ix`/`iy` 同时为负、负负相得报出
+  `ratio=1.88` 的假重叠——已修（逐项 clamp ≥0 再乘）。
+- `./gradlew :app:installDebug` 已装 emulator-5554；真机复测项见 HumanTODO 2026-10-12。
+
+## 31.接缝收到侧「相邻行并回」：缝落在行与行之间时，同一气泡不再拆成两块各翻各的（2026-10-11）
+
+### 背景（用户原话）
+
+> 「接缝的效果需要好一点……总之就是一行文字被上下两页分开的情况，导致无法识别正确。
+> 我想要它被正常识别和合并。然后不出现多余的残影。」
+
+这条反馈对应 §30 明确留下的「第二轮未做 #1」：收到侧吸收窗口因此收紧到 `0.3 × 行高`
+（只吸收「同一行的另一半」），**「同一气泡的相邻行」不吸收** —— 因为并进来会丢那行的译文。
+本轮把这条支路补齐了（对齐参考项目 `seam-surface-utils.js:buildSeamExtendedBubbles` 的做法）。
+
+### 改动
+
+1. **判据**（`SeamIncomingGeometry.isAdjacentLineFragment`，纯逻辑可单测）：对齐参考项目
+   `seam-residuals.js:isSeamAdjacentBubbleLine`（纵向窗口 `[-0.4, +0.55] × 行高`、横向重叠
+   ≥0.5、与移交框重叠 < 较小框面积 0.35），两处刻意偏离：
+   - 窗口单位用**行高**（参考用 minHeight——它的输入是逐行检测，我们是段落级框）；
+   - **多两道守卫**：高度 ≤1.6 行（多行块 = 另一段）+ 面积 ≤2.5× 移交框（参考项目有
+     `translationRole` 可核对身份，我们没有，误吸收整句串味的代价比漏吸收高）。
+2. **吸收重构**（`absorbSameLineFragments` → `absorbIncomingFragments`）：同行碎片走原路
+   （扩擦除框、摘掉本图块、文字丢弃——移交译文已覆盖整行）；相邻行额外返回**带原文**的
+   明细（`AbsorbedFragment`），并从本图场景摘掉。
+3. **译文并回**（`translateStitched`）：被吸收行的原文按纵向位置排序（`mergeAdjacentLineText`，
+   移交框顶边可为负），并进移交气泡的原文 → 追加到本次翻译请求尾部（`resolveTranslations`
+   按入参顺序 1:1 返回，结果按下标切回）→ 整句重翻一次 → 回填移交气泡
+   （`translatedText` + `contentRect`/`sourceBoxPercent` 扩到「移交框 ∪ 被吸收行」并集，
+   y% 口径 = 100 = 上一张图底边）。字号刻意不动：接缝两侧必须同字号，多出的行由并集框
+   装下，万一溢出落点也是被清理图擦过的背景。
+4. **擦除扩框**（`crossPrepareBubbles` 新参 `adjacentFragmentBoxes`）：相邻行用**普通并集**，
+   不参与同行碎片的固定点链式扩框 —— 链式并掉一行后框下移、下一行又变得「相邻」，整段会被
+   逐行吞进擦除框而这些行没并进翻译请求 → 擦掉却没人翻。扩框集合与并回集合必须严格同集。
+5. **接缝带互斥门**（`translateImage.allowIncomingMerge`，会话侧传值）：有接缝带瞄准本图时
+   **不并回**。接缝带的译文是上一张图按截断文本翻的、在缝上下连成一句（一块盖板 + 一份译文）；
+   并回的整句重翻会被带派发摘掉（`seam_suppress` 移除 c 层）→ 并回的译文丢失。带在时保持
+   旧行为，带不在（整图模式 / 移交失败 / 章节首尾）时才并回。
+6. 诊断：`incoming_absorbed` 增 `same_line=/adjacent=` 计数；新增 `incoming_merge_request`
+   （并回的合并原文）与 `incoming_merge`（回填了几个移交框、译文预览）。
+
+### 验证
+
+- 单测**全模块通过 0 失败**。新增 `SeamIncomingGeometryTest` 9 条：下一行/上一行/几像素重叠
+  → 吸收；隔行 75px / 同行叠框 / 多行块 / 横向错位 → 拒收；合并文本按纵向排序、无碎片时保留
+  移交原文。
+- **真机待确认**（见 HumanTODO 2026-10-11）：需要用户用真实分片站验证「缝落在行间」的气泡
+  是否已成一块盖板 + 一份完整译文。
+
+### 第二轮（2026-10-11 真机复测 [Lezhin]：第一轮没解决，三张截图 + 全套日志定位）
+
+- 现场三症状：①第二张图上缝下的原文**整段还留着**（「下面那个是完整的文字，没有完全合并」）；
+  ②移交译文挤成一个小白框；③回滚到该页**又翻了一遍**，接缝带的大字译文 + 残字叠在第一层上面。
+- 日志（trace `[588150]`，13:09）逐条对上：
+  1. `incoming_decision kept=2 skipped=1 detail=i0:[접속종료를 접속]~[케이지라고요.!] sim=0.67`
+     —— 移交气泡被冲突判定**误杀**：本图把「条带里的第 1 行 + 缝下第 2 行」读成一个框，
+     它与移交原文只有部分字符重合（移交框只装了下半句），0.67 差 0.03 到 0.7 阈值。
+     而本图 OCR **根本没检出**第 3、4 行（`detected_texts` 里没有 `접속게이트로/두 가지`）——
+     移交是那些行的**唯一持有者**，丢掉 = 必然留原文（症状①）。
+  2. 上一张的跨缝框被 OCR 截在条带深度内（`…돌아가거나⏎두 가`，下一行只进了两个字），
+     框底距拼接图底边 54px —— **没顶到底边**，旧的 `seam_strip_short` 触发条件（框触底）
+     不成立 → 没有加高条带重跑 → 移交永远只有半句（症状①②的源头）。
+  3. `13:09:01 Fatal signal 6 (SIGABRT)`：会话取消路径上 `java.lang.String cannot be cast to
+     Function0`（且挂起的 `JobCancellationException` 还在）→ ART abort → 进程死亡（`fg TOP`）
+     → 内存态（renderedScenes/seamBySrc）全丢 → 回滚 = 全部重翻（症状③的「又翻一遍」）。
+     新进程里接缝带照常派发（`seam_dispatch ok=true bubbles=3`），叠层是**带内渲染质量**问题
+     （大字 + `1드하데 거리기라→1드하데 거리기라` 乱码原样上屏）+ 被误杀移交导致的孤儿气泡
+     双份文本。
+- 本轮改动：
+  1. **同句重读豁免**（`filterContestedIncoming` + 新增 `isSameBubbleReRead`）：本图检出
+     **①伸进上条带（top<0）②横向与移交框同列（±15%）③缝下部分被移交框覆盖 ≥90%** 时，
+     它就是「同一句被条带+本图上下两半合并后的重读」，不能据此丢移交。
+     反例守卫：`[32317270]` 的本图检出横向伸出移交框 104px（>15%）→ 不豁免，照旧丢弃。
+  2. **句中截断触发重跑**（新增 `seam_strip_sentence_cut` 日志 + `stripTruncated`）：跨缝气泡
+     框底距拼接图底边不足 2 行 + 句尾没有句末标点（`SeamTuning.endsSentence`）→ 走现成的
+     `seam_strip_retry`（条带 144→288px）让上一张看到完整下半句。误报代价=一次重跑，
+     漏报代价=缝下留原文。
+  3. 行高计算提前（`medianLineHeight` 在收到侧交叉判定之前），供豁免判据与句中截断使用。
+- 验证：全模块单测 0 失败；APK 已重装模拟器（21:1x），**等用户滚动复测**。
+- 崩溃（SIGABRT）**本轮未修**：栈顶只有 `runTranslationSession` 的解释器帧，无 Java 行号，
+  盲修风险大；已把 abort message 与栈定位记入 HumanTODO，下轮带复现步骤（滚动回滚触发取消）
+  加最小日志抓 Java 栈。
+
+### 第三轮（2026-10-11 真机复测二：重跑链路全通，暴露「框比文本矮」）
+
+- 复测结果：`seam_strip_sentence_cut` ✓ 触发、`seam_strip_retry band=288px` ✓、乱码移交被跳过
+  （`cross_out_probe i5:untranslated`）✓、重跑后 OCR 完整读出两个气泡（`케이지라고요!!⏎접속종료를
+  하려면 죽거나⏎접속게이트로 돌아가거나⏎두 가지 밖에 없는데.!`、`악질들한테…고통받을수도
+  있습니다.!`）→ 上气泡完整翻译（用户截图确认）。
+- **新暴露的根因：OCR 框比它装的文本矮一半**（`erase_target idx=0 box=60x6` 装 4 行台词 →
+  框高只够 2 行）→ 擦除/清理图只擦上半，下半原文留在画面（用户「清理图没了、原文露着」）；
+  移交框/接缝带同样缺一截。**修法**：`growBubbleToTextHeight` —— 按原文硬换行 + 宽度折行估行数
+  （CJK 字宽 0.72×行高、行距 1.2×行高）把框向下扩，邻居框（横向重叠 ≥30%、起点在下方）夹住
+  框底，扩过头由墨迹精修收回。现场数字：4 行台词框 360×161 → 扩到 2570 被邻居夹到 2520
+  = 真实底边。
+- **另发现（未修）：阅读器回收 `<img>` 触发重扫重翻**——Lezhin 把已翻好的 `<img>` 换成新 blob
+  URL（`MTSEAM restore seam=mt1|mt2 reason=target_detached` → 重扫得 mt4 → 同一内容重翻一遍、
+  第二条接缝带（mt4|mt2）重新派发）。上一条接缝带的两半被贴回再摘除，期间用户会看到
+  「贴回的译文浮在原文上」的中间态。要根治需要「同内容 blob 去重」（src 变了但像素相同
+  则复用 mt1 的场景），见 HumanTODO。
+
+### 第四轮（2026-10-11 真机复测三：接缝主链路已通，修「灰补丁」与同内容重翻）
+
+- 复测确认：重跑链路稳定生效（`seam_strip_sentence_cut` → `seam_strip_retry band=288px` →
+  两个气泡完整识别 → 气泡 1 完整译文上屏）。剩余问题两个：
+  1. **白气泡上出现灰补丁/灰晕**：`cleanedForAllBubbles`（浏览器「inpaint 清理图」选项）把
+     solid 气泡也交给整页 inpaint —— dense 文本退化成整块矩形擦除（paintInkMask 的
+     DENSE_INK 回退），矩形角落伸进气泡锯齿轮廓外时把灰天空吸进来（用户原话：
+     「背景是纯色的就不要用清理图了，直接用纯色就行」）。
+     **修法**：①`CleanedImageProcessor.build()` 里 solid 气泡不再进 inpaint mask，
+     改为 `applySolidFill` 直填——与 paintInkMask 同一条 RGB 距离判据把墨迹像素填成
+     背景色（1px 膨胀吃抗锯齿带），没有重采样就没有色晕；②`BubbleColorExtractor.
+     sampleBackgroundMedian` 改**主导色桶**（4bit/通道量化取众数再求均值）——原逐通道
+     中位数在「框比锯齿轮廓大、底环采到灰天空」时取到白×灰混合色 → 盖板发灰。
+  2. **同内容重翻（用户：「那个坑需要继续修」）**：Lezhin 把已翻好的 `<img>` 换成新 blob
+     URL 重建元素 → 重扫重翻 → 译文闪没了、接缝带换绑（mt1|mt2 → mt4|mt2）。
+     **修法**：会话内同内容去重——`contentFingerprint`（16 列网格 MD5，宽高参与）→
+     `scenesByContent` 缓存命中直接复用已渲染场景 + 接缝带（`content_reuse` 日志），
+     不重跑 OCR/翻译/擦除；场景几何全是百分比坐标，换 image id 照样成立；移交不重建
+     （下一张早拿着第一次的移交翻好了）。上限 12 条 LRU。
+- 验证：全模块单测 0 失败（492 条）；APK 已重装模拟器。**真机待确认**：灰补丁是否消失、
+  同内容是否还会整页重翻（看 `content_reuse` 日志）。
+
+### 未做 / 下一步（更新）
+
+1. 接缝带在时相邻行保持旧行为（独立小块）：要彻底统一需要「并回否决」——接缝带派发后检测到
+   并回时整带撤销（`dropSeam(key)` + 两半贴回），代价是接缝生命周期手术，风险高，等真机
+   先确认并回路径的效果再决定做不做；
+2. `seam_boxes`/`slice_classify` 日志已够定位吸收误判；若真机出现「整句串味」，用
+   `incoming_merge_request` 的合并原文对照上一张的移交原文即可定位是吸收误判还是翻译问题；
+3. §30 遗留各项（Lezhin 实机复测、条带高度自适应、条带/本图分开 OCR）不变。
+
 ## 30.跨切片续排的配对校验：别处的条带/移交糊到本图 + 本图文字被当「已翻过」丢掉（2026-10-03 深夜）
 
 ### 第二轮：用户报「现在变成这样了」（接缝处露字 + 乱码残留 + `page_gap`）
