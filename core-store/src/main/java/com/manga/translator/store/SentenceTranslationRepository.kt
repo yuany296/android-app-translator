@@ -18,6 +18,17 @@ data class SentenceTranslation(
 
 enum class SentenceCacheMatchKind { EXACT, COMPACT, FUZZY }
 
+/**
+ * 句子缓存的坐标（2026-10-15）。
+ *
+ * 在翻译历史里发现某句译错了时，拿它把对应的一条缓存作废，下次遇到这句会重新翻译。
+ */
+data class SentenceCacheKey(
+    val sourceLanguage: String,
+    val targetLanguage: String,
+    val originalText: String
+)
+
 data class SentenceCacheLookup(
     val translatedText: String?,
     val matchKind: SentenceCacheMatchKind?
@@ -152,6 +163,37 @@ class SentenceTranslationRepository(context: Context) {
             compactDirty = true
             file.delete()
         }
+    }
+
+    /**
+     * 作废若干条缓存（2026-10-15，翻译历史页的「作废」入口用）；返回实际删掉的条数。
+     *
+     * 只删不写：删掉后这句变成缓存未命中，下次遇到会重新调翻译引擎并写回新结果。
+     * 批量一次落盘，避免一页几十句时反复重写整个 JSON。
+     */
+    fun remove(keys: Collection<SentenceCacheKey>): Int {
+        if (keys.isEmpty()) return 0
+        synchronized(lock) {
+            ensureLoaded()
+            var removed = 0
+            keys.forEach { key ->
+                val normalized = normalize(key.originalText)
+                if (normalized.isEmpty()) return@forEach
+                if (index.remove(keyOf(key.sourceLanguage, key.targetLanguage, normalized)) != null) {
+                    removed += 1
+                }
+            }
+            if (removed > 0) {
+                compactDirty = true
+                persist()
+            }
+            return removed
+        }
+    }
+
+    /** 单条作废的便捷入口；返回是否删到了（false = 本来就不在缓存里）。 */
+    fun remove(sourceLanguage: String, targetLanguage: String, originalText: String): Boolean {
+        return remove(listOf(SentenceCacheKey(sourceLanguage, targetLanguage, originalText))) > 0
     }
 
     private fun ensureLoaded() {

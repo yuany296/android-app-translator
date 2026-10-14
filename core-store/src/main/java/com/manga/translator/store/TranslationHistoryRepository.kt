@@ -15,6 +15,48 @@ data class TranslationHistoryEntry(
     val bubblesJson: String
 )
 
+/** 历史里的一条气泡（只读展示用；2026-10-15 起支持手动修正译文）。 */
+data class HistoryBubble(
+    val originalText: String,
+    val translatedText: String,
+    val edited: Boolean = false
+)
+
+/**
+ * 历史条目里某一句话的坐标：拿它去动句子缓存。
+ *
+ * 历史只是快照，改它**不影响**翻译复用；真正决定「下次遇到这句用什么译文」的是
+ * `SentenceTranslationRepository`，所以改 / 作废时都要带上这组坐标。
+ */
+data class HistoryBubbleRef(
+    val sourceLanguage: String,
+    val targetLanguage: String,
+    val originalText: String
+)
+
+/**
+ * 解析历史条目里的气泡列表（只读）。
+ *
+ * `bubblesJson` 里除原文 / 译文外还有坐标等渲染字段，这里只取展示需要的三项；
+ * 改写要走 [TranslationHistoryRepository.updateBubbleTranslation]，它会保留其余字段。
+ */
+fun parseHistoryBubbles(bubblesJson: String): List<HistoryBubble> {
+    if (bubblesJson.isBlank()) return emptyList()
+    return runCatching {
+        val arr = JSONObject(bubblesJson).optJSONArray("bubbles") ?: JSONArray()
+        val list = mutableListOf<HistoryBubble>()
+        for (index in 0 until arr.length()) {
+            val item = arr.optJSONObject(index) ?: continue
+            list += HistoryBubble(
+                originalText = item.optString("originalText", ""),
+                translatedText = item.optString("translatedText", ""),
+                edited = item.optBoolean("edited", false)
+            )
+        }
+        list
+    }.getOrElse { emptyList() }
+}
+
 class TranslationHistoryRepository(context: Context) {
     private val file = File(context.filesDir, FILE_NAME)
     private val lock = Any()
@@ -66,6 +108,57 @@ class TranslationHistoryRepository(context: Context) {
     fun clear() {
         synchronized(lock) {
             write(emptyList())
+        }
+    }
+
+    /**
+     * 取某条历史里第 [index] 个气泡的坐标（不改动任何数据）。
+     *
+     * 用于「作废这句缓存」：先拿到源 / 目标语言与原文，再去句子缓存里删。
+     */
+    fun bubbleRefAt(id: String, index: Int): HistoryBubbleRef? {
+        synchronized(lock) {
+            val entry = loadAll().firstOrNull { it.id == id } ?: return null
+            val bubbles = parseHistoryBubbles(entry.bubblesJson)
+            if (index !in bubbles.indices) return null
+            return HistoryBubbleRef(entry.sourceLanguage, entry.targetLanguage, bubbles[index].originalText)
+        }
+    }
+
+    /**
+     * 取某条历史里全部气泡的坐标（用于「作废本页缓存」）。
+     *
+     * 返回 null 表示记录已不存在；返回空列表表示这条记录里没有可作废的气泡。
+     */
+    fun pageBubbleRefs(id: String): List<HistoryBubbleRef>? {
+        synchronized(lock) {
+            val entry = loadAll().firstOrNull { it.id == id } ?: return null
+            return parseHistoryBubbles(entry.bubblesJson).map {
+                HistoryBubbleRef(entry.sourceLanguage, entry.targetLanguage, it.originalText)
+            }
+        }
+    }
+
+    /**
+     * 改写某条历史里第 [index] 个气泡的译文，并标记该气泡「已修正」（2026-10-15 用户要求）。
+     *
+     * 只动 `translatedText` 与 `edited` 两个字段，坐标等渲染字段原样保留 ——
+     * 若整体重新序列化 bubble，会把 `x/y/w/h/bgType` 一起丢掉。
+     *
+     * 注意：历史是快照，改它**不会影响翻译复用**；调用方必须同时把新译文写进句子缓存
+     * （`SentenceTranslationRepository.put`），否则下次命中缓存仍是旧译文。
+     *
+     * @return 被改气泡的坐标（拿它去同步缓存）；记录不存在 / 索引越界时为 null。
+     */
+    fun updateBubbleTranslation(id: String, index: Int, translatedText: String): HistoryBubbleRef? {
+        synchronized(lock) {
+            val entries = loadAll()
+            val target = entries.firstOrNull { it.id == id } ?: return null
+            val rewritten = rewriteBubble(target.bubblesJson, index, translatedText) ?: return null
+            val ( rewrittenJson, originalText ) = rewritten
+            val updated = target.copy(bubblesJson = rewrittenJson)
+            write(entries.map { if (it.id == id) updated else it })
+            return HistoryBubbleRef(target.sourceLanguage, target.targetLanguage, originalText)
         }
     }
 
@@ -136,6 +229,28 @@ class TranslationHistoryRepository(context: Context) {
         ): List<TranslationHistoryEntry> {
             if (entries.size <= max) return entries
             return entries.sortedByDescending { it.timestampMs }.take(max)
+        }
+
+        /**
+         * 改写 `bubblesJson` 里第 [index] 个气泡的译文（2026-10-15 手动修正）。
+         *
+         * 只动 `translatedText` 与 `edited`，`x/y/w/h/bgType/layout` 等渲染字段原样保留 ——
+         * 整体重新序列化会把坐标一起丢掉。
+         *
+         * @return 新 JSON 与这句的原文；JSON 损坏或索引越界时为 null。
+         */
+        internal fun rewriteBubble(
+            bubblesJson: String,
+            index: Int,
+            translatedText: String
+        ): Pair<String, String>? {
+            val root = runCatching { JSONObject(bubblesJson) }.getOrNull() ?: return null
+            val bubbles = root.optJSONArray("bubbles") ?: return null
+            val bubble = bubbles.optJSONObject(index) ?: return null
+            val originalText = bubble.optString("originalText", "")
+            bubble.put("translatedText", translatedText)
+            bubble.put("edited", true)
+            return root.toString() to originalText
         }
     }
 }
