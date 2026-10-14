@@ -18,7 +18,27 @@ defaultConfig {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // 本机默认带两个架构（x86_64 是给模拟器调试用的）；
+            // 云端发布时用 -PtargetAbis=arm64-v8a 只打真机架构，安装包能小一半。
+            val targetAbis = (project.findProperty("targetAbis") as String?)
+                ?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+                ?: listOf("arm64-v8a", "x86_64")
+            abiFilters += targetAbis
+        }
+    }
+
+    // 发布用的固定签名。密钥文件在仓库 `ci/release.keystore`，刻意公开：
+    // 它只用来保证「每次发布的安装包签名一致」，否则手机没法覆盖安装升级。
+    // 不用于应用商店上架。密钥密码可由环境变量覆盖（CI 里也能换）。
+    val releaseKeystore = rootProject.file("ci/release.keystore")
+    if (releaseKeystore.exists()) {
+        signingConfigs {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "mangatranslator"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "manga"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "mangatranslator"
+            }
         }
     }
 
@@ -29,6 +49,9 @@ defaultConfig {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (releaseKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
