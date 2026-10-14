@@ -17,6 +17,14 @@ data class AppSettings( // data class：编译器自动生成 equals / hashCode 
     val translateBaseUrl: String = "",                               // 云端 API 的 Base URL，空则用厂商默认值
     val translateModel: String = "gpt-4o-mini",                      // 云端模型名
     val translateApiKey: String = "",                                // 云端 API Key
+    /**
+     * 多模态识别（视觉 OCR）专用模型名（2026-10-14 用户要求与翻译模型分开选）。
+     *
+     * 与翻译**共用同一个配置档案**（厂商 / Base URL / API Key 同源），只有模型名单独一档：
+     * 空串 = 跟随 [translateModel]；填了别的名字（如视觉模型）则 OCR 低质量回退多模态时用它。
+     * 随档案保存与切换。
+     */
+    val visionModel: String = "",                                    // 多模态识别模型，空 = 跟随翻译模型
 
     // ---- 行为开关 ----
     val enabled: Boolean = true,                                     // 翻译总开关，逻辑活的但无 UI 能改，正常恒为 true

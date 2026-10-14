@@ -33,7 +33,9 @@ enum class AiProvider(
         label = "DeepSeek",
         defaultBaseUrl = "https://api.deepseek.com/v1",
         defaultModel = "",
-        supportsThinking = false
+        // 2026-10-12 放开：官方端点默认开思考，字段是 `thinking:{"type":"enabled"/"disabled"}`
+        // （不是千问的 enable_thinking，字段方言见 ThinkingSupport）。
+        supportsThinking = true
     ),
     KIMI(
         id = "kimi",

@@ -1,6 +1,8 @@
 package com.manga.translator.translate
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -62,11 +64,13 @@ class PaddleOcrBlockMergerTest {
 
     @Test
     fun mergedGroupDropsPolygonToAvoidWrongTilt() {
-        // 多框合并出来的段落一定是轴对齐的，硬带其中一个框的倾角会让遮罩歪掉。
-        val quad = listOf(QuadPoint(0f, 0f), QuadPoint(100f, 10f), QuadPoint(100f, 60f), QuadPoint(0f, 50f))
+        // 多框合并出来的段落只在**倾角一致**时才保留四边形（2026-10-14）；只要有一框角度不同，
+        // 硬带其中一个框的倾角就会让遮罩歪掉 —— 这种情况必须丢掉四边形。
+        val tilted = listOf(QuadPoint(0f, 0f), QuadPoint(100f, 10f), QuadPoint(100f, 60f), QuadPoint(0f, 50f))
+        val flat = listOf(QuadPoint(0f, 80f), QuadPoint(100f, 80f), QuadPoint(100f, 140f), QuadPoint(0f, 140f))
         val blocks = listOf(
-            tb(0, " first ", 0f, 0f, 100f, 60f).copy(polygon = quad),
-            tb(1, " second ", 0f, 80f, 100f, 140f).copy(polygon = quad)
+            tb(0, " first ", 0f, 0f, 100f, 60f).copy(polygon = tilted),
+            tb(1, " second ", 0f, 80f, 100f, 140f).copy(polygon = flat)
         )
         val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 2400)
         assertEquals(1, merged.size)
@@ -82,6 +86,40 @@ class PaddleOcrBlockMergerTest {
             right = right,
             bottom = bottom,
             confidence = 0.9f
+        )
+    }
+
+    /** 带倾角四边形的块：框仍是轴对齐（分组用），四边形按 [angleDeg] 绕框心旋转。 */
+    private fun tbQuad(
+        id: Int,
+        text: String,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        angleDeg: Float
+    ): TextBlock {
+        val centerX = (left + right) / 2f
+        val centerY = (top + bottom) / 2f
+        val radians = Math.toRadians(angleDeg.toDouble())
+        val cos = kotlin.math.cos(radians).toFloat()
+        val sin = kotlin.math.sin(radians).toFloat()
+        fun rotated(x: Float, y: Float): QuadPoint {
+            val dx = x - centerX
+            val dy = y - centerY
+            return QuadPoint(centerX + dx * cos - dy * sin, centerY + dx * sin + dy * cos)
+        }
+        return TextBlock(
+            id = id,
+            text = text,
+            left = left,
+            top = top,
+            right = right,
+            bottom = bottom,
+            confidence = 0.9f,
+            polygon = listOf(
+                rotated(left, top), rotated(right, top), rotated(right, bottom), rotated(left, bottom)
+            )
         )
     }
 
@@ -181,5 +219,59 @@ class PaddleOcrBlockMergerTest {
         // 行高若真是 40，比值 0.44 < 0.65 → 不会合并。
         assertEquals(1, merged[0].lineCount)
         assertEquals(90f, TextLineGeometry.lineHeightPx(merged[0]), 0.01f)
+    }
+
+    // ------------------------------------------------------------------
+    // 合并组保留共同倾角（2026-10-14）
+    //
+    // 用户现场（47 话报纸页）：斜排 ~12° 的标题被合并成一块后，`polygon`/`rotationDeg`
+    // 双双丢掉 → 渲染层拿不到倾角，把斜排按水平大块画（盖板 = 整条接缝带，横着盖住原图）。
+    // 判据：组内每框都带四边形、倾角一致（偏差 ≤8°）、且落在 2°..60° 内才采信；
+    // 不一致 / 缺四边形 / 竖排（≥60°）一律退回轴对齐。
+    // ------------------------------------------------------------------
+
+    @Test
+    fun keepsTiltForConsistentlyTiltedGroup() {
+        val blocks = listOf(
+            tbQuad(0, "네 번째 살인미수에서", 188f, 1956f, 900f, 2060f, 12f),
+            tbQuad(1, "벗어난 레온 데븐포트", 940f, 1956f, 1207f, 2060f, 12f)
+        )
+        val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1280, 2720)
+        assertEquals("同一行的两块应合并", 1, merged.size)
+        val polygon = merged[0].polygon
+        assertNotNull("倾角一致的合并组必须留下四边形", polygon)
+        assertEquals(4, polygon!!.size)
+        val angle = PaddleQuadGeometry.rotationDeg(polygon.map { PaddleQuadGeometry.Point(it.x, it.y) })
+        assertEquals("倾角必须能从四边形里读出来", 12f, angle, 1.5f)
+    }
+
+    @Test
+    fun dropsTiltWhenGroupAnglesDisagree() {
+        val blocks = listOf(
+            tbQuad(0, "一行横排", 100f, 100f, 400f, 160f, 12f),
+            tbQuad(1, "另一个角度", 420f, 100f, 700f, 160f, 30f)
+        )
+        val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 2400)
+        assertEquals(1, merged.size)
+        assertNull("倾角互相矛盾时不能拿其中一个歪掉整块", merged[0].polygon)
+    }
+
+    @Test
+    fun dropsTiltForVerticalGroupAndMissingQuad() {
+        val vertical = listOf(
+            tbQuad(0, "右列", 100f, 100f, 400f, 160f, 88f),
+            tbQuad(1, "左列", 100f, 180f, 400f, 240f, 88f)
+        )
+        val mergedVertical = PaddleOcrBlockMerger.mergeBlocks(vertical, 1080, 2400)
+        assertEquals(1, mergedVertical.size)
+        assertNull("±90° 是书写方向，不是斜排", mergedVertical[0].polygon)
+
+        val mixed = listOf(
+            tbQuad(0, "带四边形", 100f, 100f, 400f, 160f, 12f),
+            tb(1, "没有四边形", 420f, 100f, 700f, 160f)
+        )
+        val mergedMixed = PaddleOcrBlockMerger.mergeBlocks(mixed, 1080, 2400)
+        assertEquals(1, mergedMixed.size)
+        assertNull("任一框缺四边形就不能整体倾斜", mergedMixed[0].polygon)
     }
 }

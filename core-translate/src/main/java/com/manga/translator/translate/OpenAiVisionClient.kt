@@ -75,12 +75,13 @@ class OpenAiVisionClient(
                 useJsonResponseFormat = useJsonFormat,
                 thinking = thinking,
                 thinkingBudget = normalizedThinkingBudget,
-                systemPrompt = "You are a manga OCR engine. Return JSON only."
+                systemPrompt = "You are a manga OCR engine. Return JSON only.",
+                providerId = providerId
             )
         }
 
         val parsed = parseBubblesFromCompletion(
-            raw = result,
+            raw = result.raw,
             imageWidth = imageWidth,
             imageHeight = imageHeight
         )
@@ -148,6 +149,19 @@ class OpenAiVisionClient(
         }
     }
 
+    /**
+     * 云端文本翻译（OpenAI 兼容接口）。
+     *
+     * 2026-10-14「原文回退」三件套（用户真机反馈「用 API 翻译经常出现原文回退」）：
+     * 1. **瞬时错误重试**：在 [requestWithFallback] 里（连接/超时/429/5xx 退避重试）；
+     * 2. **解析失败/截断重试**：响应不是合法 JSON（或 `finish_reason=length` 被 max_tokens 截断）时，
+     *    多句对半拆批（[MAX_SPLIT_DEPTH] 层），单句换 `json_format=false` 重发一次 ——
+     *    旧实现是**静默整批返回原文**（日志 `translate_parse_fallback`），用户只看到原文；
+     * 3. **单句粒度重试**：解析成功但某句译文 == 原文（疑似没翻）时，把这几句单独再发一次。
+     *
+     * 返回 [TextTranslationOutcome]：`failedIndices` = 重试后仍等原文的下标，调用方据此
+     * 给用户提示（不再静默）。
+     */
     fun translateTexts(
         provider: String,
         baseUrl: String,
@@ -158,8 +172,8 @@ class OpenAiVisionClient(
         enableThinking: Boolean,
         thinkingBudget: Int,
         glossary: List<Pair<String, String>> = emptyList()
-    ): List<String> {
-        if (texts.isEmpty()) return emptyList()
+    ): TextTranslationOutcome {
+        if (texts.isEmpty()) return TextTranslationOutcome(emptyList(), emptyList())
         if (provider.trim().equals(BAIDU_PROVIDER_ID, ignoreCase = true)) {
             throw IOException("Baidu OCR only supports OCR recognition. Configure another translation provider.")
         }
@@ -171,30 +185,130 @@ class OpenAiVisionClient(
             enableThinking = enableThinking
         )
         val normalizedThinkingBudget = thinkingBudget.coerceIn(1024, 131072)
-        val prompt = buildTranslatePrompt(texts.size, targetLanguageId, glossary)
+        // 输出上限跟着句子数走：一页 20+ 句的 JSON 在 2048 tokens 下容易被截断
+        // （截断 = 非法 JSON = 旧的静默原文回退），这里给足余量，拆批重试是第二道保险。
+        val maxOutputTokens = (texts.size * TRANSLATE_OUTPUT_TOKENS_PER_TEXT + MAX_OUTPUT_TOKENS)
+            .coerceAtMost(TRANSLATE_OUTPUT_TOKENS_CAP)
 
-        val inputArray = JSONArray().apply {
-            texts.forEach { put(it) }
+        val values = arrayOfNulls<String>(texts.size)
+        // 「整批放弃」的下标：解析失败且拆批/换姿势都救不回来，不再进单句重试（避免第三次请求）。
+        val exhausted = BooleanArray(texts.size)
+
+        fun requestChunk(chunk: List<String>, jsonFormat: Boolean): ApiResult {
+            val prompt = buildTranslatePrompt(chunk.size, targetLanguageId, glossary)
+            val inputArray = JSONArray().apply { chunk.forEach { put(it) } }
+            return requestWithFallback(
+                endpoint = endpoint,
+                model = model,
+                apiKey = apiKey,
+                traceId = traceId,
+                initialThinking = initialThinking,
+                initialJsonFormat = jsonFormat
+            ) { useJsonFormat, thinking ->
+                buildTextTranslateBody(
+                    model = model,
+                    prompt = prompt,
+                    inputTextsJson = inputArray.toString(),
+                    useJsonResponseFormat = useJsonFormat,
+                    thinking = thinking,
+                    thinkingBudget = normalizedThinkingBudget,
+                    providerId = providerId,
+                    maxOutputTokens = maxOutputTokens
+                )
+            }
         }
 
-        val result = requestWithFallback(
-            endpoint = endpoint,
-            model = model,
-            apiKey = apiKey,
-            traceId = traceId,
-            initialThinking = initialThinking
-        ) { useJsonFormat, thinking ->
-            buildTextTranslateBody(
-                model = model,
-                prompt = prompt,
-                inputTextsJson = inputArray.toString(),
-                useJsonResponseFormat = useJsonFormat,
-                thinking = thinking,
-                thinkingBudget = normalizedThinkingBudget
+        fun giveUp(start: Int, end: Int) {
+            for (i in start until end) {
+                values[i] = texts[i]
+                exhausted[i] = true
+            }
+        }
+
+        fun translateRange(start: Int, end: Int, depth: Int) {
+            val size = end - start
+            if (size <= 0) return
+            val chunk = texts.subList(start, end)
+            val first = requestChunk(chunk, jsonFormat = true)
+            var parsed = parseTranslations(first.raw, chunk)
+            if (parsed.parseFailed) {
+                Log.w(TAG, "[$traceId] translate_parse_fallback count=$size reason=${parsed.reason}")
+            }
+            var broken = parsed.parseFailed || first.finishReason == FINISH_REASON_LENGTH
+            if (broken && size > 1 && depth < MAX_SPLIT_DEPTH) {
+                val mid = start + size / 2
+                Log.w(
+                    TAG,
+                    "[$traceId] translate_split_retry count=$size depth=$depth " +
+                        "reason=${if (first.finishReason == FINISH_REASON_LENGTH) "truncated" else "parse_failed"}"
+                )
+                translateRange(start, mid, depth + 1)
+                translateRange(mid, end, depth + 1)
+                return
+            }
+            if (broken) {
+                // 单句（或拆到上限）：换 json_format=false 重发一次 —— 有的端点带 json_object
+                // 反而爱注水/被截断。
+                val retry = runCatching { requestChunk(chunk, jsonFormat = false) }.getOrNull()
+                val retryParsed = retry?.let { parseTranslations(it.raw, chunk) }
+                val retryOk = retry != null && retryParsed != null &&
+                    !retryParsed.parseFailed && retry.finishReason != FINISH_REASON_LENGTH
+                if (retryOk) {
+                    Log.d(TAG, "[$traceId] translate_parse_retry ok count=$size json_format=false")
+                    parsed = retryParsed
+                } else {
+                    Log.w(
+                        TAG,
+                        "[$traceId] translate_parse_giveup count=$size " +
+                            "reason=${if (first.finishReason == FINISH_REASON_LENGTH) "truncated" else "parse_failed"}"
+                    )
+                    giveUp(start, end)
+                    return
+                }
+            }
+            chunk.forEachIndexed { index, _ -> values[start + index] = parsed.values[index] }
+        }
+
+        translateRange(0, texts.size, 0)
+
+        // ---- 单句粒度重试：译文 == 原文（疑似没翻）的句子单独再发一次 ----
+        // 判据与缓存层（`SentenceTranslationRepository.put` 的 skip_noop）同口径：
+        // 译文等于原文视为「翻译未生效」，不入缓存、也不该就这样上屏。
+        fun unchanged(value: String?, source: String): Boolean {
+            val text = value?.trim().orEmpty()
+            return text.isEmpty() || text == source.trim()
+        }
+        val suspects = texts.indices.filter { index ->
+            !exhausted[index] && unchanged(values[index], texts[index])
+        }
+        if (suspects.isNotEmpty()) {
+            val retryTexts = suspects.map { texts[it] }
+            val retried = runCatching { requestChunk(retryTexts, jsonFormat = true) }.getOrNull()
+            val retriedParsed = retried?.let { parseTranslations(it.raw, retryTexts) }
+            var applied = 0
+            if (retriedParsed != null && !retriedParsed.parseFailed &&
+                retried?.finishReason != FINISH_REASON_LENGTH
+            ) {
+                suspects.forEachIndexed { index, globalIndex ->
+                    val value = retriedParsed.values[index]
+                    if (!unchanged(value, texts[globalIndex])) {
+                        values[globalIndex] = value
+                        applied += 1
+                    }
+                }
+            }
+            Log.d(
+                TAG,
+                "[$traceId] sentence_retry count=${suspects.size} applied=$applied " +
+                    "indices=${suspects.take(12).joinToString(",")}"
             )
         }
 
-        return parseTranslations(result, texts)
+        val finalFailed = texts.indices.filter { unchanged(values[it], texts[it]) }.toList()
+        return TextTranslationOutcome(
+            translations = values.mapIndexed { index, value -> value ?: texts[index] },
+            failedIndices = finalFailed
+        )
     }
 
     fun groupTextBlocks(
@@ -236,10 +350,11 @@ class OpenAiVisionClient(
                 inputTextsJson = "[]",
                 useJsonResponseFormat = useJsonFormat,
                 thinking = thinking,
-                thinkingBudget = normalizedThinkingBudget
+                thinkingBudget = normalizedThinkingBudget,
+                providerId = providerId
             )
         }
-return parseGroups(result, blocks)
+return parseGroups(result.raw, blocks)
     }
 
     fun fetchAvailableModels(baseUrl: String, apiKey: String): List<String> {
@@ -873,7 +988,7 @@ return parseGroups(result, blocks)
     }
 
     /**
-     * 请求重试阶梯（2026-10-02 改为「思考三态 + 有界阶梯」）。
+     * 请求重试阶梯（2026-10-02 改为「思考三态 + 有界阶梯」；2026-10-14 补瞬时错误重试）。
      *
      * 两条独立的降级理由：
      * 1. 端点不接受思考参数 → `ENABLED → DISABLED_EXPLICIT → OMIT` 逐级降级
@@ -881,6 +996,14 @@ return parseGroups(result, blocks)
      * 2. 端点不接受 `response_format` → 同一思考模式下换 `json_format=false` 重发。
      *
      * 用 `attempted` 去重 + 次数上限，避免两条降级理由互相触发导致死循环。
+     *
+     * 2026-10-14 新增：**瞬时错误**（连接失败/超时、408/425/429、5xx）在阶梯**之前**
+     * 按退避重试（[executeWithTransientRetry]）。此前这类错误直接抛 IOException → 上层
+     * 「翻译失败，已显示原文」；用户真机反馈「用 API 翻译经常原文回退」，网络抖动是其中一类。
+     *
+     * @param initialJsonFormat 首次尝试是否带 `response_format`（解析失败重试时从 false 起，
+     *   有的端点带 json_object 反而爱注水/被截断）。
+     * @return 成功的 [ApiResult]（`raw` = 响应体）；全部尝试失败时抛 IOException。
      */
     private fun requestWithFallback(
         endpoint: String,
@@ -888,16 +1011,18 @@ return parseGroups(result, blocks)
         apiKey: String,
         traceId: String,
         initialThinking: ThinkingMode,
+        initialJsonFormat: Boolean = true,
         bodyBuilder: (useJsonFormat: Boolean, thinking: ThinkingMode) -> JSONObject
-    ): String {
+    ): ApiResult {
         Log.d(
             TAG,
-            "[$traceId] request_prepare model=$model endpoint=$endpoint thinking=${initialThinking.name}"
+            "[$traceId] request_prepare model=$model endpoint=$endpoint thinking=${initialThinking.name} " +
+                "json_format=$initialJsonFormat"
         )
 
         val attempted = mutableSetOf<Pair<ThinkingMode, Boolean>>()
         var mode = initialThinking
-        var jsonFormat = true
+        var jsonFormat = initialJsonFormat
         var lastError = ""
 
         repeat(MAX_REQUEST_ATTEMPTS) {
@@ -905,7 +1030,7 @@ return parseGroups(result, blocks)
             if (!attempted.add(rung)) {
                 throw IOException("OpenAI-compatible API error: ${lastError.ifBlank { "unknown error" }}")
             }
-            val result = executeRequest(
+            val result = executeWithTransientRetry(
                 endpoint = endpoint,
                 apiKey = apiKey,
                 body = bodyBuilder(jsonFormat, mode),
@@ -913,7 +1038,7 @@ return parseGroups(result, blocks)
                 jsonFormat = jsonFormat,
                 thinking = mode
             )
-            if (result.isSuccess) return result.raw
+            if (result.isSuccess) return result
             lastError = result.error.orEmpty()
 
             val next = when {
@@ -939,6 +1064,66 @@ return parseGroups(result, blocks)
         throw IOException("OpenAI-compatible API error: ${lastError.ifBlank { "unknown error" }}")
     }
 
+    /**
+     * 瞬时错误退避重试（2026-10-14）：把「重试就能过」的错误挡住，不往降级阶梯扔。
+     *
+     * 判据（[isTransientFailure]）：连接/读取超时或网络异常（没有响应）、408/425/429、
+     * 5xx。次数上限 [MAX_TRANSIENT_ATTEMPTS]，退避 = 600ms × 次数（上限 [TRANSIENT_BACKOFF_MAX_MS]）。
+     *
+     * 线程：调用方都在 IO 线程（`Dispatchers.IO` / IO 协程），这里用 `Thread.sleep` 简单可靠；
+     * 不做协程化是为了不改现有同步签名（OCR/翻译/分组三处共用同一阶梯）。
+     */
+    private fun executeWithTransientRetry(
+        endpoint: String,
+        apiKey: String,
+        body: JSONObject,
+        traceId: String,
+        jsonFormat: Boolean,
+        thinking: ThinkingMode
+    ): ApiResult {
+        var attempt = 0
+        while (true) {
+            attempt += 1
+            val result = runCatching {
+                executeRequest(
+                    endpoint = endpoint,
+                    apiKey = apiKey,
+                    body = body,
+                    traceId = traceId,
+                    jsonFormat = jsonFormat,
+                    thinking = thinking
+                )
+            }.getOrElse { err ->
+                ApiResult(
+                    isSuccess = false,
+                    raw = "",
+                    error = err.message ?: err.javaClass.simpleName,
+                    httpCode = 0
+                )
+            }
+            if (result.isSuccess || !isTransientFailure(result) || attempt >= MAX_TRANSIENT_ATTEMPTS) {
+                return result
+            }
+            val backoffMs = (TRANSIENT_BACKOFF_BASE_MS * attempt).coerceAtMost(TRANSIENT_BACKOFF_MAX_MS)
+            Log.d(
+                TAG,
+                "[$traceId] request_retry_transient attempt=$attempt code=${result.httpCode} " +
+                    "backoff_ms=$backoffMs err=${result.error.orEmpty().take(80)}"
+            )
+            Thread.sleep(backoffMs)
+        }
+    }
+
+    /** 瞬时错误：重试有意义（网络抖动/限流/服务端临时故障），与参数错误区分开。 */
+    private fun isTransientFailure(result: ApiResult): Boolean = isTransientHttpCode(result.httpCode)
+
+    /** 瞬时错误的 HTTP 判据（纯函数，可单测）：0 = 请求没走到响应（网络/超时）。 */
+    internal fun isTransientHttpCode(code: Int): Boolean {
+        if (code == 0) return true
+        if (code == 408 || code == 425 || code == 429) return true
+        return code >= 500
+    }
+
     private fun buildVisionBody(
         model: String,
         prompt: String,
@@ -946,7 +1131,8 @@ return parseGroups(result, blocks)
         useJsonResponseFormat: Boolean,
         thinking: ThinkingMode,
         thinkingBudget: Int,
-        systemPrompt: String
+        systemPrompt: String,
+        providerId: String
     ): JSONObject {
         val body = JSONObject()
             .put("model", model)
@@ -970,7 +1156,7 @@ return parseGroups(result, blocks)
                             )
                     )
             )
-        ThinkingSupport.applyTo(body, thinking, thinkingBudget, MAX_OUTPUT_TOKENS)
+        ThinkingSupport.applyTo(body, thinking, thinkingBudget, MAX_OUTPUT_TOKENS, providerId)
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
         }
@@ -983,7 +1169,9 @@ return parseGroups(result, blocks)
         inputTextsJson: String,
         useJsonResponseFormat: Boolean,
         thinking: ThinkingMode,
-        thinkingBudget: Int
+        thinkingBudget: Int,
+        providerId: String,
+        maxOutputTokens: Int = MAX_OUTPUT_TOKENS
     ): JSONObject {
         val body = JSONObject()
             .put("model", model)
@@ -1005,7 +1193,7 @@ return parseGroups(result, blocks)
                             )
                     )
             )
-        ThinkingSupport.applyTo(body, thinking, thinkingBudget, MAX_OUTPUT_TOKENS)
+        ThinkingSupport.applyTo(body, thinking, thinkingBudget, maxOutputTokens, providerId)
         if (useJsonResponseFormat) {
             body.put("response_format", JSONObject().put("type", "json_object"))
         }
@@ -1034,14 +1222,22 @@ return parseGroups(result, blocks)
             val raw = resp.body?.string().orEmpty()
             val cost = SystemClock.elapsedRealtime() - started
             return if (resp.isSuccessful) {
-                Log.d(TAG, "[$traceId] response_ok code=${resp.code} cost_ms=$cost chars=${raw.length}")
+                val finishReason = runCatching {
+                    JSONObject(raw).optJSONArray("choices")?.optJSONObject(0)?.optString("finish_reason")
+                }.getOrNull()?.takeIf { it.isNotBlank() }
+                // 截断过 = 这次响应不可用（JSON 一般是断的；即使解析过也是残译本）——日志钉住它。
+                Log.d(
+                    TAG,
+                    "[$traceId] response_ok code=${resp.code} cost_ms=$cost chars=${raw.length} " +
+                        "finish=${finishReason ?: "-"}"
+                )
                 // 诊断：记录响应开头，用于确认模型是否输出注水/重复内容（影响耗时）。
                 Log.d(TAG, "[$traceId] response_preview chars=${raw.length} preview=${raw.take(160).replace('\n', ' ')}")
-                ApiResult(true, raw, null)
+                ApiResult(true, raw, null, httpCode = resp.code, finishReason = finishReason)
             } else {
                 val err = extractError(raw).ifBlank { "${resp.code} ${resp.message}" }
                 Log.w(TAG, "[$traceId] response_fail code=${resp.code} cost_ms=$cost err=${err.take(240)}")
-                ApiResult(false, "", err)
+                ApiResult(false, "", err, httpCode = resp.code)
             }
         }
     }
@@ -1055,21 +1251,33 @@ return parseGroups(result, blocks)
         return parseModelJson(text, imageWidth, imageHeight)
     }
 
-    private fun parseTranslations(raw: String, sourceTexts: List<String>): List<String> {
-        val text = extractCompletionText(raw)
+    /**
+     * 解析译文 JSON。2026-10-14 起返回 [ParsedTranslations]（带 `parseFailed` 标记）——
+     * 调用方据此决定「拆批/换姿势重试」，而不是像旧实现那样**静默把原文当结果返回**。
+     *
+     * 刻意**不打日志**：这一层要能被 JVM 单测直接调用（`android.util.Log` 在单测里 not mocked），
+     * 失败原因通过 [ParsedTranslations.reason] 带出去，由调用方记录。
+     */
+    internal fun parseTranslations(raw: String, sourceTexts: List<String>): ParsedTranslations {
+        val text = runCatching { extractCompletionText(raw) }.getOrElse { err ->
+            return ParsedTranslations(sourceTexts, parseFailed = true, reason = "empty_completion:${err.message?.take(60)}")
+        }
         val candidate = extractJsonCandidate(text)
         if (candidate.isBlank()) {
-            Log.w(TAG, "translate_parse_fallback reason=no_json_candidate raw_chars=${raw.length} texts=${sourceTexts.size}")
-            return sourceTexts
+            return ParsedTranslations(sourceTexts, parseFailed = true, reason = "no_json_candidate raw_chars=${raw.length}")
         }
         return runCatching {
             if (candidate.trimStart().startsWith("[")) {
                 val arr = JSONArray(candidate)
-                return@runCatching normalizeTranslationList(arr, sourceTexts)
+                return@runCatching ParsedTranslations(normalizeTranslationList(arr, sourceTexts), parseFailed = false, reason = null)
             }
             val root = JSONObject(candidate)
             when {
-                root.has("translations") -> normalizeTranslationList(root.optJSONArray("translations") ?: JSONArray(), sourceTexts)
+                root.has("translations") -> ParsedTranslations(
+                    normalizeTranslationList(root.optJSONArray("translations") ?: JSONArray(), sourceTexts),
+                    parseFailed = false,
+                    reason = null
+                )
                 root.has("items") -> {
                     val items = root.optJSONArray("items") ?: JSONArray()
                     val out = MutableList(sourceTexts.size) { index -> sourceTexts[index] }
@@ -1080,16 +1288,20 @@ return parseGroups(result, blocks)
                             out[index] = item.optString("text", out[index]).ifBlank { out[index] }
                         }
                     }
-                    out
+                    ParsedTranslations(out, parseFailed = false, reason = null)
                 }
-                else -> {
-                    Log.w(TAG, "translate_parse_fallback reason=missing_translations_key candidate=${candidate.take(120)}")
-                    sourceTexts
-                }
+                else -> ParsedTranslations(
+                    sourceTexts,
+                    parseFailed = true,
+                    reason = "missing_translations_key candidate=${candidate.take(80)}"
+                )
             }
         }.getOrElse { err ->
-            Log.w(TAG, "translate_parse_fallback reason=parse_error err=${err.message?.take(120)} candidate=${candidate.take(120)}")
-            sourceTexts
+            ParsedTranslations(
+                sourceTexts,
+                parseFailed = true,
+                reason = "parse_error:${err.message?.take(80)} candidate=${candidate.take(80)}"
+            )
         }
     }
 
@@ -1208,15 +1420,16 @@ return parseGroups(result, blocks)
     /**
      * 判断错误是否为「端点不接受思考参数」。
      *
-     * 第一判据：错误文本点名了 `enable_thinking` / `thinking_budget`（原来的行为）。
-     * 第二判据（2026-10-02 新增）：文本只泛泛地说「unknown/unsupported/invalid parameter」，
-     * 没有回显字段名。因为「关思考」路径现在会**主动发** `enable_thinking:false`，
-     * 万一某个端点连这个字段都拒绝（且不回显名字），不给降级机会就会把本来能用的翻译打挂。
+     * 第一判据：错误文本点名了思考字段（`enable_thinking` / `thinking_budget` / `thinking.type`，
+     * 用 `contains("thinking")` 一并覆盖）。第二判据（2026-10-02 新增）：文本只泛泛地说
+     * 「unknown/unsupported/invalid parameter」，没有回显字段名。因为「关思考」路径现在会
+     * **主动发**思考关闭字段，万一某个端点连这个字段都拒绝（且不回显名字），
+     * 不给降级机会就会把本来能用的翻译打挂。
      * 该判据只会让请求在阶梯里多走一级（最终退到 OMIT，即旧行为），代价有上限。
      */
     private fun isThinkingUnsupported(errorText: String): Boolean {
         val lower = errorText.lowercase()
-        val mentionsField = lower.contains("enable_thinking") || lower.contains("thinking_budget")
+        val mentionsField = lower.contains("thinking")
         val rejected = lower.contains("not supported") ||
             lower.contains("not valid") ||
             lower.contains("unsupported") ||
@@ -1607,7 +1820,19 @@ return parseGroups(result, blocks)
     private data class ApiResult(
         val isSuccess: Boolean,
         val raw: String,
-        val error: String?
+        val error: String?,
+        /** HTTP 状态码；0 = 请求没走到响应（连接失败/超时）。 */
+        val httpCode: Int = 0,
+        /** 成功响应的 `choices[0].finish_reason`（`length` = 输出被 max_tokens 截断）。 */
+        val finishReason: String? = null
+    )
+
+    /** [parseTranslations] 的返回值：`parseFailed=true` 时 [values] 就是原文（占位）。 */
+    internal data class ParsedTranslations(
+        val values: List<String>,
+        val parseFailed: Boolean,
+        /** 失败原因（供调用方打日志）：`no_json_candidate` / `missing_translations_key` / … */
+        val reason: String? = null
     )
 
     private data class BaiduAccessTokenCache(
@@ -1626,6 +1851,18 @@ private companion object {
         const val TAG = "VisionClient"
         const val READ_TIMEOUT_SECONDS = 120L
         const val MAX_OUTPUT_TOKENS = 2048
+        /** 云端文本翻译：每句预留的输出 token（20 句的 JSON 在 2048 上限下必被截断）。 */
+        const val TRANSLATE_OUTPUT_TOKENS_PER_TEXT = 96
+        /** 单次翻译请求的输出 token 上限（再大就该靠拆批，而不是赌模型不啰嗦）。 */
+        const val TRANSLATE_OUTPUT_TOKENS_CAP = 8192
+        /** 解析失败/截断时最多对半拆几层（2 层 = 最多 4 个子批）。 */
+        const val MAX_SPLIT_DEPTH = 2
+        /** OpenAI 兼容响应的截断标记（`choices[0].finish_reason`）。 */
+        const val FINISH_REASON_LENGTH = "length"
+        /** 瞬时错误（网络/429/5xx）的重试次数与退避基值（毫秒，退避 = 基值 × 第几次）。 */
+        const val MAX_TRANSIENT_ATTEMPTS = 3
+        const val TRANSIENT_BACKOFF_BASE_MS = 600L
+        const val TRANSIENT_BACKOFF_MAX_MS = 3000L
         /** 单次请求最多尝试几轮（思考降级 + response_format 降级共用这个上限）。 */
         const val MAX_REQUEST_ATTEMPTS = 4
         const val BAIDU_PROVIDER_ID = "baidu"
@@ -1646,11 +1883,23 @@ private companion object {
 }
 
 /**
+ * 云端文本翻译的结果（2026-10-14）。
+ *
+ * [translations] 与输入一一对应；[failedIndices] = 重试后仍等于原文（或空白）的下标 ——
+ * 调用方据此给用户提示（例如「云端翻译 N/M 句未生效，已显示原文」），
+ * 不再像旧实现那样静默把原文当译文上屏。
+ */
+data class TextTranslationOutcome(
+    val translations: List<String>,
+    val failedIndices: List<Int>
+)
+
+/**
  * 思考参数的发送模式（2026-10-02 新增，用户要求「加一个参数表示是否开启思考功能」）。
  *
- * - [ENABLED]：显式打开（`enable_thinking:true` + `thinking_budget`）。
- * - [DISABLED_EXPLICIT]：**显式关闭**（`enable_thinking:false` + `max_tokens`）。
- *   这一态是本次新增的关键：千问 Qwen3 / qwen3-vl 这类模型默认就开思考，
+ * - [ENABLED]：显式打开。
+ * - [DISABLED_EXPLICIT]：**显式关闭**（并附带 `max_tokens` 输出上限）。
+ *   这一态是本次新增的关键：Qwen3 / DeepSeek 这类默认开思考的模型，
  *   以前「关」只是不发字段，等于没关，用户会一直等模型思考完。
  * - [OMIT]：完全不发思考字段（厂商不支持该参数时保持旧行为）。
  */
@@ -1664,8 +1913,18 @@ enum class ThinkingMode { ENABLED, DISABLED_EXPLICIT, OMIT }
  * `com.manga.translator.store.AiProvider.supportsThinking` 一致，避免两处各自漂移。
  */
 object ThinkingSupport {
-    /** 与 `AiProvider.QWEN` / `AiProvider.GLM` 对应（注意同步修改两边）。 */
-    private val PROVIDER_IDS = setOf("qwen", "glm")
+    /** 与 `AiProvider.QWEN` / `AiProvider.GLM` / `AiProvider.DEEPSEEK` 对应（注意同步修改两边）。 */
+    private val PROVIDER_IDS = setOf("qwen", "glm", "deepseek")
+
+    /**
+     * 思考字段有两种「方言」（2026-10-12 按各家官方文档修正）：
+     * - 千问（DashScope 兼容模式）：`enable_thinking: true/false` + `thinking_budget`；
+     * - GLM / DeepSeek：`thinking: {"type": "enabled"/"disabled"}`。
+     *
+     * DeepSeek 官方端点对不认识的字段是**静默忽略**（不报错）——此前错发千问方言的
+     * `enable_thinking:false`，结果「关思考」完全没生效且降级链也不会触发（无错误可判）。
+     */
+    private val THINKING_TYPE_PROVIDERS = setOf("glm", "deepseek")
 
     fun providerSupportsThinking(providerId: String): Boolean {
         return providerId.trim().lowercase() in PROVIDER_IDS
@@ -1691,18 +1950,36 @@ object ThinkingSupport {
     /**
      * 把思考相关字段（以及非思考模式下的 `max_tokens` 输出上限）写进请求体。
      *
+     * 字段方言按厂商区分：千问发 `enable_thinking`（+ `thinking_budget`），
+     * GLM / DeepSeek 发 `thinking.type`。见 [THINKING_TYPE_PROVIDERS] 的说明。
+     *
      * 非思考模式限制最大输出，避免模型输出失控导致响应时间暴涨
      * （日志曾观测到 2 句译文返回 18KB）。
      */
-    fun applyTo(body: JSONObject, mode: ThinkingMode, budget: Int, maxOutputTokens: Int) {
+    fun applyTo(
+        body: JSONObject,
+        mode: ThinkingMode,
+        budget: Int,
+        maxOutputTokens: Int,
+        providerId: String
+    ) {
+        val typeStyle = providerId.trim().lowercase() in THINKING_TYPE_PROVIDERS
         when (mode) {
             ThinkingMode.ENABLED -> {
-                body.put("enable_thinking", true)
-                body.put("thinking_budget", budget.coerceIn(MIN_THINKING_BUDGET, MAX_THINKING_BUDGET))
+                if (typeStyle) {
+                    body.put("thinking", JSONObject().put("type", "enabled"))
+                } else {
+                    body.put("enable_thinking", true)
+                    body.put("thinking_budget", budget.coerceIn(MIN_THINKING_BUDGET, MAX_THINKING_BUDGET))
+                }
             }
 
             ThinkingMode.DISABLED_EXPLICIT -> {
-                body.put("enable_thinking", false)
+                if (typeStyle) {
+                    body.put("thinking", JSONObject().put("type", "disabled"))
+                } else {
+                    body.put("enable_thinking", false)
+                }
                 body.put("max_tokens", maxOutputTokens)
             }
 

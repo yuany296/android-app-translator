@@ -54,7 +54,40 @@ object TextLayoutMetrics {
         return bubble.copy(contentX = left, contentY = top, contentW = width, contentH = height)
     }
 
-    /** 统计视觉行数；空输入返回 1。 */
+    /**
+     * 逐行框的**行高中位数**（像素）：横排取每行框的高、竖排取每行框的宽（列宽）。
+     *
+     * 为什么不用「块框高 ÷ 行数」：块级框偏松（含行距/内边距；粘到气泡描边时 OTSU
+     * 墨迹收紧也收不回来——描边被当成墨迹），行高被系统性放大（2026-10-14 真机实测：
+     * 同一张图上 4 行泡 lineH=45.3、5 行泡 lineH=34.9，前者译文比原文大 1/3、
+     * 白盖板戳出气泡）。ML Kit 自带的逐行框紧贴字形，中位数抗单行离群。
+     *
+     * 返回 0f = 输入不可用（空 / 维度非法），调用方退回老口径。
+     */
+    fun medianLineBoxDimPx(lineBoxes: List<FloatArray>, vertical: Boolean): Float {
+        val dims = lineBoxes.mapNotNull { lb ->
+            when {
+                lb.size < 4 -> null
+                vertical -> (lb[2] - lb[0]).takeIf { it > 1f }
+                else -> (lb[3] - lb[1]).takeIf { it > 1f }
+            }
+        }.sorted()
+        if (dims.isEmpty()) return 0f
+        return dims[dims.size / 2]
+    }
+
+    /**
+     * 统计视觉行数；空输入返回 1。
+     *
+     * ⚠️ 2026-10-14 修：**同一个块里的多行**以前被算成 1 行 —— 而 ML Kit 返回的是块级框，
+     * 「两行并成一个块」是常态（真机夹具：4 行韩文只给 3 个块）。行数少算一行，
+     * 「框高 ÷ 行数」就翻倍 → `font_height_percent` 翻倍 → 译文比原文大一大截、整块戳出气泡
+     * （用户 2026-10-14：「超出太多了吧」）。
+     *
+     * 现在的口径：块按行分组（同一行被切成多块时只算一行），**每组的行数取组内块 `lineCount`
+     * 的最大值**再求和 —— `lineCount` 来自检测器本身（ML Kit = `block.lines`；Paddle 单框 = 1，
+     * 合并块 = 组内行数）。检测器没给行数的老数据 `lineCount` 默认 1，行为与改动前一致。
+     */
     fun countVisualLines(blocks: List<TextBlock>): Int {
         val usable = blocks.filter { it.bottom > it.top }
         if (usable.isEmpty()) return 1
@@ -63,12 +96,15 @@ object TextLayoutMetrics {
         var currentTop = 0f
         var currentBottom = 0f
         var currentCount = 0
+        var currentLineSpan = 1
         val heights = mutableListOf<Float>()
         sorted.forEach { block ->
+            val blockLineSpan = block.lineCount.coerceAtLeast(1)
             if (currentCount == 0) {
                 currentTop = block.top
                 currentBottom = block.bottom
                 currentCount = 1
+                currentLineSpan = blockLineSpan
                 heights += block.bottom - block.top
                 return@forEach
             }
@@ -83,16 +119,18 @@ object TextLayoutMetrics {
                 currentTop = min(currentTop, block.top)
                 currentBottom = max(currentBottom, block.bottom)
                 currentCount += 1
+                currentLineSpan = maxOf(currentLineSpan, blockLineSpan)
                 heights += block.bottom - block.top
             } else {
-                lines += 1
+                lines += currentLineSpan
                 currentTop = block.top
                 currentBottom = block.bottom
                 currentCount = 1
+                currentLineSpan = blockLineSpan
                 heights += block.bottom - block.top
             }
         }
-        if (currentCount > 0) lines += 1
+        if (currentCount > 0) lines += currentLineSpan
         return lines.coerceAtLeast(1)
     }
 }

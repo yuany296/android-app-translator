@@ -60,14 +60,16 @@ data class OcrMergeDecision(
  * | 对齐 | 只有垂直重叠 ≥ 18% | 宽度比 + 边缘/中心对齐（见下） |
  * | 字号一致性 | 无 | `min/max 行高 ≥ 0.65` |
  *
- * ## 相对参考项目**刻意收紧**的两点
+ * ## 与参考项目的对齐口径（2026-10-14 修订）
  *
- * 1. 段落分支的对齐闸由参考项目的「`widthRatio ≥ 0.35` **或** 边缘/中心对齐」改成
- *    「`widthRatio ≥ 0.35` **且** 边缘/中心对齐」（区域已知时【[sameKnownRegion] = true】
- *    才退回参考项目的宽松口径）。理由：参考项目靠 `region_id` 做「同一个气泡」的硬闸，
- *    我们的分组链路在没有区域时没有这道闸，所以几何上必须自己兜住 —— 误合并的代价
- *    （两个气泡并成一句、一块盖板，用户现场）远高于误拆。真机现场那一对**两条都不过**：
- *    间隙 `50 > 37`、且左差 `115 > 74` / 右差 `143 > 74` / 中心差 `129 > 105`。
+ * 1. 段落分支的对齐闸：参考项目是「`widthRatio ≥ 0.35` **或** 边缘/中心对齐」。
+ *    2026-10-03 曾把宽度比升级成**硬闸**（不足直接拒绝）——结果「只有几个字的短行」
+ *    （气泡末行、CAUTION 带）宽度比必然 < 0.35，即使居中/贴左也合并不上
+ *    （用户 2026-10-14 报「只有两个字就合并不到」）。现在回到参考项目口径：
+ *    宽度比只作证据，**边缘对齐或中心接近即可合并**；两者皆无仍拒绝
+ *    （两气泡错位行的现场回归 `knownRegionRelaxesAlignmentButNotGap` 不受影响）。
+ *    区域未知时保留「边缘对齐/中心接近」这道闸 —— 参考项目靠 `region_id` 兜底，
+ *    我们没有，几何上必须自己守住「两个独立气泡不得并成一句」。
  * 2. 不实现参考项目的 `sharedSpeechBubbleContainer` 逃生门（同一个可信容器内可放宽字号闸）：
  *    我们的容器信息只在 planner 内部、不可靠，宁可拆开。
  *
@@ -87,7 +89,10 @@ object OcrBlockMergeRules {
     /** 基线残差上限相对行高（参考项目 `|Δbottom| ≤ 0.35 × avgHeight`）。 */
     const val BASELINE_MAX_RATIO = 0.35f
 
-    /** 段落分支：两块在行内方向上的长度比下限（参考项目 `widthRatio ≥ 0.35`）。 */
+    /**
+     * 段落分支：两块在行内方向上的长度比（参考项目 `widthRatio ≥ 0.35`）。
+     * 只作对齐证据、**不是闸**（2026-10-14 起）；保留常量用于与参考项目对表。
+     */
     const val WIDTH_RATIO_MIN = 0.35f
 
     /** 段落分支：边缘对齐容差相对行高（参考项目 `|Δleft| / |Δright| ≤ 2.2 × avgHeight`）。 */
@@ -193,15 +198,7 @@ object OcrBlockMergeRules {
             )
         }
 
-        val widthRatio = minInlineExtent / maxInlineExtent.coerceAtLeast(1f)
-        if (widthRatio < WIDTH_RATIO_MIN) return decision.copy(reason = OcrMergeReason.ALIGNMENT)
-
         val edgeTolerance = avgLineHeight * EDGE_ALIGN_MAX_RATIO
-        val aligned = if (vertical) {
-            abs(a.top - b.top) <= edgeTolerance || abs(a.bottom - b.bottom) <= edgeTolerance
-        } else {
-            abs(a.left - b.left) <= edgeTolerance || abs(a.right - b.right) <= edgeTolerance
-        }
         val centerOffset = if (vertical) {
             abs(centerY(a) - centerY(b))
         } else {
@@ -213,9 +210,21 @@ object OcrBlockMergeRules {
         if (!centerClose && inlineOverlapRatio <= INLINE_OVERLAP_ACCEPT_RATIO) {
             return decision.copy(reason = OcrMergeReason.ALIGNMENT)
         }
-        if (!sameKnownRegion && !aligned && !centerClose) {
-            return decision.copy(reason = OcrMergeReason.ALIGNMENT)
+        if (!sameKnownRegion && !centerClose) {
+            // 边缘对齐（行内方向两端任一端对齐即算）。
+            val edgeAligned = if (vertical) {
+                abs(a.top - b.top) <= edgeTolerance || abs(a.bottom - b.bottom) <= edgeTolerance
+            } else {
+                abs(a.left - b.left) <= edgeTolerance || abs(a.right - b.right) <= edgeTolerance
+            }
+            if (!edgeAligned) {
+                return decision.copy(reason = OcrMergeReason.ALIGNMENT)
+            }
         }
+        // 宽度比（WIDTH_RATIO_MIN）只是「对齐形态」的证据之一，不再是硬闸（2026-10-14 修）：
+        // 只有几个字的短行（气泡末行、CAUTION 带这类）宽度比必然 < 0.35，
+        // 只要边缘对齐或中心接近就应并入所在段 —— 此前宽度比不足直接拒绝，
+        // 短行永远合并不上（用户报「只有两个字就合并不到」）。
         return decision.copy(merge = true, reason = OcrMergeReason.PARAGRAPH)
     }
 

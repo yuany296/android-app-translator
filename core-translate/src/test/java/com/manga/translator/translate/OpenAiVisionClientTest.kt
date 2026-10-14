@@ -1,5 +1,7 @@
 package com.manga.translator.translate
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
@@ -178,6 +180,74 @@ class OpenAiVisionClientTest {
         )
 
         assertFalse(shouldMerge(leftBubble, rightBubble))
+    }
+
+    @Test
+    fun isTransientHttpCode_classifiesNetworkAndServerErrors() {
+        // 0 = 请求没走到响应（连接失败/超时）→ 值得重试。
+        assertTrue(client.isTransientHttpCode(0))
+        assertTrue(client.isTransientHttpCode(408))
+        assertTrue(client.isTransientHttpCode(425))
+        assertTrue(client.isTransientHttpCode(429))
+        assertTrue(client.isTransientHttpCode(500))
+        assertTrue(client.isTransientHttpCode(503))
+        // 参数/鉴权类错误重试没有意义（会走降级阶梯或直接失败）。
+        assertFalse(client.isTransientHttpCode(400))
+        assertFalse(client.isTransientHttpCode(401))
+        assertFalse(client.isTransientHttpCode(404))
+    }
+
+    @Test
+    fun parseTranslations_parsesTranslationsArray() {
+        val parsed = client.parseTranslations(
+            completion("{\"translations\":[\"甲\",\"乙\"]}"),
+            listOf("가", "나")
+        )
+        assertFalse(parsed.parseFailed)
+        assertEquals(listOf("甲", "乙"), parsed.values)
+    }
+
+    @Test
+    fun parseTranslations_handlesFencedJson() {
+        val parsed = client.parseTranslations(
+            completion("```json\n{\"translations\":[\"甲\",\"乙\"]}\n```"),
+            listOf("가", "나")
+        )
+        assertFalse(parsed.parseFailed)
+        assertEquals(listOf("甲", "乙"), parsed.values)
+    }
+
+    @Test
+    fun parseTranslations_marksGarbageAsParseFailed() {
+        // 模型回了一段解释而不是 JSON：旧实现静默返回原文，现在必须标记 parseFailed
+        // （调用方据此拆批/换姿势重试，而不是直接上屏原文）。
+        val parsed = client.parseTranslations(completion("抱歉，我无法完成这个请求。"), listOf("가", "나"))
+        assertTrue(parsed.parseFailed)
+        assertEquals(listOf("가", "나"), parsed.values)
+    }
+
+    @Test
+    fun parseTranslations_marksMissingKeyAsParseFailed() {
+        val parsed = client.parseTranslations(completion("{\"result\":[\"甲\",\"乙\"]}"), listOf("가", "나"))
+        assertTrue(parsed.parseFailed)
+    }
+
+    @Test
+    fun parseTranslations_marksTruncatedJsonAsParseFailed() {
+        // 被 max_tokens 截断的半截 JSON：没有可配平的候选 → parseFailed。
+        val parsed = client.parseTranslations(completion("{\"translations\":[\"甲\",\"乙"), listOf("가", "나"))
+        assertTrue(parsed.parseFailed)
+    }
+
+    private fun completion(content: String): String {
+        return JSONObject()
+            .put(
+                "choices",
+                JSONArray().put(
+                    JSONObject().put("message", JSONObject().put("content", content))
+                )
+            )
+            .toString()
     }
 
     private fun shouldMerge(a: Bubble, b: Bubble): Boolean {

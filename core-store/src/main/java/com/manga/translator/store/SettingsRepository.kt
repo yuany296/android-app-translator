@@ -35,6 +35,7 @@ class SettingsRepository(context: Context) {
             translateBaseUrl = prefs.getString(KEY_TRANSLATE_BASE_URL, legacyBaseUrl)?.trim().orEmpty(),
             translateModel = prefs.getString(KEY_TRANSLATE_MODEL, legacyModel)?.trim().orEmpty(),
             translateApiKey = prefs.getString(KEY_TRANSLATE_API_KEY, legacyApiKey)?.trim().orEmpty(),
+            visionModel = prefs.getString(KEY_VISION_MODEL, "")?.trim().orEmpty(),
             enabled = prefs.getBoolean(KEY_ENABLED, true),
             ignoreSimplifiedChinese = prefs.getBoolean(KEY_IGNORE_SIMPLIFIED, false),
             enableThinking = prefs.getBoolean(KEY_ENABLE_THINKING, false),
@@ -59,6 +60,7 @@ class SettingsRepository(context: Context) {
             .putString(KEY_TRANSLATE_BASE_URL, normalizeBaseUrl(settings.translateBaseUrl))
             .putString(KEY_TRANSLATE_MODEL, settings.translateModel.trim())
             .putString(KEY_TRANSLATE_API_KEY, settings.translateApiKey.trim())
+            .putString(KEY_VISION_MODEL, settings.visionModel.trim())
             // 兼容旧版本字段，默认同步为翻译配置。
             .putString(KEY_PROVIDER, AiProvider.fromId(settings.translateProvider).id)
             .putString(KEY_BASE_URL, normalizeBaseUrl(settings.translateBaseUrl))
@@ -206,6 +208,20 @@ class SettingsRepository(context: Context) {
     }
 
     /**
+     * OCR 低质量自动改用多模态模型重读（2026-10-14，默认开）。
+     *
+     * 本地识别过不了质量闸（分数低 / 读不出目标语言字符 / 空）且**云端 API 已配置**时，
+     * 整图交给多模态模型重读。没配云端 API 时是纯 no-op。
+     */
+    fun isLowQualityVisionOcrEnabled(): Boolean {
+        return prefs.getBoolean(KEY_LOW_QUALITY_VISION_OCR, true)
+    }
+
+    fun setLowQualityVisionOcrEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_LOW_QUALITY_VISION_OCR, enabled).apply()
+    }
+
+    /**
      * 内嵌浏览器默认搜索引擎（2026-09-28 用户反馈：写死 Google，国内用不了）。
      * 同样是独立 pref（不属于翻译 API 档案），默认 [BrowserSearchEngine.DEFAULT] = 必应。
      */
@@ -340,6 +356,7 @@ class SettingsRepository(context: Context) {
             .put("translateBaseUrl", normalizeBaseUrl(settings.translateBaseUrl))
             .put("translateModel", settings.translateModel.trim())
             .put("translateApiKey", settings.translateApiKey.trim())
+            .put("visionModel", settings.visionModel.trim())
             // 保留旧字段供旧客户端读取
             .put("provider", AiProvider.fromId(settings.translateProvider).id)
             .put("baseUrl", normalizeBaseUrl(settings.translateBaseUrl))
@@ -372,6 +389,7 @@ class SettingsRepository(context: Context) {
             translateBaseUrl = json.optString("translateBaseUrl", legacyBaseUrl).trim(),
             translateModel = json.optString("translateModel", legacyModel).trim(),
             translateApiKey = json.optString("translateApiKey", legacyApiKey).trim(),
+            visionModel = json.optString("visionModel", "").trim(),
             enabled = json.optBoolean("enabled", true),
             ignoreSimplifiedChinese = json.optBoolean("ignoreSimplifiedChinese", false),
             enableThinking = json.optBoolean("enableThinking", false),
@@ -418,6 +436,8 @@ class SettingsRepository(context: Context) {
         const val KEY_BAIDU_TRANSLATE_SECRET_KEY = "baidu_translate_secret_key"
         const val KEY_BROWSER_INPAINT_CLEAN = "browser_inpaint_clean"
         const val KEY_BROWSER_DOM_OVERLAY = "browser_dom_overlay"
+        const val KEY_VISION_MODEL = "vision_model"
+        const val KEY_LOW_QUALITY_VISION_OCR = "low_quality_vision_ocr"
         const val KEY_BROWSER_SEARCH_ENGINE = "browser_search_engine"
         const val KEY_BROWSER_SITE_ADAPTER = "browser_site_adapter"
         const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"

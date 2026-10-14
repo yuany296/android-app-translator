@@ -250,6 +250,23 @@ class PaddleOcrLocalTextDetector(
         val rawBlocks = slots.filterNotNull().sortedBy { it.id }
         val recMs = System.currentTimeMillis() - recStartedAt
 
+        // 合并前的**行级**清单（2026-10-14，用户现场 47 话报纸标题）：
+        // `ocr_blocks_all`（app 层）打的是**合并后**的块 —— 标题被读成「…벗어 아니 레온…」
+        // 这类「认错字」，到底是识别器自己吐出来的、还是后聚合把两块并起来引入的，
+        // 只有合并前这一行能一眼分开（行级还带四边形倾角，斜排是否被正确读出也看得到）。
+        Log.d(
+            TAG,
+            "paddle_lines_all raw=${rawBlocks.size} img=${srcW}x${srcH} :: " + rawBlocks.take(MAX_LINE_PROBE).joinToString(" ˌ ") { block ->
+                val angle = block.polygon?.let { polygon ->
+                    PaddleQuadGeometry.rotationDeg(polygon.map { PaddleQuadGeometry.Point(it.x, it.y) })
+                }
+                "${block.text.replace('\n', '⏎').take(12)}@" +
+                    "${block.left.toInt()},${block.top.toInt()}," +
+                    "${(block.right - block.left).toInt()}x${(block.bottom - block.top).toInt()}" +
+                    (angle?.let { ",rot=${"%.1f".format(it)}" } ?: "")
+            } + if (rawBlocks.size > MAX_LINE_PROBE) " …(+${rawBlocks.size - MAX_LINE_PROBE})" else ""
+        )
+
         // 4. 后聚合：把同一行/同一段落的碎片合并成完整句子（参考 translator 的 ocr-lines）
         val merged = PaddleOcrBlockMerger.mergeBlocks(rawBlocks, srcW, srcH)
         val totalMs = System.currentTimeMillis() - startedAt
@@ -1322,6 +1339,8 @@ class PaddleOcrLocalTextDetector(
         /** 单个文字框识别任务的超时上限，超时只丢该框结果、不阻塞整页。 */
         const val REC_TASK_TIMEOUT_MS = 20_000L
 
+        /** `paddle_lines_all`（合并前行级清单）最多打印几条：够看清边界行，又不把 logcat 撑爆。 */
+        private const val MAX_LINE_PROBE = 14
         /** det 单次推理最大 intra-op 线程数。 */
         const val DET_MAX_INTRA_OP_THREADS = 4
 

@@ -182,6 +182,37 @@ class OcrBlockMergeRulesTest {
         assertEquals(OcrMergeReason.PARAGRAPH, decision.reason)
     }
 
+    // ------------------------------------------------------------------
+    // 短行（2026-10-14 用户报「只有两个字就合并不到」）
+    // ------------------------------------------------------------------
+
+    @Test fun shortCenteredLineBelowParagraphMerges() {
+        // 气泡末行只有两个字、居中：宽度比 60/300 = 0.2 < 0.35，
+        // 旧判据在宽度比硬闸处直接拒绝 —— 用户现场。
+        val upper = block(0, "글이 길게 이어지는 문장입니다", 100f, 100f, 400f, 140f)
+        val short = block(1, "끝", 220f, 150f, 280f, 190f)
+        val decision = OcrBlockMergeRules.shouldMerge(upper, short)
+        assertTrue("居中的短末行应并入段落（reason=${decision.reason}）", decision.merge)
+        assertEquals(OcrMergeReason.PARAGRAPH, decision.reason)
+    }
+
+    @Test fun shortLeftAlignedLineBelowParagraphMerges() {
+        val upper = block(0, "글이 길게 이어지는 문장입니다", 100f, 100f, 400f, 140f)
+        val short = block(1, "끝", 100f, 150f, 160f, 190f)
+        val decision = OcrBlockMergeRules.shouldMerge(upper, short)
+        assertTrue("贴左的短末行应并入段落（reason=${decision.reason}）", decision.merge)
+        assertEquals(OcrMergeReason.PARAGRAPH, decision.reason)
+    }
+
+    @Test fun shortMisalignedLineIsStillRejected() {
+        // 短行但既不贴边也不居中（右侧远处孤块）→ 仍不是同一段。
+        val upper = block(0, "글이 길게 이어지는 문장입니다", 100f, 100f, 400f, 140f)
+        val short = block(1, "끝", 500f, 150f, 560f, 190f)
+        val decision = OcrBlockMergeRules.shouldMerge(upper, short)
+        assertFalse("错位的短块不应合并", decision.merge)
+        assertEquals(OcrMergeReason.ALIGNMENT, decision.reason)
+    }
+
     @Test
     fun blankLineBreakSplitsParagraph() {
         // 行距 ≥ 1.1 倍行高（空行分段）→ 不合并，交由调用方产出两段。

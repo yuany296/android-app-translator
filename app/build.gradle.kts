@@ -42,6 +42,7 @@ defaultConfig {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {

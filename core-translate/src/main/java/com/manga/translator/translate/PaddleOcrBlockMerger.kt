@@ -179,6 +179,8 @@ object PaddleOcrBlockMerger {
 
     private fun mergeGroupToBlock(group: List<TextBlock>, id: Int, imageWidth: Int, imageHeight: Int): TextBlock {
         val sorted = group.sortedWith(compareBy<TextBlock> { it.top }.thenBy { it.left })
+        // 倾角一致的多框合并组：留下一个「最小外接矩形」四边形，斜排段才不会在合并后丢掉倾角。
+        val mergedTiltQuad = mergedTiltQuadOf(sorted)
         val left = sorted.minOf { it.left }.coerceIn(0f, imageWidth.toFloat())
         val top = sorted.minOf { it.top }.coerceIn(0f, imageHeight.toFloat())
         val right = sorted.maxOf { it.right }.coerceIn(left + 1f, imageWidth.toFloat())
@@ -222,11 +224,75 @@ object PaddleOcrBlockMerger {
             right = right,
             bottom = bottom,
             confidence = sorted.maxOf { it.confidence },
-            // 四边形只在「本组合并的就是单个检测框」时透传：合并后的段/行一定是轴对齐的
-            // 多行块，硬把其中一个框的倾角当成整块的倾角会让遮罩歪掉（2026-09-29）。
-            polygon = group.singleOrNull()?.polygon,
+            // 四边形：单框直接透传；**倾角一致的多框**给出「最小外接矩形」+ 公共倾角
+            // （2026-10-14 修，见 [mergedTiltQuadOf] 的注释）；其余一律 null（保持轴对齐）。
+            // 注意 `TextBlock` 没有 rotationDeg 字段：倾角由消费端从四边形本身算
+            // （`TextQuadGeometry.rotationDeg`），所以这里只要把四边形留下就够了。
+            polygon = mergedTiltQuad ?: group.singleOrNull()?.polygon,
             lineCount = lineCount
         )
+    }
+
+    /**
+     * 合并组的**共同倾角**（像素空间）：组内每个框都带四边形、倾角都在
+     * [MIN_MERGED_TILT_DEG]..[MAX_MERGED_TILT_DEG] 内、且互相相差不超过
+     * [MERGED_TILT_SPREAD_DEG] 时，返回「所有框顶点绕公共角转正后的外接矩形」与那个角。
+     *
+     * 为什么要它（2026-10-14 真机，47 话报纸页）：斜排的报纸标题被合并成一块后，
+     * 原来只保留「单框」的四边形（`group.singleOrNull()?.polygon`，理由见 2026-09-29 的注释），
+     * 于是 `polygon`/`rotationDeg` 双双为 null → 渲染层拿不到倾角，把 12° 斜排的标题按
+     * **水平大块**画出来（盖板 = 整条接缝带 97.5% × 93.4%，横着盖住原图，用户截图就是这个）。
+     *
+     * 反向的顾虑（原来保留单框口径的理由）依然成立：**倾角不一致**时（例如横排一行 +
+     * 误并进来的斜排一行）不能拿其中一个框的角度歪掉整块 —— 这种情况返回 null，
+     * 让下游退回轴对齐。竖排（|倾角| ≥ 60°）也返回 null：那是书写方向，由竖排链路处理。
+     */
+    private fun mergedTiltQuadOf(blocks: List<TextBlock>): List<QuadPoint>? {
+        if (blocks.size < 2) return null
+        val polygons = ArrayList<List<QuadPoint>>(blocks.size)
+        for (block in blocks) {
+            val polygon = block.polygon ?: return null
+            if (polygon.size != 4) return null
+            polygons += polygon
+        }
+        val angles = polygons.map { polygon ->
+            PaddleQuadGeometry.rotationDeg(polygon.map { PaddleQuadGeometry.Point(it.x, it.y) })
+        }
+        if (angles.any { !it.isFinite() || abs(it) < MIN_MERGED_TILT_DEG || abs(it) > MAX_MERGED_TILT_DEG }) {
+            return null
+        }
+        val median = angles.sorted()[angles.size / 2]
+        if (angles.any { abs(it - median) > MERGED_TILT_SPREAD_DEG }) return null
+        return rotatedBoundsQuad(polygons.flatten(), median)
+    }
+
+    /** 把一组顶点绕原点转 `-angleDeg` 后取 AABB、再转回去 —— 即该组的「最小外接矩形」。 */
+    private fun rotatedBoundsQuad(points: List<QuadPoint>, angleDeg: Float): List<QuadPoint> {
+        val toRectified = Math.toRadians(-angleDeg.toDouble())
+        val cosA = kotlin.math.cos(toRectified)
+        val sinA = kotlin.math.sin(toRectified)
+        val rectified = points.map { point ->
+            QuadPoint(
+                (point.x * cosA - point.y * sinA).toFloat(),
+                (point.x * sinA + point.y * cosA).toFloat()
+            )
+        }
+        val left = rectified.minOf { it.x }
+        val top = rectified.minOf { it.y }
+        val right = rectified.maxOf { it.x }
+        val bottom = rectified.maxOf { it.y }
+        val back = Math.toRadians(angleDeg.toDouble())
+        val cosB = kotlin.math.cos(back)
+        val sinB = kotlin.math.sin(back)
+        return listOf(
+            QuadPoint(left, top), QuadPoint(right, top),
+            QuadPoint(right, bottom), QuadPoint(left, bottom)
+        ).map { point ->
+            QuadPoint(
+                (point.x * cosB - point.y * sinB).toFloat(),
+                (point.x * sinB + point.y * cosB).toFloat()
+            )
+        }
     }
 
     /**
@@ -333,6 +399,13 @@ object PaddleOcrBlockMerger {
     // 会把上下相邻的不同气泡/旁白误合并成一个句子。
     // 2026-08-27 再次收紧：用户反馈仍太宽松，减少跨气泡/跨行误合并。
     private const val HEIGHT_RATIO_LIMIT = 1 / 0.72f // 高度差异不超过 ~1.39 倍
+
+    /** 合并组「共同倾角」的生效区间（度，像素空间）：小于它是噪声、大于等于 60° 是竖排书写方向。 */
+    private const val MIN_MERGED_TILT_DEG = 2f
+    private const val MAX_MERGED_TILT_DEG = 60f
+
+    /** 组内各框倾角互相允许的最大偏差（度）：超过就认为不是同一段斜排，退回轴对齐。 */
+    private const val MERGED_TILT_SPREAD_DEG = 8f
 
     /**
      * 单块判竖排的最小高宽比（真竖排一列通常 ≥ 2.0）。

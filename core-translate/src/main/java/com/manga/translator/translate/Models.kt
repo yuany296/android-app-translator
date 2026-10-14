@@ -56,7 +56,15 @@ data class Bubble(
      * 原文行数（逐行 OCR 框的个数）。渲染时用「内容框高 ÷ 行数」估计原文字高，
      * 让译文字号与原文一致（用户 2026-09-28 要求）；1 = 单行/未知。
      */
-    val sourceLineCount: Int = 1
+    val sourceLineCount: Int = 1,
+    /**
+     * 逐行文字框（**百分比**，每行 `[left, top, right, bottom]`，坐标系同 [x]/[y]）。
+     *
+     * 来源：[TextBlock.lineBoxes]（ML Kit 逐行 boundingBox）在构泡时换算。
+     * 拿不到时为 null —— 字号/遮罩退回「块框 ÷ 行数 + 墨迹收紧」老路径
+     * （跨缝合并泡等合成 Bubble 即如此，行为不变）。
+     */
+    val lineBoxes: List<FloatArray>? = null
 )
 
 data class TranslationResult(val bubbles: List<Bubble>)
@@ -108,7 +116,16 @@ data class TextBlock(
      * 取值：[TextLineGeometry.lineCount] 会与「文本换行数 + 1」取最大，所以这里给 1
      * 也不会把带换行的块算成单行。
      */
-    val lineCount: Int = 1
+    val lineCount: Int = 1,
+    /**
+     * 逐行文字框（**图片像素**，每行 `[left, top, right, bottom]`）。
+     *
+     * ML Kit 的段落级块自带每行 boundingBox（除回检测缩放后带出）；Paddle / 远程 OCR
+     * 拿不到时为 null。用途（2026-10-14「字号以原文为基准」）：行高中位数 = 原文行高、
+     * 行框并集 = 真实字形区 —— 块级框偏松且会粘到气泡描边，「块框高 ÷ 行数」把字号
+     * 系统性放大 1/3、盖板比原文大一圈（用户截图：译文戳出气泡下沿）。
+     */
+    val lineBoxes: List<FloatArray>? = null
 )
 
 data class TextBlockGroup(

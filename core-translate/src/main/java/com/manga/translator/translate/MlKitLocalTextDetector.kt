@@ -47,7 +47,21 @@ class MlKitLocalTextDetector : LocalTextDetector {
                         // ML Kit 的 `block` 是**段落级**多行块：行数必须带出来，否则
                         // 「行高 = 框高 ÷ 行数」会退化成「整块高度」→ 合并阈值放大数倍
                         // （2026-10-03 两个独立气泡被并成一句的真机事故）。
-                        lineCount = block.lines.count { it.text.isNotBlank() }.coerceAtLeast(1)
+                        lineCount = block.lines.count { it.text.isNotBlank() }.coerceAtLeast(1),
+                        // 逐行框（除回缩放，与块框同坐标系）：行高中位数 = 原文行高基线、
+                        // 行框并集 = 真实字形区。块级框偏松且会粘到气泡描边（OTSU 收不回），
+                        // 「框高 ÷ 行数」系统性放大字号（2026-10-14 用户截图：译文比原文
+                        // 大 1/3、白盖板戳出气泡下沿）。
+                        lineBoxes = block.lines.mapNotNull { line ->
+                            line.boundingBox?.let { box ->
+                                floatArrayOf(
+                                    box.left / scale,
+                                    box.top / scale,
+                                    box.right / scale,
+                                    box.bottom / scale
+                                )
+                            }
+                        }.takeIf { it.isNotEmpty() }
                     )
                 }
             }.getOrElse { err ->
