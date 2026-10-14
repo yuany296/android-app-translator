@@ -36,9 +36,12 @@ jobs:
       - name: 接受 Android SDK 许可
         run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
 
-      - name: 把 Gradle 分发源换成官方地址
-        # 仓库里配的是腾讯云镜像（在国内拉得快）；GitHub 的机器在国外，走官方源更稳。
-        run: sed -i 's|mirrors.cloud.tencent.com/gradle/|services.gradle.org/distributions/|' gradle/wrapper/gradle-wrapper.properties
+      - name: 把 Gradle 分发源与依赖源换成官方地址
+        # 仓库里配的是国内镜像（腾讯云 + 阿里云，本机拉得快）；GitHub 的机器在国外，
+        # 直连官方源更稳，也不会因为镜像同步不全而找不到依赖。
+        run: |
+          sed -i 's|mirrors.cloud.tencent.com/gradle/|services.gradle.org/distributions/|' gradle/wrapper/gradle-wrapper.properties
+          sed -i '/maven.aliyun.com/d' settings.gradle.kts
 
       - name: 去掉本机专用的 JDK 路径
         # gradle.properties 里写死了本机 Android Studio 的绝对路径，GitHub 的机器上没有这个目录。
@@ -49,7 +52,20 @@ jobs:
 
       - name: 编译 release 安装包
         # 只打 arm64（真机架构），安装包比带模拟器架构小一半。
-        run: ./gradlew :app:assembleRelease -PtargetAbis=arm64-v8a --no-daemon --stacktrace
+        # 显式给足内存：默认堆对 5 个模块的 Compose 工程偏小，编译期容易 OOM。
+        # 失败时把关键行做成 annotation，方便在本地直接把原因读出来。
+        run: |
+          set +e
+          ./gradlew :app:assembleRelease -PtargetAbis=arm64-v8a --no-daemon \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
+            --stacktrace > build.log 2>&1
+          RC=$?
+          tail -60 build.log
+          if [ $RC -ne 0 ]; then
+            SUMMARY=$(grep -E 'FAILURE:|What went wrong|Could not (resolve|download|find)|OutOfMemory|^Caused by|^e: ' build.log | head -6 | tr '\n' ' | ')
+            echo "::error title=Gradle 构建失败::$SUMMARY"
+            exit $RC
+          fi
 
       - name: 收集产物
         run: |
