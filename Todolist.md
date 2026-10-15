@@ -1,5 +1,52 @@
 # Todolist
 
+## 50. 用户 2026-10-15 裁定：**删除盖板「容器轮廓裁剪」机制**（§49 的后续，2026-10-15）
+
+用户读完 §49 的解释后裁定：
+
+> 「问题是它现在量的好像不是气泡轮廓，而是文字的轮廓。我觉得删掉这个机制比较好。
+>  那个之前超出盖板的原因应该是截页的处理没处理好、把宽高算错了。
+>  这里可以参考一下 C:\homework\translator 是怎么做的。」
+> 补充澄清：「其实我的意思是 textbox 合并之后并扩张一点点的那个区域。」
+
+### 一、参考项目核实（读代码确认，不是印象）
+
+- `rendering/cover-geometry.js#resolveCoverQuad`：遮罩 = **文字几何**（Paddle 文字四边形，
+  或合并后的 textbox）× `coverScale(padding)`（绕中心等比外扩，最大 +6%）；
+- `resolveSolidFillOutline`：实底填充轮廓 = `region_polygon` → `polygon`（都是 **OCR 文字
+  区域**；那是 Paddle 检测给出的区域多边形），**从不扫描气泡内壁**；
+- 结论：我们自研的「逐行量容器内壁」不是参考项目的做法，删掉它符合用户判断。
+
+### 二、删了什么
+
+- `CoverOutlinePolygon.kt` + `CoverOutlinePolygonTest.kt`（12 条单测）整个删除；
+- `WebtoonImageTranslator`：`resolveInteriorCap` / `InteriorCap` / `inkBandsForOutline` /
+  `outlineDilatePx`、`cover_outline` 日志与探针（`outlineProbe`/`flushOutlineProbe`）、
+  `ink_tilt` 里的 `interior_cap(cover_outline_only)=` 段、`OUTLINE_*` 与
+  `INTERIOR_CAP_MAX_TILT_DEG` 常量，全部删除。
+- **保留**：`regionPolygonPercent = defaultRegionPolygon` —— 即「合并后的文字区域 + 少量
+  外扩」（有四边形时=外扩后的文字四边形；无四边形时=字形框 + 自适应外扩，下沿多留一点）。
+  这就是用户澄清的「textbox 合并之后扩张一点点的区域」。
+- `BubbleInteriorScanner` 保留（只服务「亮平底色 → 纯色盖板升级」这条证据链；
+  排版框与轮廓两条消费路径都已删除）。
+
+### 三、验证（emulator-5554，新包）
+
+- 面板渐变夹具（§49 的复现场景）：**不再产生 `cover_outline` 日志**；DOM 里
+  `--mt-region-clip = polygon(0% 0%, 100% 0%, 100% 100%, 0% 100%)`（纯矩形）——
+  台阶从根上不可能再出现（`.verify/panel_cmp3.png` 右：直边盖板）。
+- 椭圆夹具（灰度云椭圆泡）：盖板 = 文字矩形，四角会有一点戳出椭圆轮廓
+  （`.verify/ellipse_noline.png`）—— 这是删掉机制的**已知代价**（参考项目同样口径）；
+  真实漫画里椭圆气泡文字框通常小于气泡，影响远小于此夹具（文字占满椭圆）。
+- 单测全模块 **630 通过 / 0 失败**；JS 验收 **223/223**。
+- 真机（AN3GUT4A22006400）已装新包，等重翻复测（HumanTODO 第十三轮）。
+
+### 四、紧接下一项（用户指定）
+
+接缝/截页的宽高换算与参考项目对照（`stitch-mapping.js` / `seam-handling.js` /
+`crosspage-cover.js` vs 我们的 `SeamBandGeometry` / `SeamBubbleMerger` /
+`WebtoonImageTranslator`）：**先读、先给结论清单**，用户拍板后再改。
+
 ## 49. 用户 2026-10-15 追加：Kakao 盖板「锯齿状的背景」（§41 锯齿问题的真机重现场）（2026-10-15）
 
 用户在新包上复测（真机 AN3GUT4A22006400，正在读的一话）报「出现了锯齿状的背景」。

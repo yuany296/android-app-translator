@@ -782,10 +782,6 @@ class WebtoonImageTranslator(
             timer.mark("ink_tilt", probe)
             pendingTiltProbe = null
         }
-        pendingOutlineProbe?.let { probe ->
-            timer.mark("cover_outline", probe)
-            pendingOutlineProbe = null
-        }
 
         // 覆盖层模式：把「擦掉原文 → 画上译文」下发给 WebView 的 DOM 渲染层
         // （场景 = 百分比几何 + 颜色 + 原字高 + 清理图 URL）；整图模式：照旧渲染成图 PNG。
@@ -1441,7 +1437,6 @@ class WebtoonImageTranslator(
         topH: Int
     ): List<FinalBubble?> {
         resetTiltProbe()
-        resetOutlineProbe()
         val result = bubbles.mapIndexed { index, bubble ->
             val refinedRect = prep.contentRects[index]
             if (refinedRect == null || refinedRect.width() <= 2f || refinedRect.height() <= 2f) {
@@ -1563,29 +1558,14 @@ class WebtoonImageTranslator(
             // - interiorCap 纵向削到容器高 → 已删：这就是纵向收窄；
             // - 2026-10-12 固定横向收窄 ∓0.2 行高 → 用户真机对比判定负优化（악질들泡
             //   译文第一行被接缝盖板裁掉一截），当天已回退。
-            // interiorCap 的逐行扫描**保留**，但只喂给盖板轮廓裁剪（见下方
-            // regionPolygonPercent，防椭圆收腰白肩），与译文排版无关。
+            // 「按容器内壁轮廓裁剪盖板」那套机制已删（2026-10-15 用户裁定）：它逐行走像素
+            // 找气泡边界，量到的其实是**文字噪声**的轮廓 —— 面板型气泡里切出台阶
+            // （用户真机「锯齿状的背景」）。盖板只按「**合并后的文字区域 + 少量外扩**」走
+            // （见下方 regionPolygonPercent），与参考项目 `cover-geometry.js` 的
+            // `resolveCoverQuad`（文字几何 × coverScale）同口径 —— 那边的 region_polygon
+            // 也只是 OCR 的文字区域，从不扫描气泡内壁。
             // -----------------------------------------------------------------
             val layoutRect = RectF(maskRect)
-            // ⚠️ 容器扫描的输入必须是**宽松框**（精修后的内容框），不能跟排版框一起换成
-            // 行框并集：扫描从框中心逐行向外量「底色弦宽」，行框紧贴文字时每一行都穿过
-            // 笔画（桥接上限只有框高 ×0.22），密集韩文行直接把弦宽卡成几十像素的窄条 →
-            // 盖板轮廓多边形退化成窄缝，实底填充被裁没（2026-10-14 어린아이 泡实测：
-            // 原文全露、译文底下无盖板）。这个扫描只服务盖板轮廓，与排版无关。
-            val interiorCap = resolveInteriorCap(
-                stitched = stitched,
-                glyphRect = rawRect,
-                lineCount = lineCount,
-                colors = prep.colors[index],
-                bubble = bubble
-            )
-            if (interiorCap != null) {
-                tiltProbe.append(
-                    "|b$index interior_cap(cover_outline_only)=${interiorCap.widthPx.toInt()}" +
-                        "x${interiorCap.heightPx?.toInt() ?: -1} " +
-                        "mid=${interiorCap.midWidthPx.toInt()} "
-                )
-            }
             // 字号输入诊断（2026-09-30 用户反馈「倾斜的文本看不清」）：
             // 真机上 `font_height_percent` 只有 3.13%（真值 11.09%），字号被 FONT_MIN 兜住 = 10px。
             // 只打最终字号是查不出「四边形厚度算错还是 srcH 口径不对」的，这里把三个输入全打出来。
@@ -1676,46 +1656,12 @@ class WebtoonImageTranslator(
                     rect[0], rect[1] + rect[3]
                 )
             }
-            // 纯色盖板轮廓（2026-10-14 加固，用户报「锯齿 + 盖不住原文」）：
-            // 纯色盖板是**矩形**，按容器逐行轮廓裁一下（左侧上→下、右侧下→上），
-            // 否则椭圆/圆角气泡收腰处会在轮廓外露出一块白肩（2026-10-13 真机夹具实测：
-            // 445px 宽的文字框在椭圆上沿比轮廓宽 18px/侧）。
-            //
-            // 加固三条（详见 [CoverOutlinePolygon]）：①墨迹守卫——落在文字行带内的行
-            // 不许窄于该行带的字形框（否则裁切切进字形区，缺口处原文/背景透出来）；
-            // ②邻行外抹平——单行噪声尖刺向邻行看齐（去锯齿）；③整体外扩。
-            // 轮廓不可信（行退化/可用行不足）时返回 null，落回矩形/四边形轮廓。
-            val wantsCoverOutline = interiorCap?.hasOutline == true &&
-                bubble.bgType.equals("solid", ignoreCase = true)
-            val coverOutline = if (wantsCoverOutline) {
-                CoverOutlinePolygon.build(
-                    profileRowsPx = interiorCap!!.profileRowsPx,
-                    coverTopPx = maskRect.top - coverPadPx,
-                    coverBottomPx = maskRect.bottom + coverPadBottomPx,
-                    inkBands = inkBandsForOutline(lineBoxesPx, maskRect),
-                    dilatePx = outlineDilatePx(lineHeightPx),
-                    stitchedWidthPx = stitched.width,
-                    srcHeightPx = srcH,
-                    topStripHeightPx = topH,
-                    minChordRatio = OUTLINE_ROW_MIN_CHORD_RATIO
-                )
-            } else {
-                null
-            }
-            if (wantsCoverOutline) {
-                outlineProbe.append(
-                    if (coverOutline == null) {
-                        "b$index=fallback "
-                    } else {
-                        val diag = coverOutline.diag
-                        "b$index=rows${diag.rowsTotal}/drop${diag.rowsDropped}" +
-                            "/spike${diag.rowsSpikeFixed}" +
-                            "/clamp${diag.rowsInkClamped}(+${diag.maxInkDeficitPx.toInt()}px)" +
-                            "/dil${diag.dilatePx.toInt()} "
-                    }
-                )
-            }
-            val regionPolygonPercent = coverOutline?.pointsPercent ?: defaultRegionPolygon
+            // 盖板/实底填充轮廓 = **合并后的文字区域 + 少量外扩**（见 [defaultRegionPolygon]）。
+            // 2026-10-15 用户裁定：删掉「按容器内壁轮廓裁剪」那套机制 —— 它量到的其实是
+            // 文字/背景噪声的轮廓，会把盖板切出台阶（「锯齿状的背景」）；参考项目
+            // `cover-geometry.js` 同样只用文字几何（`resolveCoverQuad` = 文字四边形/框
+            // × coverScale 外扩），从不扫描气泡内壁。
+            val regionPolygonPercent = defaultRegionPolygon
             // 盖板外框 = 轮廓的外接框（四边形的外接框已经含了那几像素外扩）。
             val coverBoxPercent = paddedQuadPercent?.let { percentQuadBounds(it) }
                 ?: BrowserSceneBuilder.expandPercentBoxByPx(
@@ -1751,7 +1697,6 @@ class WebtoonImageTranslator(
             )
         }
         flushTiltProbe()
-        flushOutlineProbe()
         return result
     }
 
@@ -2192,92 +2137,6 @@ class WebtoonImageTranslator(
     }
 
     /**
-     * 气泡内部实测的容器几何，**只供盖板轮廓裁剪**（`regionPolygonPercent`，防椭圆收腰白肩）。
-     *
-     * ⚠️ 2026-10-14 用户规则后，它**不再参与排版框**：排版框 = 字形框原样，宽度/高度
-     * 上限一律不用（历史与原因见 `resolveFinalBubbles` 里的详注）。
-     */
-    private class InteriorCap(
-        val widthPx: Float,
-        val heightPx: Float?,
-        val midWidthPx: Float,
-        /** 容器逐行边界（拼接图像素，`[y,left,right] × N`），供盖板轮廓裁剪用。 */
-        val profileRowsPx: FloatArray
-    ) {
-        val hasOutline: Boolean get() = profileRowsPx.size >= 6
-    }
-
-    /**
-     * 气泡内部可写区域 → 盖板轮廓的容器几何（**不作排版框上限**，背景与用法见
-     * [resolveFinalBubbles] 里的详注）。
-     *
-     * 只在**量到可信容器**（中点行宽 ≥ 字形宽 × 0.9，且容器没贴着画面边缘/没比字形框大得
-     * 离谱，见 [BubbleInteriorScanner.Interior.isTrustworthyContainer]）时返回；斜排
-     * （四边形 / 明显倾角）与「量到的其实是整页白底」都直接跳过 —— 前者逐行量的是水平弦
-     * 会把字号误压小，后者会把盖板轮廓裁成一根窄柱（2026-10-14 真机夹具实测 213px）。
-     */
-    private fun resolveInteriorCap(
-        stitched: Bitmap,
-        glyphRect: RectF,
-        lineCount: Int,
-        colors: BubbleColors?,
-        bubble: Bubble
-    ): InteriorCap? {
-        val palette = colors ?: return null
-        if (bubble.polygon != null) return null
-        if (kotlin.math.abs(bubble.rotationDeg ?: 0f) > INTERIOR_CAP_MAX_TILT_DEG) return null
-        val glyphWidth = glyphRect.width()
-        val glyphHeight = glyphRect.height()
-        if (glyphWidth < 8f || glyphHeight < 8f) return null
-        val interior = ServiceLocator.bubbleInteriorScanner.scan(
-            source = stitched,
-            glyph = glyphRect,
-            lineCount = lineCount.coerceAtLeast(1),
-            bgColor = palette.bgColor
-        ) ?: return null
-        if (!interior.isTrustworthyContainer(glyphWidth, glyphHeight, stitched.width, stitched.height)) {
-            return null
-        }
-        val widthCap = interior.widthCapPx(glyphWidth) ?: return null
-        return InteriorCap(
-            widthPx = widthCap,
-            heightPx = interior.heightCapPx(glyphWidth, glyphHeight),
-            midWidthPx = interior.midRowWidthPx,
-            profileRowsPx = interior.profileRows
-        )
-    }
-
-    /**
-     * 墨迹守卫的行带（[CoverOutlinePolygon] 用）：优先检测器给的**逐行框**（每行各自的实际
-     * 字形范围，宽度互不相同），拿不到时退化成整块字形框（一行并集）。
-     *
-     * 为什么优先逐行框：多行气泡各行的宽度常差很多（长句 + 短句），拿并集守会把短行带
-     * 一起撑到最长行的宽度 → 短行两侧重新露出白肩。逐行框就没有这个问题。
-     */
-    private fun inkBandsForOutline(
-        lineBoxesPx: List<RectF>?,
-        maskRect: RectF
-    ): List<FloatArray> {
-        val boxes = lineBoxesPx
-            ?.filter { it.width() > 1f && it.height() > 1f }
-            ?.takeIf { it.isNotEmpty() }
-            ?: return listOf(
-                floatArrayOf(maskRect.left, maskRect.top, maskRect.right, maskRect.bottom)
-            )
-        return boxes.map { floatArrayOf(it.left, it.top, it.right, it.bottom) }
-    }
-
-    /**
-     * 盖板轮廓的整体外扩（px）：按行高的一个比例，钳在 [OUTLINE_DILATE_MIN_PX, OUTLINE_DILATE_MAX_PX]。
-     *
-     * 为什么不能用盖板的 `coverPadPx`（最大能到 11px）：那是给**字形框**留的余量，已经算进
-     * coverBox 里了；轮廓再按它外扩等于外扩翻倍，「露白肩」会回来。这里只取一个能吃掉
-     * 抗锯齿/亚像素误差的小量。
-     */
-    private fun outlineDilatePx(lineHeightPx: Float): Float =
-        (lineHeightPx * OUTLINE_DILATE_LINE_RATIO).coerceIn(OUTLINE_DILATE_MIN_PX, OUTLINE_DILATE_MAX_PX)
-
-    /**
      * 两个框的并集（[extra] 为 null 时原样返回 [base]）。
      * 用途：精修只允许**缩小**框，但倾角估计窗口不允许被这种缩小带到字形以内。
      */
@@ -2359,23 +2218,6 @@ class WebtoonImageTranslator(
 
     /** 本轮倾角诊断（[flushTiltProbe] 写入，[translateStitched] 读取）。 */
     private var pendingTiltProbe: String? = null
-
-    /** 盖板轮廓裁切诊断累积串（每张图一条 `cover_outline` 日志）。 */
-    private val outlineProbe = StringBuilder()
-
-    /** 每张图开始时清空轮廓诊断（在 [resolveFinalBubbles] 入口调用）。 */
-    private fun resetOutlineProbe() {
-        outlineProbe.setLength(0)
-    }
-
-    /** 轮廓诊断：累积到 [pendingOutlineProbe]，由 [translateStitched] 统一打日志。 */
-    private fun flushOutlineProbe() {
-        pendingOutlineProbe = outlineProbe.toString().trim().ifEmpty { null }
-        outlineProbe.setLength(0)
-    }
-
-    /** 本轮轮廓诊断（[flushOutlineProbe] 写入，[translateStitched] 读取）。 */
-    private var pendingOutlineProbe: String? = null
 
     /**
      * 没有 OCR 四边形（= ML Kit）时的几何重建。三步：
@@ -3299,27 +3141,6 @@ class WebtoonImageTranslator(
         private const val LOCAL_BUBBLE_PADDING_RATIO = 0.10f
         private const val LOCAL_BUBBLE_MIN_PADDING_PX = 6f
 
-        /**
-         * 排版框按气泡内部收窄时，能容忍的最大倾角（度）。
-         *
-         * 超过它就跳过：`BubbleInteriorScanner` 逐行量的是**水平弦**，而斜排文字的
-         * 「行」跟着基线走 —— 用水平弦收窄会把字号误压小。四边形（Paddle）同样直接跳过。
-         */
-        private const val INTERIOR_CAP_MAX_TILT_DEG = 2f
-
-        /**
-         * 盖板轮廓逐行弦宽的下限（占最大弦的比例）。
-         *
-         * OCR 原框紧贴文字时，扫描行穿过密集字形，量到的弦是行内字间空隙（真机实测
-         * 37%↔48% 锯齿自交，盖板被裁没、原文全露）。低于最大弦 45% 的行按文字噪声丢弃，
-         * 可用行不足 3 行就整体退回矩形盖板（见 [CoverOutlinePolygon.build]）。
-         */
-        private const val OUTLINE_ROW_MIN_CHORD_RATIO = 0.45f
-
-        /** 盖板轮廓外扩占行高的比例（吃抗锯齿/亚像素误差；上下限见下两行）。 */
-        private const val OUTLINE_DILATE_LINE_RATIO = 0.05f
-        private const val OUTLINE_DILATE_MIN_PX = 2f
-        private const val OUTLINE_DILATE_MAX_PX = 6f
         /** 残墨统计：采样步长与「算不算墨迹」的亮度差阈值。 */
         private const val INK_SAMPLE_STRIDE = 3
         private const val INK_DELTA_THRESHOLD = 52f

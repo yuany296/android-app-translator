@@ -2369,3 +2369,33 @@ polygon(-12.00% 0.00%, …, -12.00% 32.67%, 50.71% 47.52%, …, 100.61% 32.67%, 
 - 全模块 **642 通过 / 0 失败**；`node app/src/test/js/mt-overlay-acceptance.test.js` **223/223**。
 
 真机已装新包，等用户重翻复测（HumanTODO 第十二轮）。
+
+## 2026-10-15（第四轮）删除盖板「容器轮廓裁剪」机制（用户裁定，Todolist §50）
+
+用户裁定删掉 §41 起自研的「按容器内壁轮廓裁剪盖板」：参考项目 `cover-geometry.js`
+的盖板本来就是「文字几何 × coverScale（≤+6%）」，实底轮廓用的 `region_polygon` 也只是
+OCR 的文字区域，**从不扫描气泡内壁**；我们那套逐行量内壁的产物是文字/背景噪声轮廓
+（§49 的台阶即由此而来）。
+
+### 1. 改动
+
+- 删除 `CoverOutlinePolygon.kt` + `CoverOutlinePolygonTest.kt`（12 条单测）；
+- `WebtoonImageTranslator`：`resolveInteriorCap` / `InteriorCap` / `inkBandsForOutline` /
+  `outlineDilatePx` / `cover_outline` 日志与探针 / `ink_tilt` 的 `interior_cap=` 段 /
+  `OUTLINE_*` / `INTERIOR_CAP_MAX_TILT_DEG` 全部删除；
+- 保留 `regionPolygonPercent = defaultRegionPolygon`（合并文字区域 + 少量自适应外扩，
+  下沿多留一点）与 `BubbleInteriorScanner`（只服务纯色盖板升级证据）。
+
+### 2. 验证（emulator-5554；原用的 5556 被用户关闭后改在 5554 上跑）
+
+```
+panel-gradient 夹具：无 cover_outline 日志；--mt-region-clip = 纯矩形（0/0→100/100）；
+                     盖板直边无台阶（.verify/panel_cmp3.png 右）
+ellipse-bubble 夹具：盖板 = 文字矩形，四角略戳出椭圆（.verify/ellipse_noline.png）
+                     —— 删掉机制的已知代价；真实漫画椭圆泡文字通常小于气泡，影响更小
+全模块 testDebugUnitTest：630 通过 / 0 失败（删除 12 条轮廓单测后的总数）
+node app/src/test/js/mt-overlay-acceptance.test.js：223/223
+```
+
+真机（AN3GUT4A22006400）已装新包；真机复测要点见 HumanTODO 第十三轮，
+接缝宽高 vs 参考项目的对照（先读不改）是下一项。

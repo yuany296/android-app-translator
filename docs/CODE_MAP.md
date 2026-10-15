@@ -4,7 +4,7 @@
 > 与 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 的分工：那份讲**模块职责与主链路入口**（宏观），
 > 这份讲**逐个文件一句话职责 + 对应日志**（微观）。改架构时更新那份，加/改文件时更新这份。
 >
-> 最近更新：2026-10-15（窗口内改动：扫描安全阀 80→600 + 长章节场景缓存/`renderedSrcs`（§48）；「阅读位置优先」`BrowserImageOrder`、`scan … capped=`）
+> 最近更新：2026-10-15（窗口内改动：**删除盖板「容器轮廓裁剪」机制**（用户裁定；盖板=合并文字区域+少量外扩，§50）；扫描安全阀 80→600 + 长章节 `renderedSrcs`（§48）；「阅读位置优先」`BrowserImageOrder`）
 
 ---
 
@@ -130,7 +130,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
-| `CoverOutlinePolygon.kt` | **纯色盖板轮廓多边形**（墨迹守卫 + 孤立尖刺抑制 + 整体外扩）：不许裁进字形带，也不许切出台阶 | `build` | 纯逻辑 + 单测 `CoverOutlinePolygonTest`；日志 `cover_outline b0=rows/drop/spike/clamp/dil`；2026-10-15 加固 3（尖刺：逐侧局部内凹 > 0.15×最大弦；端行要求行带内或平坦上下文） |
+| ~~`CoverOutlinePolygon.kt`~~ | **已删除（2026-10-15 用户裁定）**：按容器内壁轮廓裁剪盖板 —— 量到的其实是文字噪声轮廓，会切出台阶（「锯齿状的背景」）。盖板/填充轮廓现在只按「合并文字区域 + 少量外扩」走（`defaultRegionPolygon`，与参考项目 `cover-geometry.js` 同口径） | — | 日志 `cover_outline` 一并删除（不再产生） |
 | `HandoffTextMatch.kt` | 移交可用性的**文本证据**（字符重合度 ≥0.7 才算同一句） | `explainedByHandoff` | `incoming_decision`；纯逻辑 |
 
 ### 3.5 渲染层（`core-overlay` + 网页 JS）
@@ -198,7 +198,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 |---|---|---|---|
 | `BackgroundOutlinePolicy.kt` | 按清理图亮度跨度决定译文要不要加描边 | `needsOutline` / `isBusy` | 只被浏览器链路 `WebtoonImageTranslator` 调用；日志 `outline_need`（plain/busy/outline/solid）；`isBusy` 等纯逻辑可单测 |
 | `BubbleBackgroundPolicy.kt` | 「这块底算不算亮的平底色」判据（决定盖板纯色平涂） | `isFlatBrightBackground` / `isBright` / `ringCoverage` | 2026-10-13 新增；阈值对齐参考项目 `bubble-colors.js`；日志 `solid_upgrade count=… evidence=ring…/flat…`；纯逻辑可单测 |
-| `BubbleInteriorScanner.kt` | 从字形框向外量容器内部：逐行可用宽度 + 轮廓剖面 + 底色一致率 | `scan` / `Interior.widthCapPx` / `Interior.isFlatBrightContainer` / `Interior.profileRows` | 2026-10-13 新增；排版框收窄（`ink_tilt` 的 `interior_cap=`）与纯色盖板裁剪（`region_polygon`）都靠它；纯逻辑核心 `scanWith` 可单测 |
+| `BubbleInteriorScanner.kt` | 从字形框向外量容器内部：底色一致率（纯色升级证据）+ 逐行可用宽度/轮廓剖面 | `scan` / `Interior.isFlatBrightContainer` / `Interior.midRowWidthPx` | 2026-10-13 新增；**2026-10-15 起只服务「纯色盖板升级证据」**（排版框收窄与盖板轮廓裁剪都已删除；`profileRows` 字段暂留但无消费方） |
 | `BubbleAdjustment.kt` | 单个气泡的用户调整量（位移/字号/描边） | `BubbleAdjustment` | `OverlayController.renderBubbles` 的 load/save 回调；持久化在 `PageOverlayAdjustmentRepository` |
 | `BubbleColorExtractor.kt` | 采样背景中值色与墨色，产出译文配色 | `extract` / `sampleBackground` / `chooseReadableTextColor` | 日志 `sampled_colors b0=#文字色/#底色`（浏览器）/ `bubble_colors count=`（悬浮球）；`sampleBackground` 额外给出外圈一致率（`BubbleColors.bgCoverage`/`flatBackground`）；配色判据是 internal 纯函数可单测 |
 | `BubbleRegionDetector.kt` | OpenCV 亮斑轮廓框出候选气泡区域 | `detect` | 日志 TAG `BubbleRegionDetect`；调用方计时 `bubble_region_stats`；**注意**：整页浅色会被检成大亮块，`isSolidBubbleRegion` 会因此退回 `none` |
