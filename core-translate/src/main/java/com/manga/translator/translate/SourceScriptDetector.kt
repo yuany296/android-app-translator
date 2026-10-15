@@ -46,7 +46,29 @@ object SourceScriptDetector {
      * 决定要不要采信。
      */
     fun detect(texts: List<String>): Detected? {
-        if (texts.isEmpty()) return null
+        val counts = countScript(texts)
+        return when {
+            counts.hangul >= HANGUL_MIN -> Detected("ko", counts.hangul)
+            counts.kana >= KANA_MIN -> Detected("ja", counts.kana)
+            counts.han >= HAN_MIN -> Detected(if (counts.traditionalOnlySeen) "zh-tw" else "zh-cn", counts.han)
+            counts.latin >= LATIN_MIN -> Detected("en", counts.latin)
+            else -> null
+        }
+    }
+
+    /** 各脚本字符的计数（[detect] 与「要不要探测」共用同一套口径）。 */
+    data class ScriptCounts(
+        val hangul: Int,
+        val kana: Int,
+        val han: Int,
+        val latin: Int,
+        val traditionalOnlySeen: Boolean = false
+    ) {
+        val total: Int get() = hangul + kana + han + latin
+    }
+
+    fun countScript(texts: List<String>): ScriptCounts {
+        if (texts.isEmpty()) return ScriptCounts(0, 0, 0, 0)
         var hangul = 0
         var kana = 0
         var han = 0
@@ -65,13 +87,70 @@ object SourceScriptDetector {
                 }
             }
         }
-        return when {
-            hangul >= HANGUL_MIN -> Detected("ko", hangul)
-            kana >= KANA_MIN -> Detected("ja", kana)
-            han >= HAN_MIN -> Detected(if (traditionalOnlySeen) "zh-tw" else "zh-cn", han)
-            latin >= LATIN_MIN -> Detected("en", latin)
-            else -> null
+        return ScriptCounts(hangul, kana, han, latin, traditionalOnlySeen)
+    }
+
+    /**
+     * 「提示用探测」的候选模型语言（2026-10-15）。
+     *
+     * 背景：Paddle 的 rec 模型按语种分家、词典互不相通 —— ja 词典 **0 个谚文**、ko 词典
+     * **0 个假名**。配错语言时首遍输出全是「模型自己词典里的字形噪声」（配 ja 读韩文 →
+     * 假名/汉字垃圾），[detect] 在这份垃圾上永远判出「与配置同族」，提示永远不出现
+     * （用户实测：配日文翻韩漫，毫无提示）。
+     *
+     * 探测 = 用姊妹 rec 模型把同一张图重读一遍，**结果只喂提示**，不动 OCR 结果与翻译。
+     * 只给 CJK 配置发候选：en 配置读拉丁字母哪儿都在，首遍判据够用。
+     */
+    fun probeCandidateLanguages(configuredLanguageId: String): List<String> =
+        when (configuredLanguageId.lowercase()) {
+            "ja" -> listOf("ko", "zh-cn")
+            "ko" -> listOf("ja", "zh-cn")
+            "zh-cn", "zh-tw", "zh" -> listOf("ja", "ko")
+            else -> emptyList()
         }
+
+    /** 探测结果被采信的最低证据（比 [detect] 的门槛高：垃圾字形偶尔也能凑出 1-2 个字符）。 */
+    fun probeEvidenceThreshold(languageId: String): Int = when (languageId.lowercase()) {
+        "ko" -> 8
+        "ja" -> 3
+        else -> 8
+    }
+
+    /** 首遍输出里「配置语言的字符」低于这个占比（且有足够文本量）= 模型读的多半不是配置语言。 */
+    private const val PROBE_FAMILY_RATIO = 0.15f
+
+    /** 文本量低于这个数时不探测：几句话既证明不了「选对」也证明不了「选错」。 */
+    private const val PROBE_MIN_EVIDENCE_CHARS = 20
+
+    /** 首遍平均置信度低于这个值也值得探测（模型读「不是自己语言」的字时分数系统性偏低）。 */
+    const val PROBE_WEAK_CONFIDENCE = 0.75f
+
+    /**
+     * 要不要做「提示用探测」：两条判据任一成立 ——
+     * ① 首遍输出里配置语言的字符占比 < 15%（覆盖 ja↔ko：词典里根本没有对方字符，
+     *    输出要么是噪声、要么干脆没有配置语言的证据）；
+     * ② 平均置信度 < [PROBE_WEAK_CONFIDENCE]（覆盖反向组合：ko 词典虽无假名，但模型会把
+     *    假名字形**硬读成**谚文垃圾 —— 脚本占比看不出来，分数看得出来）。
+     *
+     * 判不出置信度（无分数）时按「分数充足」处理，只走判据 ①。
+     */
+    fun needsScriptProbe(
+        texts: List<String>,
+        configuredLanguageId: String,
+        avgConfidence: Float
+    ): Boolean {
+        if (probeCandidateLanguages(configuredLanguageId).isEmpty()) return false
+        val counts = countScript(texts)
+        if (counts.total < PROBE_MIN_EVIDENCE_CHARS) return false
+        val familyChars = when (configuredLanguageId.lowercase()) {
+            "ja" -> counts.kana
+            "ko" -> counts.hangul
+            "zh-cn", "zh-tw", "zh" -> counts.han
+            else -> return false
+        }
+        if (familyChars < (counts.total * PROBE_FAMILY_RATIO)) return true
+        if (avgConfidence > 0f && avgConfidence < PROBE_WEAK_CONFIDENCE) return true
+        return false
     }
 
     /**

@@ -241,11 +241,27 @@ class EngineSelectingTextDetector(
     /** 本进程内「本地空结果 → 多模态也没读出」的连续次数。 */
     private var emptyVisionMisses = 0
 
+    /** 本进程内已完成的本地识别次数（探测节奏用：首个图 + 每 [PROBE_EVERY_N_RUNS] 个图兜底探一次）。 */
+    private var detectRuns = 0
+
+    /** 上一次识别用的配置源语言：变化 = 用户刚切了语言，这一张立刻探测（提示最值钱的时机）。 */
+    private var lastConfiguredLanguage: String? = null
+
     override fun detect(bitmap: android.graphics.Bitmap, sourceLanguageId: String): List<TextBlock> {
         val settings = ServiceLocator.settingsRepository.getSettings()
-        val blocks = detectWithEngineFallback(bitmap, sourceLanguageId)
-        reportLanguageMismatch(blocks, settings.sourceLanguage)
-        return maybeVisionFallback(bitmap, blocks, sourceLanguageId, settings)
+        detectRuns += 1
+        val languageSwitched = lastConfiguredLanguage != null && lastConfiguredLanguage != sourceLanguageId
+        lastConfiguredLanguage = sourceLanguageId
+        val local = detectWithEngineFallback(bitmap, sourceLanguageId)
+        val final = maybeVisionFallback(bitmap, local, sourceLanguageId, settings)
+        reportLanguageHint(
+            bitmap,
+            local,
+            final,
+            sourceLanguageId,
+            forceProbe = detectRuns == 1 || languageSwitched || detectRuns % PROBE_EVERY_N_RUNS == 0
+        )
+        return final
     }
 
     /** 原有引擎选择：Paddle 失败/为空回退 ML Kit。 */
@@ -267,19 +283,127 @@ class EngineSelectingTextDetector(
     }
 
     /**
-     * 语言选错提示（2026-10-14 定稿）：首遍文本的脚本族与配置源语言**不同族**时记录，
-     * 由阅读底栏显示；同族（如简繁互混）不算「选错了」，判不出也清除。
+     * 语言选错提示（2026-10-14 定稿；2026-10-15 三处修正）：
+     *
+     * 1. **报告时机**：挪到多模态回退**之后** —— 回退读出的文本才是真语言（多模态读韩文
+     *    毫无压力），以前先报告再回退，配错语言 + 配了 API 时反而错过最好的证据；
+     * 2. **姊妹模型探测**（[probeSiblingLanguage]）：首遍输出里几乎找不到「配置语言的字符」
+     *    或分数普遍偏低时，用捆绑的姊妹 rec 模型重读一遍 —— 结果只喂提示，OCR/翻译一律不动。
+     *    配 ja 读韩文时首遍垃圾里假名占 27%、置信度 0.89（实测），两条怀疑判据都会漏 ——
+     *    所以再加**节奏兜底**：进程内第一张图 + 每 [PROBE_EVERY_N_RUNS] 张图强制探一次
+     *    （正常配置多付一次识别的代价只摊在少数图上，配错语言几页内必然看到提示）；
+     * 3. **探针证据必须压过首遍**（实测 ko 配置读韩文页时，ja 探针从垃圾里也能凑出 14 个假名）：
+     *    正确配置时首遍同族证据很高、垃圾探针赢不了；配错时首遍证据≈0，真探针稳赢。
      */
-    private fun reportLanguageMismatch(blocks: List<TextBlock>, configuredLanguageId: String) {
-        val detected = com.manga.translator.translate.SourceScriptDetector.detect(blocks.map { it.text })
-        val mismatched = LanguageMismatchHint.isMismatch(detected?.languageId, configuredLanguageId)
-        LanguageMismatchHint.report(if (mismatched) detected?.languageId else null)
+    private fun reportLanguageHint(
+        bitmap: android.graphics.Bitmap,
+        local: List<TextBlock>,
+        final: List<TextBlock>,
+        configuredLanguageId: String,
+        forceProbe: Boolean
+    ) {
+        val detected = com.manga.translator.translate.SourceScriptDetector.detect(final.map { it.text })
+        val mismatched = detected != null &&
+            LanguageMismatchHint.isMismatch(detected.languageId, configuredLanguageId)
+        // 多模态替换过结果（final !== local）就不探测：多模态读出的语言比本地模型可信。
+        val probed = if (!mismatched && final === local) {
+            probeSiblingLanguage(
+                bitmap,
+                local,
+                configuredLanguageId,
+                firstPassEvidence = detected?.scriptChars ?: 0,
+                forceProbe = forceProbe
+            )
+        } else {
+            null
+        }
+        val hintLanguage = if (mismatched) detected?.languageId else probed
+        LanguageMismatchHint.report(
+            hintLanguage?.takeIf { LanguageMismatchHint.isMismatch(it, configuredLanguageId) }
+        )
         android.util.Log.d(
             TAG,
             "lang_hint configured=$configuredLanguageId detected=${detected?.languageId ?: "none"} " +
-                "mismatched=$mismatched ocr_blocks=${blocks.size} " +
-                "sample=${blocks.take(3).joinToString(" | ") { it.text.replace("\n", " ").take(24) }}"
+                "mismatched=$mismatched probed=${probed ?: "none"} ocr_blocks=${final.size} " +
+                "sample=${final.take(3).joinToString(" | ") { it.text.replace("\n", " ").take(24) }}"
         )
+    }
+
+    /**
+     * 姊妹模型探测（2026-10-15，用户报「配日文翻韩漫看不出语言选错了」）。
+     *
+     * 根因：Paddle 各语种 rec 词典互不相通（ja 词典 0 谚文、ko 词典 0 假名），配错语言时
+     * 首遍输出是「自己词典里的字形噪声」，`SourceScriptDetector` 在噪声上永远判「与配置同族」，
+     * 提示永远不出现。触发闸：怀疑判据（[com.manga.translator.translate.SourceScriptDetector.needsScriptProbe]）
+     * 或节奏兜底（[forceProbe]，首图 + 每 N 图）。
+     *
+     * **验收（实测钉出来的三条，全部满足才采信探针）**：
+     * 1. 探针读出的语言族 = 探针模型自己的语言族（zh 探针读日文页能读出假名，族检查挡掉）；
+     * 2. 证据 ≥ [com.manga.translator.translate.SourceScriptDetector.probeEvidenceThreshold]；
+     * 3. 证据 > [firstPassEvidence]（首遍自身的证据量）—— 正确配置时首遍同族证据很高，
+     *    垃圾探针（ko 配置读韩文页时 ja 探针凑出 14 假名 / conf 0.89）赢不了它。
+     *
+     * **边界（2026-10-14 用户裁定）**：探测结果只进 [LanguageMismatchHint]，不替换 OCR 结果、
+     * 不跟随翻译语言 —— 自动动作仍然只有「提示」一个。
+     */
+    private fun probeSiblingLanguage(
+        bitmap: android.graphics.Bitmap,
+        local: List<TextBlock>,
+        configuredLanguageId: String,
+        firstPassEvidence: Int,
+        forceProbe: Boolean
+    ): String? {
+        val candidates = com.manga.translator.translate.SourceScriptDetector
+            .probeCandidateLanguages(configuredLanguageId)
+        if (candidates.isEmpty() || local.isEmpty()) return null
+        val texts = local.map { it.text }
+        val scores = local.map { it.confidence }.filter { it > 0f }
+        val avgConfidence = if (scores.size >= maxOf(1, local.size / 2)) {
+            scores.average().toFloat()
+        } else {
+            0f
+        }
+        if (!forceProbe && !com.manga.translator.translate.SourceScriptDetector
+            .needsScriptProbe(texts, configuredLanguageId, avgConfidence)
+        ) {
+            android.util.Log.d(
+                TAG,
+                "lang_probe skipped configured=$configuredLanguageId avg_conf=${"%.2f".format(avgConfidence)} " +
+                    "counts=${com.manga.translator.translate.SourceScriptDetector.countScript(texts)}"
+            )
+            return null
+        }
+        var best: String? = null
+        var bestEvidence = 0
+        for (candidate in candidates) {
+            val blocks = runCatching { paddle.detect(bitmap, candidate) }.getOrElse { err ->
+                android.util.Log.w(TAG, "lang_probe model_fail candidate=$candidate reason=${err.message?.take(60)}")
+                emptyList()
+            }
+            val detected = com.manga.translator.translate.SourceScriptDetector.detect(blocks.map { it.text })
+            val probeScores = blocks.map { it.confidence }.filter { it > 0f }
+            val probeAvgConf = if (probeScores.size >= maxOf(1, blocks.size / 2)) probeScores.average().toFloat() else 0f
+            val accepted = detected != null &&
+                com.manga.translator.translate.SourceScriptDetector
+                    .recognitionFamily(detected.languageId, paddle = true) ==
+                    com.manga.translator.translate.SourceScriptDetector
+                        .recognitionFamily(candidate, paddle = true) &&
+                detected.scriptChars >= com.manga.translator.translate.SourceScriptDetector
+                    .probeEvidenceThreshold(candidate) &&
+                detected.scriptChars > firstPassEvidence
+            android.util.Log.i(
+                TAG,
+                "lang_probe configured=$configuredLanguageId candidate=$candidate " +
+                    "blocks=${blocks.size} detected=${detected?.languageId ?: "none"} " +
+                    "evidence=${detected?.scriptChars ?: 0} conf=${"%.2f".format(probeAvgConf)} " +
+                    "first_pass=$firstPassEvidence accepted=$accepted"
+            )
+            if (accepted && detected!!.scriptChars > bestEvidence) {
+                best = detected.languageId
+                bestEvidence = detected.scriptChars
+            }
+        }
+        return best
     }
 
     /** 低质量回退多模态：API 可用（见 [ServiceLocator.resolveVisionApiConfig]）+ 闸门通过才发请求；目标脚本更多才替换。 */
@@ -341,6 +465,14 @@ class EngineSelectingTextDetector(
 
         /** 本地读空 + 多模态也读空，连续这么多次后不再对空结果触发（省 API）。 */
         private const val EMPTY_VISION_GIVE_UP = 3
+
+        /**
+         * 语言探测的节奏兜底（2026-10-15）：怀疑判据（字符占比/置信度）对「配 ja 读韩文」
+         * 这类镜像组合会漏（实测垃圾假名占 27%、置信度 0.89），所以进程内第一张图 +
+         * 每隔这么多张图强制探测一次。正常配置多付 1~2 次识别的代价只摊在少数图上；
+         * 配错语言连续读几页必然撞上一次提示。
+         */
+        private const val PROBE_EVERY_N_RUNS = 4
     }
 }
 

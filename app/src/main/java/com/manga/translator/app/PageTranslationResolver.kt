@@ -249,6 +249,7 @@ class PageTranslationResolver(
             model = settings.translateModel,
             apiKey = settings.translateApiKey,
             texts = texts,
+            sourceLanguageId = settings.sourceLanguage,
             targetLanguageId = settings.targetLanguage,
             enableThinking = settings.enableThinking,
             thinkingBudget = settings.thinkingBudget,

@@ -69,7 +69,9 @@ private data class EditTarget(
     val entryId: String,
     val bubbleIndex: Int,
     val original: String,
-    val translated: String
+    val translated: String,
+    /** 这句当时是否处于「已作废」态（决定弹层要不要说明「保存=重新生效」）。 */
+    val invalidated: Boolean = false
 )
 
 private fun formatTimestamp(ts: Long): String {
@@ -236,8 +238,14 @@ fun HistoryScreen(
                                         expandedId = if (expanded) null else entry.id
                                     },
                                     onDelete = { onDelete(entry.id) },
-                                    onEditBubble = { bubbleIndex, original, translated ->
-                                        editTarget = EditTarget(entry.id, bubbleIndex, original, translated)
+                                    onEditBubble = { bubbleIndex, original, translated, invalidated ->
+                                        editTarget = EditTarget(
+                                            entryId = entry.id,
+                                            bubbleIndex = bubbleIndex,
+                                            original = original,
+                                            translated = translated,
+                                            invalidated = invalidated
+                                        )
                                     },
                                     onInvalidatePage = { onInvalidatePage(entry.id) }
                                 )
@@ -277,6 +285,7 @@ fun HistoryScreen(
         EditTranslationSheet(
             original = target.original,
             initialTranslation = target.translated,
+            invalidated = target.invalidated,
             onSave = { text ->
                 editTarget = null
                 onEditTranslation(target.entryId, target.bubbleIndex, text)
@@ -357,7 +366,7 @@ private fun HistoryEntryRow(
     showDivider: Boolean,
     onToggle: () -> Unit,
     onDelete: () -> Unit,
-    onEditBubble: (index: Int, original: String, translated: String) -> Unit,
+    onEditBubble: (index: Int, original: String, translated: String, invalidated: Boolean) -> Unit,
     onInvalidatePage: () -> Unit
 ) {
     // 以 bubblesJson 为 key：改完译文后 json 变了，这里要跟着重新解析，否则展开区还是旧译文。
@@ -435,17 +444,34 @@ private fun HistoryEntryRow(
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(8.dp))
                                 // 整行都可点，而不是只点末尾那个「改」字 —— 手指按得住。
-                                .clickable { onEditBubble(index, bubble.originalText, bubble.translatedText) },
+                                .clickable {
+                                    onEditBubble(
+                                        index,
+                                        bubble.originalText,
+                                        bubble.translatedText,
+                                        bubble.invalidated
+                                    )
+                                },
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
                                 text = highlightQuery("→ ${bubble.translatedText}", query),
                                 fontSize = 13.sp,
                                 lineHeight = 19.sp,
-                                color = MtColors.BrandInk,
+                                // 已作废的旧译文压暗：它只是留档，不再是「会遇到就用」的那句。
+                                color = if (bubble.invalidated) MtColors.TextTertiary else MtColors.BrandInk,
                                 modifier = Modifier.weight(1f)
                             )
-                            if (bubble.edited) {
+                            // 已作废优先于「已修正」显示：两条标记同时挂着时，用户只需要知道
+                            // 「这句已经不算数了」（2026-10-15 用户反馈「作废了还能改，我以为还能用」）。
+                            if (bubble.invalidated) {
+                                Text(
+                                    text = "已作废",
+                                    fontSize = 11.sp,
+                                    color = MtColors.DangerTextSoft,
+                                    modifier = Modifier.padding(start = 6.dp)
+                                )
+                            } else if (bubble.edited) {
                                 Text(
                                     text = "已修正",
                                     fontSize = 11.sp,
@@ -454,10 +480,11 @@ private fun HistoryEntryRow(
                                 )
                             }
                             Text(
-                                text = "改",
-                                fontSize = 12.sp,
+                                // 入口文案跟着状态走：作废过的必须一眼看出「点它 = 让这句重新生效」。
+                                text = if (bubble.invalidated) "改后生效" else "改",
+                                fontSize = if (bubble.invalidated) 11.sp else 12.sp,
                                 fontWeight = FontWeight.SemiBold,
-                                color = MtColors.Brand,
+                                color = if (bubble.invalidated) MtColors.TextTertiary else MtColors.Brand,
                                 modifier = Modifier.padding(start = 10.dp)
                             )
                         }
@@ -499,11 +526,15 @@ private fun HistoryEntryRow(
  * 两条出路分开写清楚：
  * - 知道正确译文 → 改上面输入框 + 「保存」，会同时写回句子缓存；
  * - 不知道 / 觉得原文本身就错（截页被错误合并）→ 用「作废这句缓存」，下次重新翻译。
+ *
+ * 2026-10-15 补：这句已经作废时（[invalidated]）弹层要主动说明「保存 = 重新生效」——
+ * 用户反馈「作废之后还能改译文，我以为它还能用」，问题不在能不能改，而在没告诉他改的含义。
  */
 @Composable
 private fun EditTranslationSheet(
     original: String,
     initialTranslation: String,
+    invalidated: Boolean,
     onSave: (String) -> Unit,
     onInvalidate: () -> Unit,
     onDismiss: () -> Unit
@@ -549,7 +580,7 @@ private fun EditTranslationSheet(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "修改译文",
+                        text = if (invalidated) "修改译文 · 已作废" else "修改译文",
                         fontSize = 17.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = MtColors.TextPrimary,
@@ -564,6 +595,22 @@ private fun EditTranslationSheet(
                             .clip(RoundedCornerShape(8.dp))
                             .clickable(enabled = canSave) { onSave(text.trim()) }
                             .padding(horizontal = 4.dp, vertical = 4.dp)
+                    )
+                }
+
+                if (invalidated) {
+                    // 作废过的句子必须先把话说清楚：下面这个输入框里的旧译文已经不算数了。
+                    Text(
+                        text = "这句已作废（下次遇到会重新翻译）。保存 = 让它重新生效，" +
+                            "以后遇到这句都用你写的译文。",
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        color = MtColors.DangerTextSoft,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MtColors.SurfaceMuted)
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
                     )
                 }
 
@@ -594,7 +641,11 @@ private fun EditTranslationSheet(
                 }
 
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(text = "译文", fontSize = 11.sp, color = MtColors.TextSecondary)
+                    Text(
+                        text = if (invalidated) "译文（已作废的旧译文）" else "译文",
+                        fontSize = 11.sp,
+                        color = MtColors.TextSecondary
+                    )
                     Box(modifier = Modifier.height(6.dp))
                     Box(
                         modifier = Modifier
@@ -620,10 +671,10 @@ private fun EditTranslationSheet(
                     }
                     Box(modifier = Modifier.height(8.dp))
                     Text(
-                        text = if (sameAsOriginal) {
-                            "译文不能和原文一样"
-                        } else {
-                            "保存后，以后遇到这句都用这个译文"
+                        text = when {
+                            sameAsOriginal -> "译文不能和原文一样"
+                            invalidated -> "保存后这句会重新生效，以后遇到都用它"
+                            else -> "保存后，以后遇到这句都用这个译文"
                         },
                         fontSize = 11.sp,
                         color = if (sameAsOriginal) MtColors.Danger else MtColors.TextTertiary
@@ -636,13 +687,26 @@ private fun EditTranslationSheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(10.dp))
-                        .clickable(onClick = onInvalidate)
+                        // 已经作废过就不给再点：重复点没有新效果，留着只会让人以为「还没生效」。
+                        .clickable(enabled = !invalidated, onClick = onInvalidate)
                         .padding(vertical = 2.dp)
                 ) {
                     Column {
-                        Text(text = "作废这句缓存", fontSize = 14.sp, color = MtColors.DangerTextSoft)
+                        Text(
+                            text = if (invalidated) "已作废这句缓存" else "作废这句缓存",
+                            fontSize = 14.sp,
+                            color = if (invalidated) MtColors.TextTertiary else MtColors.DangerTextSoft
+                        )
                         Box(modifier = Modifier.height(2.dp))
-                        Text(text = "下次遇到这句重新翻译", fontSize = 12.sp, color = MtColors.TextTertiary)
+                        Text(
+                            text = if (invalidated) {
+                                "旧译文只留作追溯，下次遇到这句会重新翻译"
+                            } else {
+                                "下次遇到这句重新翻译"
+                            },
+                            fontSize = 12.sp,
+                            color = MtColors.TextTertiary
+                        )
                     }
                 }
             }

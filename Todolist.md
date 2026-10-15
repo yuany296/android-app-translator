@@ -1,5 +1,113 @@
 # Todolist
 
+## 46. 用户 2026-10-15 六条反馈：语言提示实证修复 / 翻译提示词对齐插件 / 作废态收尾 / 档案不换语言 / 截图译文点不回来 / 公开仓库清理（2026-10-15）
+
+用户报障清单（编号沿用原话）：2 语言提示无效、3 插件翻译更好、4 作废后还能改译文、
+6 换配置换掉源语言、7 翻译层点不回来、8 清理 GitHub 公开文件。（1、5 不在本轮。）
+
+### 一、第 2 条：语言提示「从没出现过」—— 根因实证 + 姊妹模型探测（`EngineSelectingTextDetector`）
+
+- **根因（模拟器实测钉死）**：提示判据 = 首遍 OCR 文本的脚本族 vs 配置语言族。但 Paddle 各语种
+  rec **词典互不相通**（`paddle_ja_dict.txt` 0 谚文 / `paddle_ko_dict.txt` 0 假名）——配 ja 读韩文时
+  首遍输出是「ja 词典里的字形噪声」：`lang_hint configured=ja detected=ja`（假名 17/40、
+  **置信度 0.89**）。检测器在垃圾上永远判「同族」，提示在结构上不可能出现。
+- **修法：姊妹模型探测**（结果**只喂提示**，OCR/翻译/缓存一律不动 —— §45「只提示、不动作」边界不变）：
+  - 触发：怀疑判据（配置语言字符占比 <15% 或均分 <0.75，`SourceScriptDetector.needsScriptProbe`）
+    **或节奏兜底**（进程内首图 / 配置语言刚切换的那张 / 每 4 张图，`PROBE_EVERY_N_RUNS=4`）——
+    实测怀疑判据对「ja↔ko 镜像组合」两条都会漏（垃圾假名 27%、conf 0.89），节奏兜底保证几页内必报；
+  - 探测 = 用捆绑的姊妹 rec 模型（ja/ko/zh）把同一张图重读一遍，最多 2 次；
+  - **验收三条件**（全部实测钉出来）：①探针读出的语言族 = 探针模型自己的族（zh 探针读日文页
+    能读出假名，族检查挡掉）；②证据 ≥ `probeEvidenceThreshold`（ko 8 / ja 3 / zh 8）；
+    ③**证据 > 首遍自身证据** —— 正确配置时首遍同族证据很高，垃圾探针赢不了
+    （实测 ko 配置读韩文页：ja 探针从垃圾里凑出 14 假名 conf 0.89，被首遍 43 谚文压掉）。
+- **报告时机**：`reportLanguageMismatch` 原来在多模态回退**之前**跑 —— 回退读出的文本才是真语言，
+  挪到之后（`reportLanguageHint`）。
+- **模拟器四象限实证**（夹具 `.verify/web/lang-ko.html` / `lang-ja.html`，白底椭圆泡 PNG）：
+  | 配置 | 页面 | 结果 |
+  | --- | --- | --- |
+  | ja | ko | ko 探针 evidence=43 conf=0.99 → 底栏「语言可能选错了 · 页面是韩文」+ Toast ✓ |
+  | ja | ja | ko 探针 evidence=0、zh 探针读出假名但族不符 → 不提示 ✓ |
+  | ko | ko | ja 探针 14 / zh 探针 9，均 < 首遍 43 → 不提示 ✓ |
+  | ko | ja | ja 探针 evidence=32 conf=1.00 → 提示「页面是日文」✓ |
+- 日志：`lang_hint configured= detected= mismatched= probed=`、`lang_probe … first_pass= accepted=`、
+  `lang_probe skipped … counts=`（怀疑判据没过时也留数字，方便下轮调阈值）。
+
+### 二、第 3 条：翻译提示词对齐插件（`OpenAiVisionClient`）
+
+对齐参考项目 `translation-provider.js`（用户问「插件是不是有输入上下文」——读完插件的实现，
+差距不在上下文，在提示词三件套）：
+1. **system 角色**：`manga dialogue translator. Translate from X to Y. Return JSON only…`
+   （原来只有一句通用 "text translation engine"，模型不知道在译漫画、也不知道源语言）；
+2. **质量规则**（对齐插件 webpage 提示词里同样适用于台词的几条）：不增删信息、语气口语化
+   （随便/感叹保持）、保留引号、专有名词必须译/音译**不许留原文文字**、拟声词不丢；
+3. **术语表按批过滤**：只注入本批文本里真正出现的词条（原来整表照抄，拆批后指令被稀释 ——
+   这是「插件更好」的第二条）。`temperature=0` 原本就有。
+- `PageTranslationResolver` 调用点补 `sourceLanguageId`；`buildTextTranslateBody` 接受 systemPrompt
+  （grouping 另给 "text grouping engine"）。跨气泡上下文（把同页相邻气泡喂给模型）本轮**没做**：
+  句子缓存按句存键，加上下文要动缓存语义，单独排期。
+- 单测：`TranslatePromptTest` 4 条（system 角色/规则在/术语表过滤/语言名映射）。
+
+### 三、第 4 条：作废态收尾（上轮遗留的半成品补完）
+
+上轮未提交的 `HistoryBubble.invalidated` + `markBubbleInvalidated/markAllInvalidated` +
+HistoryScreen「已作废」标记/「改后生效」入口/弹层说明、`MainActivity` 三处动作（改译文/作废单句/
+作废整页：标记与删缓存同段落盘 + 列表即时 `refreshHistory`）**上轮 diff 已全部写好**；本轮把这些
+纳入提交、跑绿单测，未再改行为。
+- `HistoryBubbleInvalidateTest`（8 条）跑绿。
+
+### 四、第 6 条：换配置档案不再换源语言
+
+- 新纯逻辑 `core-store/ProfileApplyPolicy.kt`：`AppSettings.applyProfile(profile)` —— 档案只搬
+  「档案表单里存在的字段」（厂商/BaseURL/Key/模型/多模态模型/思考/引擎），**语言对、OCR 引擎、
+  百度凭据、服务开关保留用户当前值**（档案 = 整份 AppSettings 快照，整包替换会把建档时刻的
+  语言快照顶回来，而档案表单里根本没有语言项）；
+- 两处套用点都接上：首页 `LauncherScreen`（上轮已接，修掉插在 import 中间的语法错）+
+  **浏览器齿轮弹层 `pickTranslateProfile`**（本轮补上，上轮漏的第二个套用点）；
+- 单测：`ProfileApplyPolicyTest` 4 条（保留语言/搬凭据/保百度/纯函数）。
+
+### 五、第 7 条：截图译文「点一下恢复原文」后点不回来 —— 两条路全断，都修了
+
+- **根因**：恢复原文后（`hasRenderOnPage=false`、`screenshotRender` 还在）——
+  ①点球走 `onPrimaryAction` → `controls.primaryAction` 只有 START/STOP → **起了一整轮新翻译**
+  （状态行却承诺「点球重看截图译文」）；②⋮ 菜单「原文/译文」开关被 `hasRender=false` 禁用；
+  且 dismiss 后 `viewMode` 停在「译文」→「译文」段已选中不可点。三条加起来 = 无路可回。
+- **修**：
+  1. `onPrimaryAction` 前置拦截：空闲 + 有截图结果 + 屏上没有 → `reShowScreenshot()`（重发已有场景，
+     秒回，不 OCR）；贴回发起失败（页面已换）落回原 START 语义（`reShowScreenshot` 改返回 Boolean）；
+  2. dismiss 时 `viewMode = ORIGINAL`（视图状态跟真实画面走）；
+  3. `BrowserTranslateUiPolicy.resolve` 增 `canReshow` 参数：有可重看结果时开关不禁用；
+  - 单测：`BrowserTranslateUiPolicyTest` 增 `dismissedScreenshot_canReshowKeepsToggleUsable`。
+- **模拟器端到端**：截图翻译（`shot_ok mode=dom bubbles=5`）→ 点屏幕 → `shot_dismiss source=page_tap`
+  → 点球 → **`shot_reshow mode=dom bubbles=5`**（不是 session_start）→ 状态「已显示截图译文」✓。
+
+### 六、第 8 条：公开仓库清理
+
+- `git rm --cached`（本地保留）：`tpl-00003/00004.md`（AI 工具的设计系统模板转储，与工程无关）、
+  `.codex/*`（AI 协作日志）、`logs/regression-smoke-20260325-130302.txt`、
+  `logs/translator-logcat-20260325-130358.txt`（真机 logcat）；`.gitignore` 补 `/.codex/`、`/tpl-*.md`；
+- 排查过：跟踪文件里无真实密钥（HumanTODO 里的 `sk-aaa` 等是文档记录的**假**测试 key）；
+  `ci/release.keystore` 是刻意的固定签名（gitignore 注释说明公开无影响）；`image/导览/*.png`
+  是文档插图，保留；
+- ⚠️ **git 历史里仍能看到已移除的文件**（以及更早提交过的 `verify_*.png` 等 App 截图）——
+  要从历史里彻底抹掉需要 `git filter-repo` + force push，等用户拍板再做。
+
+### 七、验证汇总
+
+- 单测全绿：core-translate 176 / core-store 110 / app 258（新增 `ScriptProbePolicyTest` 9 条、
+  `TranslatePromptTest` 4 条、`ProfileApplyPolicyTest` 4 条、`HistoryBubbleInvalidateTest` 8 条（上轮写的）、
+  policy test 增 1 条）；JS 验收 223/223（渲染层未动）；`:app:assembleDebug` 通过，APK 已装
+  emulator-5556 并完成上表四象限 + 第 7 条端到端验证。
+
+### 未做 / 下一轮
+
+1. **翻译质量的效果对照要真机**：提示词对齐插件后的实际译文质量需要用户配真实 API 后对比
+   （模拟器上只有假 key）；跨气泡上下文（同页相邻句喂给模型）是下一步的候选，但要动句子缓存键。
+2. 语言提示的探测每 4 张图多付 1~2 次 Paddle 识别（模拟器实测单探针 ~1-2s）；真机如果觉得
+   翻页变慢，把 `PROBE_EVERY_N_RUNS` 调大或砍掉节奏兜底（怀疑判据仍保留）。
+3. ML Kit 引擎路径没有单独验证探测（本轮全用 Paddle）；ML Kit 没有按语种分词典的问题，
+   首遍判据 + 探测共用同一套逻辑。
+4. git 历史清理（filter-repo + force push）等用户决定。
+
 ## 45. 新功能 UI 按画布定稿落地 + 语言识别收敛为「只提示」（2026-10-14 深夜，§44 的后续）
 
 画布定稿（`浏览翻译弹层-终版v2` / `首页-完整版v2` / `语言提示-底栏规格`）落到代码。

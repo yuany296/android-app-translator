@@ -147,6 +147,7 @@ import com.manga.translator.store.BrowserUrlResolver
 import com.manga.translator.store.FavoriteAddResult
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.TranslateEngine
+import com.manga.translator.store.applyProfile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
@@ -1460,6 +1461,11 @@ fun EmbeddedBrowserScreen(
             mainHandler.post {
                 if (!hasRenderOnPage) return@post
                 hasRenderOnPage = false
+                // 视图状态跟着真实画面走（2026-10-15）：译文层被点掉后用户看到的就是原文，
+                // viewMode 停在「译文」会让 ⋮ 菜单的「译文」段处于已选中且不可点 —— 唯一的
+                // 回去路径看起来是死的（用户反馈「翻译层点不回来」）。拨回「原文」后
+                // 「译文」段可点 → showTranslations() → reShowScreenshot() 正常接手。
+                viewMode = BrowserViewMode.ORIGINAL
                 statusText = "已恢复原文 · 点球重看截图译文"
                 Log.d(TAG, "shot_dismiss source=page_tap")
             }
@@ -1697,15 +1703,18 @@ fun EmbeddedBrowserScreen(
      * 「原文→译文」贴回截图结果：按捕获时存的几何原样重发（不重跑 OCR/翻译）。
      * 页面换过（URL 不同，#fragment 忽略）→ 作废丢弃 —— 几何对新页面没有意义。
      *
+     * @return 是否真的发起了贴回（false = 没有可重看的结果 / 正忙 / 页面已换）。调用方
+     *   （悬浮球单击）据此决定要不要落回「开始翻译」的默认动作。
+     *
      * 声明在 [showTranslations] 之前：Kotlin 局部函数不能前向引用。
      */
-    fun reShowScreenshot() {
-        val render = screenshotRender ?: return
-        if (reShowBusy || running) return
+    fun reShowScreenshot(): Boolean {
+        val render = screenshotRender ?: return false
+        if (reShowBusy || running) return false
         if (webView.url?.substringBefore("#") != render.pageUrl.substringBefore("#")) {
             screenshotRender = null
             Log.d(TAG, "shot_reshow_drop reason=navigated")
-            return
+            return false
         }
         reShowBusy = true
         sessionScope.launch {
@@ -1757,6 +1766,7 @@ fun EmbeddedBrowserScreen(
                 reShowBusy = false
             }
         }
+        return true
     }
 
     /**
@@ -2119,7 +2129,8 @@ fun EmbeddedBrowserScreen(
         running = running,
         reShowBusy = reShowBusy,
         hasRender = hasRenderOnPage,
-        mode = viewMode
+        mode = viewMode,
+        canReshow = screenshotRender != null
     )
 
     /**
@@ -2127,8 +2138,15 @@ fun EmbeddedBrowserScreen(
      *
      * 与改造前的底栏主按钮同一套语义：运行中 → 停止（译文保留）；空闲 → 开始翻译。
      * [controls] 按当前状态给出这一下该做什么，两个入口永远说同样的话。
+     *
+     * 例外（2026-10-15，用户反馈「截图译文点一下恢复原文后就点不回来了」）：空闲且
+     * 有「已被点掉」的截图结果时，点球 = 状态行承诺的「重看截图译文」（重发已有场景，
+     * 秒回），不是再起一整轮扫描-识别-翻译。贴回发起失败（页面已换等）则照旧开始翻译。
      */
     fun onPrimaryAction() {
+        if (!running && !reShowBusy && screenshotRender != null && !hasRenderOnPage) {
+            if (reShowScreenshot()) return
+        }
         when (controls.primaryAction) {
             BrowserPrimaryAction.START -> startSession()
             BrowserPrimaryAction.STOP -> stopSession(
@@ -2498,10 +2516,13 @@ fun EmbeddedBrowserScreen(
      * 套用某个云端配置档案（与首页 `ProfileSheet` 同一套动作：套配置 + 记住这次的选择）。
      *
      * 档案自带 engine/provider/baseUrl/model/key，所以「选档案」这个动作本身就把引擎切到了云端。
+     * 2026-10-15：与首页同走 [applyProfile] —— 只搬档案自己的字段，**语言对 / OCR 引擎保留
+     * 用户当前值**（档案表单里根本没有语言项，整包替换会让语言跟着档案建时的快照乱跳，
+     * 用户反馈「换翻译配置会换掉源语言」）。
      */
     fun pickTranslateProfile(name: String) {
         settingsRepository.getProfile(name)?.let { profile ->
-            updateSettings { profile }
+            updateSettings { it.applyProfile(profile) }
         }
         settingsRepository.setLastTranslateProfileName(name)
         activeProfile = name

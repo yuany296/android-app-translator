@@ -53,17 +53,21 @@ object BrowserTranslateUiPolicy {
      * @param reShowBusy 是否正在跑「一次性贴回」会话（不翻译、只把已有译文层贴回）
      * @param hasRender 当前页面是否至少成功贴过一张译文
      * @param mode 当前视图
+     * @param canReshow 有「摘掉后可重看」的截图译文结果（2026-10-15：以前点一下恢复原文后
+     *   hasRender 归 false，开关被禁、点球又只会重开翻译 —— 用户反馈「翻译层点不回来」）
      */
     fun resolve(
         pageLoaded: Boolean,
         running: Boolean,
         reShowBusy: Boolean,
         hasRender: Boolean,
-        mode: BrowserViewMode
+        mode: BrowserViewMode,
+        canReshow: Boolean = false
     ): BrowserTranslateControls {
         // 分段开关只在「有东西可切」时可用：要么会话在跑（后续还会产出译文），
-        // 要么屏上/缓存里已经有译文层。否则点它必然是「没反应」，这就是改造前的第二个抱怨。
-        val toggleEnabled = !reShowBusy && (running || hasRender)
+        // 要么屏上/缓存里已经有译文层，要么有截图结果可重看。否则点它必然是「没反应」，
+        // 这就是改造前的第二个抱怨。
+        val toggleEnabled = !reShowBusy && (running || hasRender || canReshow)
         val disabledReason = when {
             reShowBusy -> "正在显示译文…"
             toggleEnabled -> null

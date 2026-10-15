@@ -534,29 +534,39 @@ class MainActivity : ComponentActivity() {
                                     },
                                     // 改译文（2026-10-15）：历史只是快照，真正决定「下次遇到这句用什么」
                                     // 的是句子缓存，所以两边一起改 —— 只动快照的话下次命中缓存还是旧的错译。
+                                    // 2026-10-15 补：改一条**已作废**的句子 = 让它重新生效（仓库里清
+                                    // `invalidated`），所以提示要明说，不能让用户以为改的是一条死条目。
                                     onEditTranslation = { entryId, bubbleIndex, newText ->
                                         scope.launch {
-                                            val changed = withContext(Dispatchers.IO) {
-                                                val ref = ServiceLocator.translationHistoryRepository
+                                            val ref = withContext(Dispatchers.IO) {
+                                                val updated = ServiceLocator.translationHistoryRepository
                                                     .updateBubbleTranslation(entryId, bubbleIndex, newText)
-                                                    ?: return@withContext false
+                                                    ?: return@withContext null
                                                 ServiceLocator.sentenceTranslationRepository.put(
-                                                    ref.sourceLanguage,
-                                                    ref.targetLanguage,
-                                                    ref.originalText,
+                                                    updated.sourceLanguage,
+                                                    updated.targetLanguage,
+                                                    updated.originalText,
                                                     newText
                                                 )
-                                                true
+                                                updated
                                             }
-                                            if (changed) {
+                                            if (ref != null) {
                                                 refreshHistory()
-                                                toast("已更新译文 · 以后遇到这句都用它")
+                                                toast(
+                                                    if (ref.wasInvalidated) {
+                                                        "已重新生效 · 以后遇到这句都用它"
+                                                    } else {
+                                                        "已更新译文 · 以后遇到这句都用它"
+                                                    }
+                                                )
                                             } else {
                                                 toast("这条记录已不存在")
                                             }
                                         }
                                     },
                                     // 作废单句：删掉这条缓存，下次遇到重新翻译（治「原文本身就被错拼」）。
+                                    // 2026-10-15：同时把历史里这句标成「已作废」并刷新列表 —— 以前只删缓存，
+                                    // 列表看上去一模一样，用户以为它还能用（用户反馈）。
                                     onInvalidateBubble = { entryId, bubbleIndex ->
                                         scope.launch {
                                             val removed = withContext(Dispatchers.IO) {
@@ -568,12 +578,17 @@ class MainActivity : ComponentActivity() {
                                                     ref.targetLanguage,
                                                     ref.originalText
                                                 )
+                                                // 标记与删缓存必须同一段落盘：只做一半会出现
+                                                // 「界面说作废了、缓存还在」或反过来。
+                                                ServiceLocator.translationHistoryRepository
+                                                    .markBubbleInvalidated(entryId, bubbleIndex)
                                             }
+                                            if (removed != null) refreshHistory()
                                             toast(
                                                 when (removed) {
                                                     null -> "这条记录已不存在"
                                                     true -> "已作废这句 · 下次遇到会重新翻译"
-                                                    false -> "这句本来就没进缓存"
+                                                    false -> "已标为作废 · 这句本来就没进缓存"
                                                 }
                                             )
                                         }
@@ -585,7 +600,7 @@ class MainActivity : ComponentActivity() {
                                                 val refs = ServiceLocator.translationHistoryRepository
                                                     .pageBubbleRefs(entryId)
                                                     ?: return@withContext -1
-                                                ServiceLocator.sentenceTranslationRepository.remove(
+                                                val count = ServiceLocator.sentenceTranslationRepository.remove(
                                                     refs.map {
                                                         SentenceCacheKey(
                                                             it.sourceLanguage,
@@ -594,12 +609,16 @@ class MainActivity : ComponentActivity() {
                                                         )
                                                     }
                                                 )
+                                                ServiceLocator.translationHistoryRepository
+                                                    .markAllInvalidated(entryId)
+                                                count
                                             }
+                                            if (removed != -1) refreshHistory()
                                             toast(
                                                 when {
                                                     removed < 0 -> "这条记录已不存在"
                                                     removed > 0 -> "已作废本页 $removed 句 · 下次重新翻译"
-                                                    else -> "本页没有可作废的缓存"
+                                                    else -> "已标为作废 · 本页没有可作废的缓存"
                                                 }
                                             )
                                         }

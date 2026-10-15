@@ -19,8 +19,9 @@ class BrowserTranslateUiPolicyTest {
         running: Boolean = false,
         reShowBusy: Boolean = false,
         hasRender: Boolean = false,
-        mode: BrowserViewMode = BrowserViewMode.TRANSLATED
-    ) = BrowserTranslateUiPolicy.resolve(pageLoaded, running, reShowBusy, hasRender, mode)
+        mode: BrowserViewMode = BrowserViewMode.TRANSLATED,
+        canReshow: Boolean = false
+    ) = BrowserTranslateUiPolicy.resolve(pageLoaded, running, reShowBusy, hasRender, mode, canReshow)
 
     @Test
     fun freshPage_toggleDisabledWithReasonAndPrimaryStart() {
@@ -79,6 +80,18 @@ class BrowserTranslateUiPolicyTest {
         assertTrue(c.modeToggleEnabled)
         assertEquals("翻译", c.primaryLabel)
         assertTrue(c.primaryEnabled)
+    }
+
+    /**
+     * 截图译文被「点一下恢复原文」摘掉后（hasRender 归 false，但结果还能重看）：
+     * 开关必须仍可用 —— 2026-10-15 用户反馈「翻译层点不回来」的另一半根因是这里禁了开关。
+     */
+    @Test
+    fun dismissedScreenshot_canReshowKeepsToggleUsable() {
+        val c = controls(hasRender = false, mode = BrowserViewMode.ORIGINAL, canReshow = true)
+        assertTrue(c.modeToggleEnabled)
+        assertNull(c.modeToggleDisabledReason)
+        assertEquals("翻译", c.primaryLabel)
     }
 
     /**

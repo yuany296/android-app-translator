@@ -1,5 +1,6 @@
 package com.manga.translator.app
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -77,10 +78,19 @@ import com.manga.translator.store.AppSettings
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.OcrSpeedMode
 import com.manga.translator.store.TranslateEngine
+import com.manga.translator.store.applyProfile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/**
+ * 配置档案相关日志的统一 Tag（2026-10-15）。
+ *
+ * 首页换档案以前没有日志，用户报「换配置会换掉源语言」时没法从 logcat 回溯到底哪次点击改的，
+ * 只能靠读代码推。现在四个套用点都打一行 `profile_apply`。
+ */
+private const val TAG_PROFILE = "Settings"
 
 /** ML Kit 本地翻译模型下载状态（决定首页状态行的文案与入口）。 */
 sealed interface MlKitDownloadState {
@@ -335,7 +345,17 @@ fun LauncherScreen(
                     repo.setLastOcrProfileName(name)
                     visionProfile = name
                 } else {
-                    repo.getProfile(name)?.let { onSettingsChange(it) }
+                    // 套档案只搬「档案自己的」字段（凭据 / 模型 / 思考），语言对与 OCR 选择保留
+                    // 用户当前值 —— 2026-10-15 用户反馈「换翻译配置会换掉源语言，希望不要换掉」。
+                    repo.getProfile(name)?.let { profile ->
+                        val next = settings.applyProfile(profile)
+                        Log.d(
+                            TAG_PROFILE,
+                            "profile_apply name=$name keepLang=${next.sourceLanguage}->${next.targetLanguage} " +
+                                "engine=${next.translateEngine}"
+                        )
+                        onSettingsChange(next)
+                    }
                     repo.setLastTranslateProfileName(name)
                     selectedProfile = name
                 }

@@ -168,6 +168,7 @@ class OpenAiVisionClient(
         model: String,
         apiKey: String,
         texts: List<String>,
+        sourceLanguageId: String,
         targetLanguageId: String,
         enableThinking: Boolean,
         thinkingBudget: Int,
@@ -195,7 +196,14 @@ class OpenAiVisionClient(
         val exhausted = BooleanArray(texts.size)
 
         fun requestChunk(chunk: List<String>, jsonFormat: Boolean): ApiResult {
-            val prompt = buildTranslatePrompt(chunk.size, targetLanguageId, glossary)
+            // 提示词按「本批实际内容」拼：术语表只注入这批真正出现的词条（2026-10-15），
+            // 整表照抄会把指令稀释掉（用户反馈「插件效果更好」，其一是这一条）。
+            val prompt = buildTranslatePrompt(
+                texts = chunk,
+                sourceLanguageId = sourceLanguageId,
+                targetLanguageId = targetLanguageId,
+                glossary = glossary
+            )
             val inputArray = JSONArray().apply { chunk.forEach { put(it) } }
             return requestWithFallback(
                 endpoint = endpoint,
@@ -207,6 +215,7 @@ class OpenAiVisionClient(
             ) { useJsonFormat, thinking ->
                 buildTextTranslateBody(
                     model = model,
+                    systemPrompt = buildTranslateSystemPrompt(sourceLanguageId, targetLanguageId),
                     prompt = prompt,
                     inputTextsJson = inputArray.toString(),
                     useJsonResponseFormat = useJsonFormat,
@@ -346,6 +355,7 @@ class OpenAiVisionClient(
         ) { useJsonFormat, thinking ->
             buildTextTranslateBody(
                 model = model,
+                systemPrompt = "You are a text grouping engine. Return JSON only.",
                 prompt = prompt,
                 inputTextsJson = "[]",
                 useJsonResponseFormat = useJsonFormat,
@@ -1165,6 +1175,7 @@ return parseGroups(result.raw, blocks)
 
     private fun buildTextTranslateBody(
         model: String,
+        systemPrompt: String,
         prompt: String,
         inputTextsJson: String,
         useJsonResponseFormat: Boolean,
@@ -1182,7 +1193,7 @@ return parseGroups(result.raw, blocks)
                     .put(
                         JSONObject()
                             .put("role", "system")
-                            .put("content", "You are a text translation engine. Return JSON only.")
+                            .put("content", systemPrompt)
                     )
                     .put(
                         JSONObject()
@@ -1636,26 +1647,68 @@ return parseGroups(result.raw, blocks)
         return lines.joinToString("\n")
     }
 
-    private fun buildTranslatePrompt(count: Int, targetLanguageId: String, glossary: List<Pair<String, String>> = emptyList()): String {
-        val targetName = when (targetLanguageId.lowercase()) {
-            "zh-cn", "zh" -> "Simplified Chinese"
-            "zh-tw" -> "Traditional Chinese"
-            "en" -> "English"
-            "ko" -> "Korean"
-            "ja" -> "Japanese"
-            else -> "Simplified Chinese"
-        }
+    /**
+     * 文本翻译的 system 角色（对齐参考项目 translation-provider.js：manga dialogue translator +
+     * 源/目标语言声明 + 只回 JSON）。以前只有一句通用的 "text translation engine"，模型不知道
+     * 在译漫画台词、也不知道源语言是什么 —— 用户反馈「插件效果比手机好」后对齐插件的两条主干。
+     */
+    internal fun buildTranslateSystemPrompt(sourceLanguageId: String, targetLanguageId: String): String {
+        val sourceName = languageDisplayName(sourceLanguageId)
+        val targetName = languageDisplayName(targetLanguageId)
+        return "You are a manga dialogue translator. Translate from $sourceName to $targetName. " +
+            "Return JSON only and keep the same number of items as the input."
+    }
+
+    /**
+     * 文本翻译的用户提示词（2026-10-15 对齐参考项目后的重写）。
+     *
+     * 与旧版（一句 Translate each input text + 全量术语表）的差别：
+     * 1. **质量规则**来自参考项目 webpage 提示词里同样适用于台词的几条 —— 不增删信息、
+     *    保留引号、专有名词必须译/音译（不许原文语言残留在译文里）、语气口语化；
+     * 2. **术语表按批过滤**：只注入这批文本里真正出现的词条。整表照抄时几十条映射
+     *    会稀释掉格式指令（拆批后每批都带全表，指令占比更低），是「插件更好」的另一条；
+     * 3. 源语言写进 system（见 [buildTranslateSystemPrompt]），这里不再重复。
+     */
+    internal fun buildTranslatePrompt(
+        texts: List<String>,
+        sourceLanguageId: String,
+        targetLanguageId: String,
+        glossary: List<Pair<String, String>> = emptyList()
+    ): String {
+        val targetName = languageDisplayName(targetLanguageId)
         val lines = mutableListOf(
-            "Translate each input text into $targetName.",
+            "Translate each input text into $targetName. They are dialogue or narration from a comic page.",
+            "Keep the original meaning; do not add information not present in the source and do not omit content.",
             "Keep order strictly the same as input index.",
             "Return JSON only with schema: {\"translations\":[\"t0\",\"t1\", ...]}",
-            "The translations array length must equal input length = $count.",
+            "The translations array length must equal input length = ${texts.size}.",
+            "Write natural spoken $targetName that matches the tone of the source " +
+                "(casual speech stays casual, exclamations stay exclamations).",
+            "Preserve quotation marks as in the source; a quoted phrase must stay quoted.",
+            "Proper nouns (character names, places, brands) must be translated or transliterated " +
+                "into $targetName, never left in the source script.",
+            "Onomatopoeia should be translated or transliterated naturally, not dropped.",
             "Do not include explanations."
         )
-        if (glossary.isNotEmpty()) {
-            buildGlossaryLine(glossary)?.let { lines += it }
+        val relevant = glossary.filter { (source, target) ->
+            val s = source.trim()
+            val t = target.trim()
+            s.isNotEmpty() && t.isNotEmpty() && texts.any { it.contains(s, ignoreCase = true) }
+        }
+        if (relevant.isNotEmpty()) {
+            buildGlossaryLine(relevant)?.let { lines += it }
         }
         return lines.joinToString("\n")
+    }
+
+    /** 语言 id 的英文名（提示词里用；与 AppLanguage 无依赖，core-translate 内自持一份）。 */
+    internal fun languageDisplayName(languageId: String): String = when (languageId.lowercase()) {
+        "zh-cn", "zh" -> "Simplified Chinese"
+        "zh-tw" -> "Traditional Chinese"
+        "en" -> "English"
+        "ko" -> "Korean"
+        "ja" -> "Japanese"
+        else -> "Simplified Chinese"
     }
 
     internal fun buildGlossaryLine(glossary: List<Pair<String, String>>): String? {
