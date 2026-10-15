@@ -460,6 +460,47 @@ const FIXTURES = [
     },
   },
   {
+    name: "long_chapter",
+    adapter: "kakao_page",
+    title: "长章节：120 切（旧版 80 上限会让第 81 切之后永远拿不到 id、进不了列表）",
+    html: `<!doctype html><meta charset="utf-8"><title>long_chapter</title>
+<style>body { margin: 0; } .cut img { display: block; width: 700px; height: 1000px; }</style>
+<div id="viewer"></div>
+<script>
+  // 每切用 canvas 现画一张（颜色/文字随序号变化 → data URL 各不相同）：
+  // 真实章节的每一张图都是独立资源；若共用同一张图，会话侧会按 src 去重，测不出截断。
+  var viewer = document.getElementById("viewer");
+  for (var i = 0; i < 120; i++) {
+    var cut = document.createElement("div");
+    cut.className = "cut";
+    cut.setAttribute("data-scroll-index", String(i));
+    cut.setAttribute("data-cut-index", String(i));
+    var img = document.createElement("img");
+    img.id = "cut" + i;
+    img.alt = "cut " + i;
+    var c = document.createElement("canvas");
+    c.width = 700; c.height = 1000;
+    var g = c.getContext("2d");
+    g.fillStyle = "hsl(" + ((i * 3) % 360) + ", 40%, 50%)";
+    g.fillRect(0, 0, 700, 1000);
+    g.fillStyle = "#ffffff";
+    g.font = "900 120px sans-serif";
+    g.fillText("CUT " + i, 60, 520);
+    img.src = c.toDataURL("image/png");
+    cut.appendChild(img);
+    viewer.appendChild(cut);
+  }
+</script>`,
+    expect(result) {
+      const ids = result.items.map((i) => i.elId || i.id);
+      check("long: 120 切全部进列表（旧版 80 上限会砍到 80，第 81 切之后永远不翻）", result.items.length === 120, result.items.length);
+      check("long: 最后一切 cut119 也在（列表尾部不被截断）", ids.includes("cut119"), ids.slice(-3));
+      check("long: truncated 标志为 false（未触发安全阀）", result.truncated === false, result.truncated);
+      check("long: 每项都拿到 data-mt-id（mt 前缀顺序编号）", result.items.every((i) => /^mt\d+$/.test(i.id)), result.items.slice(0, 3).map((i) => i.id));
+      check("long: 显式命中数 ≥ 120（Kakao 适配器逐切命中）", result.explicit >= 120, result.explicit);
+    },
+  },
+  {
     name: "lezhin_like",
     adapter: "lezhin",
     title: "Lezhin 形态：window 滚动 + 图片走 data-src",

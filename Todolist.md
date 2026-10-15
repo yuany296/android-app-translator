@@ -1,5 +1,51 @@
 # Todolist
 
+## 48. 用户 2026-10-15 追加：Kakao「从中间打开但从头翻 / 看一半突然停了」——深层根因是扫描脚本 80 张硬上限（2026-10-15）
+
+用户在真机（新包已装）复测 §47 那两条后仍报：打开一话停在中间位置，翻译却像从开头开始；
+从头看，到某个位置翻译就停了。真机取证（用户手机 CDP 读 DOM）钉死根因：
+
+1. **`BrowserScanScript` 的 `limit = 80` 是静默硬截断**：用户那一话有 **174 切**，
+   扫描每轮只把前 80 张发进列表、前 80 张才拿到 `data-mt-id` —— 第 81 切起
+    **永远进不了会话**（不下载、不 OCR、不翻）。这就是「看到某个位置突然停了」。
+2. 同一根因解释「从中间打开但从头翻」：用户停在 80 切之后时，扫描列表里根本没有眼前
+   那几张 → §47 的「阅读位置优先」无锚可对（`indexOfFirst` 找不到 → 退回文档序），
+   只能从第 1 张开始翻。
+
+### 一、修复
+
+- `BrowserScanScript`：`limit` 80 → **600（安全阀）**；payload 增 `truncated` / `candidates`
+  （命中安全阀不再是静默的）。
+- `EmbeddedBrowserScreen`：`ScanResult.truncated` → `scan … capped=` 字段 + 首次命中
+  `scan_capped` 警告日志；`MAX_RENDERED_SCENES` 80 → 600（场景缓存与接缝缓存共用，
+  长章节从 81 切起不再淘汰「最早那批」）；**新增 `renderedSrcs`**（已产出过结果的 src 集合，
+  不随场景缓存淘汰）—— 否则长章节翻完后最早的图会被缓存淘汰打回「待翻译」，会话无限重翻。
+- `scripts/scan-script-verify.mjs`：新增 `long_chapter` 夹具（120 切，真实 Chrome）——
+  全部进列表、尾部 cut119 不丢、`truncated=false`。
+- `BrowserScanScriptTest`：新增 1 条结构性测试（limit ≥ 500 且带 `truncated`，防退回静默截断）。
+- `scripts/cdp-eval.mjs`：支持 `@file` 表达式入参（Windows PowerShell 5.1 会吞掉内层引号，
+  复杂表达式只能走文件；真机取证全靠它）。
+
+### 二、验证（全部绿）
+
+- 单测：`:app:testDebugUnitTest` 265（+1）；全模块 **638 通过 / 0 失败**
+  （app 265 / core-translate 165 / core-store 113 / core-overlay 60 / core-capture 35）。
+- `node scripts/scan-script-verify.mjs`：**39 通过 / 0 失败**（真实 Chrome，含新 120 切夹具；
+  修复前该夹具在 80 张处截断，必然红）。
+- `node app/src/test/js/mt-overlay-acceptance.test.js`：**ALL_OK 223/223**。
+- 模拟器端到端（emulator-5556，`.verify/web/kakao-long.html` 100 切，`?cut=70` 打开后点球）：
+  `scan pending=100 scanned=100 anchor=256 first_vy=219 capped=false`（从眼前第 70 切开始）→
+  `scene_ok done=100`、状态「已显示 100 张 · 监听新图中…」、30s 无重翻；CDP 确认 100 张全部有
+  场景根（`mt71..mt100` 也在）。修复前同场景 `scanned=80` 且从第 1 切开始。
+- 真机（AN3GUT4A22006400）新包已装；真机 Kakao 复测见 HumanTODO 第十一轮。
+
+### 未做 / 下一轮
+
+1. **安全阀 600 与 idle 轮询体积**：600 张的扫描 JSON 约 200KB+，会话空闲时每 1.2s 解析一次。
+   真实章节 ≤ 300 切没问题；若将来遇到超大页面再考虑「扫描带本轮已处理集合、回包只发增量」。
+2. 页面上有 600+ 符合尺寸的图时（极端画廊/无限流页）仍会截断 —— 有 `scan_capped` 日志可查。
+3. 场景缓存 600 的 DOM 开销（600 个 root 的逐帧同步）未专门量；真机遇到滚动掉帧再说。
+
 ## 47. 用户 2026-10-15 两条：移除语言提示（误报） / Kakao「从头开始翻 + 中途停下」（2026-10-15）
 
 ### 一、第 1 条：「语言可能选错了」提示整个移除（用户裁定）

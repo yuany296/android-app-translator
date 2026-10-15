@@ -5,6 +5,8 @@
  * 用法：
  *   adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
  *   node scripts/cdp-eval.mjs "Js 表达式"          # 表达式可 async（自动 awaitPromise）
+ *   node scripts/cdp-eval.mjs "@expr.js"           # 表达式从文件读（Windows PowerShell 会
+ *                                                  # 在传参时剥掉内层引号，复杂表达式走文件）
  *
  * 为什么存在：渲染层排障要读 `MtOverlay._overlays` 里的真实几何
  * （排版框 vs 盖板框 vs 实际字号），logcat 只有中间量，DOM 里才是最终事实。
@@ -14,9 +16,10 @@ import fs from "node:fs";
 const port = process.env.CDP_PORT || "9222";
 const expr = process.argv[2];
 if (!expr) {
-  console.error("usage: node scripts/cdp-eval.mjs '<js expression>'");
+  console.error("usage: node scripts/cdp-eval.mjs '<js expression>' | '@expr.js'");
   process.exit(2);
 }
+const evalSource = expr.startsWith("@") ? fs.readFileSync(expr.slice(1), "utf8") : expr;
 
 const targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json();
 const page = targets.find((t) => t.type === "page") || targets[0];
@@ -56,7 +59,7 @@ await new Promise((resolve, reject) => {
 });
 
 const result = await send("Runtime.evaluate", {
-  expression: expr,
+  expression: evalSource,
   awaitPromise: true,
   returnByValue: true,
 });

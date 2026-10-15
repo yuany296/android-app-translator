@@ -224,6 +224,19 @@ class BrowserScanScriptTest {
     }
 
     @Test
+    fun scanScriptLimitIsSafetyValveNotScheduler() {
+        val js = BrowserScanScript.SCAN_JS
+        // 旧版 `limit = 80` 在 174 切的长章节上把第 81 切之后**静默**截掉了：那些图
+        // 拿不到 data-mt-id、永远进不了会话列表 —— 用户看到的现象是「翻到一半突然不翻了」
+        // （Kakao 真机 2026-10-15）。上限只能当安全阀，必须远高于真实章节长度。
+        val match = Regex("var limit = (\\d+)").find(js)
+        requireNotNull(match) { "扫描脚本应保留 limit 定义（安全阀）" }
+        val limit = match.groupValues[1].toInt()
+        assertTrue("limit 至少 500（真实长章节 200+ 切是常态）：实际 $limit", limit >= 500)
+        assertTrue("命中安全阀时必须带 truncated 标记（不再静默截断）", js.contains("truncated"))
+    }
+
+    @Test
     fun extractorScriptIsIdempotentAndReportsTaint() {
         val js = BrowserScanScript.EXTRACTOR_JS
         assertTrue(js.contains("if (window.__mtExtract) return 1;"))

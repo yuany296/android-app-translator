@@ -367,7 +367,16 @@ private data class ScanResult(
     val frameCount: Int = 0,
     val adapterId: String = "",
     /** 顶层视口高度（CSS px，扫描脚本给）；<=0 时「阅读位置优先」退化为文档序。 */
-    val viewportHeight: Int = 0
+    val viewportHeight: Int = 0,
+    /**
+     * 候选被扫描脚本的安全阀截断（2026-10-15）。
+     *
+     * 触发时说明页面上**还有**符合尺寸的图没进列表 —— 它们不会被翻译（旧版 80 上限
+     * 在 Kakao 174 切章上就是这个症状：翻到第 81 切突然停了）。阀值 600 对真实章节
+     * 绰绰有余，所以这个标记正常应恒为 false；一旦为真，会话会打 `scan_capped` 警告，
+     * 把「为什么后面还有图没翻」的线索直接留在日志里。
+     */
+    val truncated: Boolean = false
 ) {
     val isEmpty: Boolean get() = images.isEmpty()
 }
@@ -927,7 +936,8 @@ private fun parseScannedImages(raw: String?): ScanResult {
                 explicitHits = meta.optInt("explicit", 0),
                 frameCount = meta.optInt("frames", 0),
                 adapterId = meta.optString("cfg"),
-                viewportHeight = meta.optInt("vh", 0)
+                viewportHeight = meta.optInt("vh", 0),
+                truncated = meta.optBoolean("truncated", false)
             )
         } else {
             ScanResult(images)
@@ -1019,8 +1029,15 @@ private const val MAX_ATTEMPTS_PER_IMAGE = 5
  */
 private const val NEXT_PAGE_WAIT_ROUNDS = 6
 
-/** 已渲染场景缓存上限（每个场景几 KB，防长章节无限增长；整图 PNG 由内存仓 96MB 上限管着）。 */
-private const val MAX_RENDERED_SCENES = 80
+/**
+ * 已渲染场景缓存上限（每个场景几 KB，防长章节无限增长；整图 PNG 由内存仓 96MB 上限管着）。
+ *
+ * 2026-10-15 由 80 提到 600：扫描安全阀提到 600 后，一对 174 切的长章节（Kakao 实测）
+ * 也整章进列表 —— 80 的上限会让最早 94 张的场景在翻到后面时被淘汰，
+ * 「原文/译文」切回来时那段译文贴不回去（接缝带一起被淘汰还会露出两半）。600 覆盖
+ * 真实章节；极端页面被淘汰时**不会**触发重翻（「已产出过结果」由 `renderedSrcs` 单独记）。
+ */
+private const val MAX_RENDERED_SCENES = 600
 
 /** 同内容去重缓存上限（2026-10-11）：长会话防内存增长，LRU 淘汰最早的。 */
 private const val CONTENT_SCENE_CACHE_MAX = 12
@@ -1181,6 +1198,11 @@ fun EmbeddedBrowserScreen(
     val renderedTokens = remember { HashMap<String, String>() }
     // 覆盖层渲染：src → 已渲染场景（「原文/翻译」秒回贴回用，不重跑 OCR/翻译）。
     val renderedScenes = remember { LinkedHashMap<String, BrowserSceneBuilder.Scene>() }
+    // 「已产出过结果」的图（src）—— **不随场景缓存淘汰**（2026-10-15）。
+    // 为什么单独记一份：`renderedScenes` 有容量上限，长章节里最早的条目会被淘汰；
+    // 而 `isPending` 若只看缓存有没有，被淘汰的图会重新变回「待翻译」—— 会话把
+    // 全章翻完后又会去重翻最早的几十张（翻一批、淘汰一批，永远转不完）。
+    val renderedSrcs = remember { HashSet<String>() }
     // 渲染层 JS 是否已注入当前页面（页面跳转后要重新注入）。
     var rendererInjected by remember { mutableStateOf(false) }
     // 视图模式（2026-10-02 用户反馈「原文/翻译两个按钮功能不统一」后拆分）：
@@ -1456,6 +1478,7 @@ fun EmbeddedBrowserScreen(
         removeOverlayNodes()
         renderedTokens.clear()
         renderedScenes.clear()
+        renderedSrcs.clear()
         seamBySrc.clear()
         placedIds.clear()
         // 截图结果同理：它是旧设置（覆盖层渲染开关决定画法）下产出的。
@@ -1531,6 +1554,7 @@ fun EmbeddedBrowserScreen(
             runCatching { CookieManager.getInstance().flush() }
             renderedTokens.clear()
             renderedScenes.clear()
+            renderedSrcs.clear()
             seamBySrc.clear()
             placedIds.clear()
             BrowserOverlayImageStore.clear()
@@ -1663,6 +1687,7 @@ fun EmbeddedBrowserScreen(
                 userAgent = webView.settings.userAgentString,
                 renderedTokens = renderedTokens,
                 renderedScenes = renderedScenes,
+                renderedSrcs = renderedSrcs,
                 placedIds = placedIds,
                 seamBySrc = seamBySrc,
                 useDomOverlay = domOverlay,
@@ -2694,6 +2719,15 @@ private suspend fun runTranslationSession(
     userAgent: String?,
     renderedTokens: HashMap<String, String>,
     renderedScenes: LinkedHashMap<String, BrowserSceneBuilder.Scene>,
+    /**
+     * 「已产出过结果」的图（src），**不随场景缓存淘汰**。
+     *
+     * 为什么与 [renderedScenes] 分开：场景缓存按 [MAX_RENDERED_SCENES] 淘汰，
+     * 淘汰后 `renderedScenes[src]` 查不到 —— 若 `isPending` 只看缓存，长章节里
+     * 最早那批图会重新变回「待翻译」，会话整章翻完后回头再翻一遍（永远转不完，
+     * 2026-10-15 随之开放的 174 切长章节实测风险）。
+     */
+    renderedSrcs: HashSet<String>,
     placedIds: HashSet<String>,
     seamBySrc: LinkedHashMap<String, PendingSeam>,
     useDomOverlay: Boolean,
@@ -2733,6 +2767,8 @@ private suspend fun runTranslationSession(
     var incomingCross: List<CrossBubblePart> = emptyList()
     /** 已打过 `band_pair` 诊断的「图 + 结论」组合（见下面的去重注释）。 */
     val loggedBandPairs = HashSet<String>()
+    /** `scan_capped` 警告是否已打过（截断发生时每轮都打会刷屏，只留第一条）。 */
+    var cappedWarned = false
     // 接缝覆盖层上屏后要摘掉的「半块」：imageId → 气泡层 id。
     // 摘的时机必须是「那张图的场景已经上屏之后」，否则摘了个不存在的节点。
     // 会话内事务性使用（登记 → 上屏后消费），所以留在会话局部；
@@ -3091,6 +3127,10 @@ private suspend fun runTranslationSession(
         // 已经确认「处理过但没产出译文」的图不再当待处理：否则每轮扫描都会重跑一遍 OCR，
         // 既浪费又占主线程（RIDI 实测里那些反复出现的 image_no_text / image_no_bubbles）。
         if (processedWithoutResult.contains(image.src)) return false
+        // 「已产出过结果」的图同样不算待处理 —— 判据用**不受场景缓存淘汰**的集合
+        // （2026-10-15 长章节修复）：只看 renderedScenes/renderedTokens 的话，
+        // 缓存淘汰会把老图打回「待翻译」，会话永远在重翻最早的几十张。
+        if (renderedSrcs.contains(image.src)) return false
         return renderedTokens[image.src] == null && renderedScenes[image.src] == null &&
             (attempts[image.attemptKey()] ?: 0) < MAX_ATTEMPTS_PER_IMAGE
     }
@@ -3190,8 +3230,20 @@ private suspend fun runTranslationSession(
                     "hosted=${images.count { it.hostId.isNotBlank() }} " +
                     "anchor=${(scan.viewportHeight * VIEWPORT_ANCHOR_RATIO).toInt()} " +
                     "first_vy=${orderedImages.firstOrNull()?.viewportTop ?: -1} " +
+                    "capped=${scan.truncated} " +
                     "done=$doneCount shown=${placedIds.size}"
             )
+            // 安全阀截断（旧版 80 上限的教训：静默截断 = 用户看到「翻到一半不翻了」）。
+            // 正常恒不触发；一旦触发，这条日志是「后面还有图没翻」的唯一线索。
+            if (scan.truncated && !cappedWarned) {
+                cappedWarned = true
+                Log.w(
+                    TAG,
+                    "scan_capped scanned=${images.size} pending=$pendingTotal " +
+                        "adapter=${scan.adapterId} —— 候选超过扫描上限，" +
+                        "列表之外的图不会被翻译（见 BrowserScanScript 的 limit 注释）"
+                )
+            }
 
             var batchIndex = 0
             for (image in orderedImages) {
@@ -3643,6 +3695,7 @@ private suspend fun runTranslationSession(
                         // 「原文」视图：只记结果，不上屏。会话照常往下翻译（用户选定的模型），
                         // 切回「译文」时下一轮 needsReShow 会把这一批一起贴回。
                         if (!canPlace()) {
+                            renderedSrcs += image.src
                             Log.d(
                                 TAG,
                                 "scene_cached_hidden bubbles=${scene.bubbles.size} done=$doneCount"
@@ -3651,6 +3704,7 @@ private suspend fun runTranslationSession(
                             val result = dispatchScene(image.id, scene)
                             val ok = result != null && result.optBoolean("ok")
                             if (ok) {
+                                renderedSrcs += image.src
                                 placedIds += image.id
                                 onRendered()
                                 Log.d(
@@ -3683,6 +3737,7 @@ private suspend fun runTranslationSession(
                         val overlayToken = "t${System.nanoTime()}"
                         BrowserOverlayImageStore.put(overlayToken, png)
                         renderedTokens[image.src] = overlayToken
+                        renderedSrcs += image.src
                         if (canPlace()) {
                             placedIds += image.id
                             webView.evaluateJavascript(placeOverlayJs(image, overlayToken), null)

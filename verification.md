@@ -2278,3 +2278,51 @@ GPU 层也在内，不需要系统权限）；失败自动回退「临时切软�
 - 未在真机复测（本次为模拟器 + 真实历史数据）。
 - 历史列表里的「原文」是当时 OCR 的结果；「原文本身就被错拼」的条目目前只靠用户自己看出来，
   界面上没有自动标记（见 HumanTODO）。
+
+## 2026-10-15（第二轮）Kakao「翻到一半突然不翻了」的深层根因：扫描脚本 80 张硬上限（Todolist §48）
+
+### 1. 真机取证（用户手机 AN3GUT4A22006400，正在读的一话）
+
+用 CDP（`adb forward` + `scripts/cdp-eval.mjs`，本轮给该脚本加了 `@file` 入参绕开
+PowerShell 5.1 吞引号的问题）读页面真实状态：
+
+```
+imgCount=230（其中 174 张是 370×486 / 760×1000 的漫画切图）
+带 data-mt-id 的只有前 80 张（mt1..mt80）；第 81 张起（94 张）永远没有 id
+```
+
+扫到第 80 张就停 —— 会话列表里根本没有后面的切图（`BrowserScanScript` 的 `limit = 80`）。
+这同时解释用户的另一句「我在中间看，它从开头翻」：阅读位置在 80 切之后时，扫描列表里
+没有眼前那几张 → 「阅读位置优先」无锚可对，只能从第 1 张开始。
+
+### 2. 修复
+
+| 位置 | 改动 |
+|---|---|
+| `BrowserScanScript.kt` | `limit` 80 → 600（安全阀）；payload 增加 `truncated` / `candidates` |
+| `EmbeddedBrowserScreen.kt` | `ScanResult.truncated` → `scan … capped=` + 首次命中打 `scan_capped` 警告；`MAX_RENDERED_SCENES` 80 → 600（场景/接缝缓存）；新增 `renderedSrcs`（「已产出过结果」不随缓存淘汰，防长章节翻完后再重翻最早的几十张） |
+| `scripts/scan-script-verify.mjs` | 新增 `long_chapter` 夹具（120 切）：全部进列表、`truncated=false`、尾部 cut119 不丢 |
+| `BrowserScanScriptTest.kt` | 新增 1 条：limit ≥ 500 且带 `truncated` 标记（防退回静默截断） |
+
+### 3. 验证
+
+```
+:app:testDebugUnitTest             265 通过 / 0 失败（新增 BrowserScanScriptTest 1 条）
+全模块 testDebugUnitTest           638 通过 / 0 失败（app 265 / core-translate 165 / core-store 113 / core-overlay 60 / core-capture 35）
+node scripts/scan-script-verify.mjs  39 通过 / 0 失败（真实 Chrome，含新 long_chapter 120 切夹具）
+node app/src/test/js/mt-overlay-acceptance.test.js  ALL_OK 223/223
+```
+
+模拟器端到端（emulator-5556，新夹具 `.verify/web/kakao-long.html`，100 切 + `?cut=70` 打开）：
+
+```
+session_start token=1 mode=TRANSLATE …
+scan pending=100 reshow=0 scanned=100 … anchor=256 first_vy=219 capped=false   ← 从眼前第 70 切开始（旧版这里 scanned=80 且从第 1 切开始）
+scene_ok … done=100（status「已显示 100 张 · 监听新图中…」，随后 30s 无重翻）      ← 旧版翻到第 80 切就停
+CDP：100 张 dst 图全部有 __mt_scene_root（mt71..mt100 也在，旧版不可能存在）
+```
+
+已知夹具噪声：本夹具用 canvas 现画韩文，模拟器 OCR（本地 ML Kit 链路）读出的是乱码
+（`E人L LＲ`），译文质量不作数 —— 本轮的验收点是「扫描/调度/不中断」，不是 OCR 质量。
+
+真机（AN3GUT4A22006400）已装新包，等用户复测（HumanTODO 第十一轮）。

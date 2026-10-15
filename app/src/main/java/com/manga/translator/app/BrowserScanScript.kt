@@ -114,6 +114,8 @@ object BrowserScanScript {
      *   用它把 `<img>` 插进同一个宿主，从而与图片共享滚动上下文。
      * - `frame` —— iframe 序号，0 = 顶层文档；`frameX/frameY` 是 iframe 元素在
      *   **顶层**文档里的视口偏移，仅用于诊断。
+     * - 顶层另有 `vh`（视口高度）与 `truncated` / `candidates`（是否/多少候选被
+     *   安全阀截断 —— 真章节远低于阀值，截断只该出现在极端页面，见脚本内 `limit` 注释）。
      */
     val SCAN_JS: String = """
 (function () {
@@ -496,7 +498,15 @@ object BrowserScanScript {
     for (var i = 0; i < generic.length; i++) push(generic[i], false);
 
     var out = [];
-    var limit = 80;
+    // 上限只是**安全阀**，不是调度手段（2026-10-15）。
+    //
+    // 教训：这里是 `limit = 80` 时，一条 174 切的长章节里第 81 切之后**永远**拿不到
+    // `data-mt-id`、也永远进不了会话的处理列表 —— 用户看到的现象就是「翻到一半突然
+    // 不翻了」（Kakao 真机 174 切，只翻了前 80 切；而且因为他正读的位置在 80 切之后，
+    // 扫描列表里根本没有他眼前那几张 → 「阅读位置优先」也无锚可对，只能从头翻）。
+    // 真实站点长章节 200+ 切是常态，阀值必须远高于它。
+    // 命中阀值时 payload 带 `truncated:true`，Kotlin 侧会打 `scan_capped` 警告日志。
+    var limit = 600;
     // 收窄之后的元素去重：容器命中和内部 <img> 命中会指向同一张图，
     // 不去重就会把它翻两遍（浪费一次下载 + 一次 OCR，还会画两层译文）。
     var seenTargets = [];
@@ -626,7 +636,7 @@ object BrowserScanScript {
         }
       }
     }
-    return { items: out, explicitHits: explicitHits };
+    return { items: out, explicitHits: explicitHits, truncated: out.length >= limit && found.length > limit, candidates: found.length };
   }
 
   function frames() {
@@ -653,6 +663,8 @@ object BrowserScanScript {
 
   var result = [];
   var explicitTotal = 0;
+  var truncatedTotal = false;
+  var candidateTotal = 0;
   var scopes = frames();
   for (var f = 0; f < scopes.length; f++) {
     // 相对 URL 必须按**该帧自己的** baseURI 解析：iframe 里的 `data-src="/a.jpg"`
@@ -677,6 +689,8 @@ object BrowserScanScript {
     }
     if (!collected) continue;
     explicitTotal += collected.explicitHits;
+    candidateTotal += collected.candidates || 0;
+    if (collected.truncated) truncatedTotal = true;
     for (var j = 0; j < collected.items.length; j++) result.push(collected.items[j]);
   }
 
@@ -687,6 +701,9 @@ object BrowserScanScript {
     cfg: CFG.id || "generic",
     // 顶层视口高度（CSS px）：会话侧「阅读位置优先」的锚点基准（视口高度 35%）。
     vh: (window.innerHeight || 0),
+    // 候选被安全阀截断（极端页面）时置位：会话侧打 `scan_capped` 警告，别静默。
+    truncated: truncatedTotal,
+    candidates: candidateTotal,
     errors: (window.__mtScanErrors || []).slice(0, 6)
   };
   window.__mtScanErrors = [];

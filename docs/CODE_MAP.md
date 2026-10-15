@@ -4,7 +4,7 @@
 > 与 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 的分工：那份讲**模块职责与主链路入口**（宏观），
 > 这份讲**逐个文件一句话职责 + 对应日志**（微观）。改架构时更新那份，加/改文件时更新这份。
 >
-> 最近更新：2026-10-12（窗口内改动：内嵌浏览器「截图翻译」改为 WebView 视口自截，免系统授权 —— 悬浮球 ⋮ 菜单不再接首页 MediaProjection 链路）
+> 最近更新：2026-10-15（窗口内改动：扫描安全阀 80→600 + 长章节场景缓存/`renderedSrcs`（§48）；「阅读位置优先」`BrowserImageOrder`、`scan … capped=`）
 
 ---
 
@@ -120,9 +120,10 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
 | `MainActivity.kt` | Compose 外壳（底栏 tab：首页/浏览器/术语表/翻译历史）、权限引导、服务启停 | `MainTab` | 浏览器 tab → `EmbeddedBrowserScreen`（不再传截图入口，见下行） |
-| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=`、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42） |
+| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=… capped=…`、`scan_capped`（扫描安全阀命中警告）、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42）；场景缓存上限 600 + `renderedSrcs`（已产出结果不随缓存淘汰，防长章节无限重翻，§48） |
 | `SeamRaceBand.kt` | 晚邻接竞态「接缝带补建」的纯逻辑：文本+几何匹配跨缝明的两半、给出带几何与待摘 id、盖板避让同图其它气泡 | `findMatch` | 纯逻辑 + 单测 `SeamRaceBandTest`；日志 `seam_race_band`（会话侧） |
-| `BrowserScanScript.kt` | 注入网页的扫描脚本：找图、坐标契约、宿主标记、像素提取 | `SCAN_JS` / `EXTRACTOR_JS` | `site_adapter`、`scan` |
+| `BrowserImageOrder.kt` | 「阅读位置优先」调度：把扫描列表**旋转**到视口锚点（视口高 35%）那张图起、已读部分轮转到末尾（只旋转、不重排） | `rotateToReadingAnchor` | 纯逻辑 + 单测 `BrowserImageOrderTest`；会话日志 `scan … anchor= first_vy=`（2026-10-15） |
+| `BrowserScanScript.kt` | 注入网页的扫描脚本：找图、坐标契约、宿主标记、像素提取 | `SCAN_JS` / `EXTRACTOR_JS` | `site_adapter`、`scan`；**候选上限 600 是安全阀不是调度**（旧版 80 会在 174 切的长章节上把第 81 切之后静默截掉，2026-10-15），命中时 payload 带 `truncated` → 会话打 `scan_capped` |
 | `BrowserSceneBuilder.kt` | 场景 JSON 生产者（普通场景 + 接缝带场景）= Kotlin↔JS 契约 | `buildSceneJson` / `buildSeamSceneJson` | 渲染层字段以它为准 |
 | `WebtoonImageTranslator.kt` | **浏览器链路核心管线**：拼接→OCR→归属→翻译→擦字→场景/贴片 | `translateImage` / `translateStitched` | `slice_classify`、`seam_verdict`、`cross_prep`、`incoming_absorbed`、`render_done` |
 | `SeamNeighbourPolicy.kt` | 跨切片**配对闸**：上一张/下一张是否几何紧邻 | `predecessor` / `successor` / `decide` | `band_pair`、`incoming_dropped`；纯逻辑 |
