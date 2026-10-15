@@ -34,6 +34,12 @@ Thumbs.db
 /cache/
 *.onnx
 *.bin
+# 例外：PaddleOCR 的 4 个 ONNX 模型（约 45MB）刻意入库。
+# 为什么必须入库：云端发布时包里若不含模型，App 只能联网下载，而**日文/韩文的识别模型
+# 只有 HuggingFace 一个源**（落在 AWS 海外 CDN，国内网络直连不可达）——
+# 结果就是发布出去的包在韩漫/日漫场景下识别功能不可用，且失败时没有任何提示。
+# 入库后云端构建与本地构建产物完全一致：零下载、开箱即用。
+!core-translate/src/main/assets/paddle_models/*.onnx
 
 # ===== 调试 / 验证用的临时截图与产物 =====
 bg1_screen.png
@@ -85,3 +91,7 @@ local.properties
 
 # ===== 本机 AI 工具（ZCode）自动生成的忽略配置，与 git 无关 =====
 /.zcodeignore
+
+# ===== AI 工具产物 / 与工程无关的模板转储（2026-10-15 清理公开仓库时补）=====
+/.codex/
+/tpl-*.md
