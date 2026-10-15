@@ -12,8 +12,10 @@ defaultConfig {
         applicationId = "com.manga.translator.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        // 版本号默认值。云端发布时由 workflow 从标签推导后用 -P 覆盖
+        // （例：标签 v1.0.1 → versionName 1.0.1、versionCode 10001），本地不传参时用下面的默认值。
+        versionCode = (project.findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("versionName") as String?) ?: "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

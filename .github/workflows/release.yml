@@ -1,7 +1,8 @@
 name: Release APK
 
-# 打一个 v 开头的标签（如 v1.0.0）推上来，或者在本页手动点「Run workflow」，
-# GitHub 就会自己在云端编译 APK，并挂到 Release 页面供下载。本地不需要做任何事。
+# 打一个 v 开头的标签（如 v1.0.0）推上来，或在本页手动点「Run workflow」并填版本号，
+# GitHub 就会自己在云端编译安装包并挂到 Release 页面。本地不需要做任何事。
+# 版本号会自动从标签推导并写进 APK（v1.0.1 → 版本名 1.0.1 / 版本号 10001）。
 on:
   push:
     tags:
@@ -50,13 +51,30 @@ jobs:
       - name: 让 gradlew 可执行
         run: chmod +x gradlew
 
+      - name: 从标签推导版本号
+        id: ver
+        run: |
+          set -e
+          V="${{ github.event.inputs.version || github.ref_name }}"
+          V="${V#v}"
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          MINOR=$(echo "$V" | cut -d. -f2); MINOR=${MINOR:-0}
+          PATCH=$(echo "$V" | cut -d. -f3); PATCH=${PATCH:-0}
+          CODE=$(( MAJOR * 10000 + MINOR * 100 + PATCH ))
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "本次发布：版本名 $V / 版本号 $CODE"
+
       - name: 编译 release 安装包
         # 只打 arm64（真机架构），安装包比带模拟器架构小一半。
         # 显式给足内存：默认堆对 5 个模块的 Compose 工程偏小，编译期容易 OOM。
         # 失败时把关键行做成 annotation，方便在本地直接把原因读出来。
         run: |
           set +e
-          ./gradlew :app:assembleRelease -PtargetAbis=arm64-v8a --no-daemon \
+          ./gradlew :app:assembleRelease --no-daemon \
+            -PtargetAbis=arm64-v8a \
+            -PversionName="${{ steps.ver.outputs.name }}" \
+            -PversionCode="${{ steps.ver.outputs.code }}" \
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" \
             --stacktrace > build.log 2>&1
           RC=$?
@@ -78,11 +96,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          case "$VERSION" in
-            v*) ;;
-            *) VERSION="v$VERSION" ;;
-          esac
+          VERSION="v${{ steps.ver.outputs.name }}"
           mv out/*.apk "out/manga-translator-${VERSION}.apk"
           gh release create "$VERSION" out/*.apk \
             --title "$VERSION" \
