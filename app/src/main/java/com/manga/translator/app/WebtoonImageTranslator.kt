@@ -1709,6 +1709,7 @@ class WebtoonImageTranslator(
                     } else {
                         val diag = coverOutline.diag
                         "b$index=rows${diag.rowsTotal}/drop${diag.rowsDropped}" +
+                            "/spike${diag.rowsSpikeFixed}" +
                             "/clamp${diag.rowsInkClamped}(+${diag.maxInkDeficitPx.toInt()}px)" +
                             "/dil${diag.dilatePx.toInt()} "
                     }

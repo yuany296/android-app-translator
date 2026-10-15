@@ -2326,3 +2326,46 @@ CDP：100 张 dst 图全部有 __mt_scene_root（mt71..mt100 也在，旧版不�
 （`E人L LＲ`），译文质量不作数 —— 本轮的验收点是「扫描/调度/不中断」，不是 OCR 质量。
 
 真机（AN3GUT4A22006400）已装新包，等用户复测（HumanTODO 第十一轮）。
+
+## 2026-10-15（第三轮）Kakao 盖板「锯齿状的背景」：region_polygon 孤立尖刺抑制（Todolist §49）
+
+### 1. 真机取证（CDP 读活页面）
+
+用户手机（AN3GUT4A22006400）正在读的一话里，某纯色盖板的 `--mt-region-clip` 多边形：
+
+```
+polygon(-12.00% 0.00%, …, -12.00% 32.67%, 50.71% 47.52%, …, 100.61% 32.67%, …,
+        -12.00% 100.00%, 50.71% 100.00%, 90.63% 87.05%, …, 91.79% 67.33%, 92.07% 57.43%,
+        50.71% 47.52%, 100.61% 32.67%, …)
+```
+
+两处**孤立内凹行**（y=47.52% / 100%：右边界 50.71%，上下邻行 90~100%）—— 即盖板
+被切出单侧台阶。隐藏覆盖层对比截图（`.verify/jag_cmp.png`、`jag_zoom_cmp.png`）
+确认台阶处透出的是原画面。
+
+### 2. 修复
+
+`CoverOutlinePolygon` 加固 3：逐侧检测「比两侧邻行都更靠内、幅度 ≥ 0.15×最大弦」的孤立
+尖刺 —— 内部行丢弃、端行并入邻行边界；端行额外要求「行带内或往里两行是平的」以保住
+椭圆/圆角顶底的收敛尾。日志 `cover_outline … /spikeN`。
+
+### 3. 夹具复现（修复前后各跑一次，emulator-5556）
+
+`scripts/make_panel_gradient_fixture.py` → `.verify/web/panel-gradient.html`
+（浅色渐变面板 760×390 + 两行短韩文，容器宽 ≈ 字形 1.85 倍）。
+
+| | 日志 | DOM 多边形 | 观感 |
+|---|---|---|---|
+| 修复前 | `b0=rows16/drop0/clamp1(+101px)/dil4` | 有 `0.62% 20.73%` 内凹点（两侧邻行 -32.96%） | 左侧台阶可见（`.verify/panel_cmp.png` 左） |
+| 修复后 | `b0=rows16/drop0/spike1/clamp1(+101px)/dil4` | 该行被丢弃、全行 -32.96% 平滑 | 无台阶（`.verify/panel_cmp.png` 右） |
+
+回归：椭圆夹具 `ellipse-bubble.html` → `b0=rows20/drop0/spike0/clamp7(+17px)/dil2`，
+译文不出椭圆、无白肩（`.verify/ellipse_after.png`）。
+
+### 4. 自动化
+
+- `CoverOutlinePolygonTest` 12 条（新增 4：内部尖刺丢弃 / 端部尖刺平坦上下文并入 /
+  端部尖刺行带内并入 / 收敛尾保持；调整 2 条既有用例口径）；
+- 全模块 **642 通过 / 0 失败**；`node app/src/test/js/mt-overlay-acceptance.test.js` **223/223**。
+
+真机已装新包，等用户重翻复测（HumanTODO 第十二轮）。

@@ -130,7 +130,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
-| `CoverOutlinePolygon.kt` | **纯色盖板轮廓多边形**（墨迹守卫 + 整体外扩）：不许裁进字形带，防锯齿/露原文 | `build` | 纯逻辑 + 单测 `CoverOutlinePolygonTest`；日志 `cover_outline b0=rows/drop/clamp/dil`；替换旧 `interiorOutlinePolygonPercent` |
+| `CoverOutlinePolygon.kt` | **纯色盖板轮廓多边形**（墨迹守卫 + 孤立尖刺抑制 + 整体外扩）：不许裁进字形带，也不许切出台阶 | `build` | 纯逻辑 + 单测 `CoverOutlinePolygonTest`；日志 `cover_outline b0=rows/drop/spike/clamp/dil`；2026-10-15 加固 3（尖刺：逐侧局部内凹 > 0.15×最大弦；端行要求行带内或平坦上下文） |
 | `HandoffTextMatch.kt` | 移交可用性的**文本证据**（字符重合度 ≥0.7 才算同一句） | `explainedByHandoff` | `incoming_decision`；纯逻辑 |
 
 ### 3.5 渲染层（`core-overlay` + 网页 JS）

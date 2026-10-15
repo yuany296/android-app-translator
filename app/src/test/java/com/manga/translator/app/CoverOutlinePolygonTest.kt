@@ -76,20 +76,21 @@ class CoverOutlinePolygonTest {
     }
 
     @Test
-    fun build_leavesNoisyRowOutsideInkBandsUntouched() {
-        // 行带覆盖 110~140；y=180 的窄行不在任何行带里（多行之间的空白带）：
-        // 那里没有墨迹要保，轮廓该多窄就多窄（保住轮廓贴合度）。
+    fun build_leavesModerateRowWiggleUntouched() {
+        // 行带外、幅度**小于台阶阈值**（每侧 50px < 0.15×600=90px）的行抖动：
+        // 不构成锯齿，保持贴合（轮廓该多窄就多窄）。
         val profile = floatArrayOf(
             120f, 200f, 800f,
-            150f, 200f, 800f,
-            180f, 300f, 700f
+            150f, 250f, 750f,
+            180f, 200f, 800f
         )
         val result = requireNotNull(
             build(profile, inkBands = listOf(floatArrayOf(200f, 110f, 800f, 140f)))
         )
-        val outside = requireNotNull(rowIntervalAtY(result, 180f / 20f))
-        assertEquals(30f, outside.first, 0.01f)
-        assertEquals(70f, outside.second, 0.01f)
+        val middle = requireNotNull(rowIntervalAtY(result, 150f / 20f))
+        assertEquals(25f, middle.first, 0.01f)
+        assertEquals(75f, middle.second, 0.01f)
+        assertEquals(0, result.diag.rowsSpikeFixed)
     }
 
     @Test
@@ -180,5 +181,85 @@ class CoverOutlinePolygonTest {
         val firstRow = requireNotNull(rowIntervalAtY(result, 120f / 20f))
         assertEquals(20f, firstRow.first, 0.01f)
         assertEquals(60f, firstRow.second, 0.01f)
+    }
+
+    // ------------------------------------------------------------------
+    // 孤立窄行（尖刺）抑制（2026-10-15 用户真机「锯齿状的背景」）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun build_dropsIsolatedNarrowRowBetweenWideNeighbors() {
+        // 面板型气泡里，中间一行被字形卡住量窄（弦 400，邻行 800）：
+        // 保留它会在盖板上切出台阶。孤立尖刺（内部行）必须丢弃，邻行连成坡。
+        val profile = floatArrayOf(
+            120f, 100f, 900f,
+            140f, 100f, 900f,
+            160f, 100f, 500f,
+            180f, 100f, 900f,
+            200f, 100f, 900f
+        )
+        val result = requireNotNull(build(profile, inkBands = emptyList()))
+        assertNull("尖刺行（y=8%）应被丢弃", rowIntervalAtY(result, 160f / 20f))
+        assertEquals(1, result.diag.rowsSpikeFixed)
+        assertTrue(rowIntervalAtY(result, 120f / 20f) != null)
+        assertTrue(rowIntervalAtY(result, 200f / 20f) != null)
+    }
+
+    @Test
+    fun build_mergesEndSpikeWithNeighborBoundsWhenContextIsFlat() {
+        // 尖刺落在轮廓**末端**（扫描最后一行量窄，真机现场就是这样）：
+        // 端行不能丢（丢了盖板上下沿会裂缝），改为并入邻行边界。
+        // 上下文是平的（往里两行 800/800）→ 断崖式窄行 = 尖刺。
+        val profile = floatArrayOf(
+            120f, 100f, 900f,
+            140f, 100f, 900f,
+            160f, 100f, 900f,
+            180f, 100f, 500f
+        )
+        val result = requireNotNull(build(profile, inkBands = emptyList(), coverBottomPx = 180f))
+        val last = requireNotNull(rowIntervalAtY(result, 180f / 20f))
+        assertEquals(10f, last.first, 0.01f)
+        assertEquals(90f, last.second, 0.01f)
+        assertEquals(1, result.diag.rowsSpikeFixed)
+    }
+
+    @Test
+    fun build_mergesEndSpikeInsideInkBandsEvenWhenContextConverges() {
+        // 端行贴着文字（行带内）：测量被字形污染的概率高，即使往里两行在收敛也按尖刺处理
+        // （行带正是「这里一定是文字、轮廓不被采信」的区域）。
+        val profile = floatArrayOf(
+            120f, 200f, 800f,
+            140f, 240f, 760f,
+            180f, 350f, 650f
+        )
+        val result = requireNotNull(
+            build(
+                profile,
+                inkBands = listOf(floatArrayOf(350f, 170f, 650f, 290f)),
+                coverBottomPx = 180f
+            )
+        )
+        val last = requireNotNull(rowIntervalAtY(result, 180f / 20f))
+        assertEquals(24f, last.first, 0.01f)
+        assertEquals(76f, last.second, 0.01f)
+        assertEquals(1, result.diag.rowsSpikeFixed)
+    }
+
+    @Test
+    fun build_keepsConvergingEndRowsUntouched() {
+        // 椭圆底部的收敛尾（600→560→480→340）：端行窄是**真实轮廓**，不是尖刺
+        // （每侧只比相邻一行窄 40px < 0.15×600=90px 的台阶阈值）——撑宽会在气泡底
+        // 露出白肩（§37 老毛病）。端行不在行带里 → 保持原样。
+        val profile = floatArrayOf(
+            120f, 200f, 800f,
+            140f, 220f, 780f,
+            160f, 260f, 740f,
+            180f, 340f, 660f
+        )
+        val result = requireNotNull(build(profile, inkBands = emptyList(), coverBottomPx = 180f))
+        val last = requireNotNull(rowIntervalAtY(result, 180f / 20f))
+        assertEquals(34f, last.first, 0.01f)
+        assertEquals(66f, last.second, 0.01f)
+        assertEquals(0, result.diag.rowsSpikeFixed)
     }
 }
