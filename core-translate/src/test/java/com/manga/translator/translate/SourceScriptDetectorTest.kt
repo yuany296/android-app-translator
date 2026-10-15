@@ -55,26 +55,4 @@ class SourceScriptDetectorTest {
         // 单个谚文字符不够（噪声线）。
         assertNull(SourceScriptDetector.detect(listOf("큭")))
     }
-
-    @Test
-    fun recognitionFamilyFoldsEnglishIntoChineseForPaddle() {
-        // Paddle 的 rec 模型只有 ZH/JA/KO：en 走 ZH 模型，同族不重跑。
-        assertEquals("zh", SourceScriptDetector.recognitionFamily("en", paddle = true))
-        assertEquals("zh", SourceScriptDetector.recognitionFamily("zh-cn", paddle = true))
-        assertEquals("ko", SourceScriptDetector.recognitionFamily("ko", paddle = true))
-        // ML Kit 的识别器按 en(latin)/ja/ko/zh 分：en 单独一族。
-        assertEquals("en", SourceScriptDetector.recognitionFamily("en", paddle = false))
-        assertEquals("zh", SourceScriptDetector.recognitionFamily("zh-cn", paddle = false))
-    }
-
-    @Test
-    fun koreanPageUnderJapaneseConfigLandsInDifferentFamily() {
-        // 用户 2026-10-15 报的场景：源语言配日文、OCR 出来是韩文。
-        // 两族必须分得开 —— 这是「语言可能选错了」唯一的触发条件
-        //（判定本身没问题，之前看不到提示是底栏显示条件把它挡了，见 EmbeddedBrowserScreen）。
-        assertEquals("ko", SourceScriptDetector.recognitionFamily("ko", paddle = false))
-        assertEquals("ja", SourceScriptDetector.recognitionFamily("ja", paddle = false))
-        assertEquals("ko", SourceScriptDetector.recognitionFamily("ko", paddle = true))
-        assertEquals("ja", SourceScriptDetector.recognitionFamily("ja", paddle = true))
-    }
 }

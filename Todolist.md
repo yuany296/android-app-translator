@@ -1,5 +1,61 @@
 # Todolist
 
+## 47. 用户 2026-10-15 两条：移除语言提示（误报） / Kakao「从头开始翻 + 中途停下」（2026-10-15）
+
+### 一、第 1 条：「语言可能选错了」提示整个移除（用户裁定）
+
+用户报：韩漫里夹汉字或英文是常态，这种页面也会弹「语言可能选错了」（误报），所以
+「不应该加上这个提示」。裁定执行——把 §46 刚建的整条提示链拆掉：
+
+- `LanguageMismatchHint.kt`（底栏提示 + Toast + 去重）删除；`ServiceLocator` 的
+  `onMismatch` 接线、`reportLanguageHint`、`probeSiblingLanguage`（姊妹模型探测）、
+  `detectRuns`/`lastConfiguredLanguage`/`PROBE_EVERY_N_RUNS` 全部删除；
+- `SourceScriptDetector` 收敛回 `detect`（网页文字翻译的「页面语言==目标语言 → 整页跳过」
+  仍用它），`recognitionFamily`/`countScript`/探测判据与 `ScriptProbePolicyTest` 删除，
+  `SourceScriptDetectorTest` 里 recognitionFamily 两条用例删除；类头文档写明
+  「这两个用途都已按用户裁定移除，别加回来」；
+- 附带收益：§46 的姊妹探测每 4 张图多付 1~2 次 Paddle 识别的开销一并消失；
+- 保留的判定只有一处：网页文字翻译的「同语言跳过」（只影响要不要翻，不产生任何提示）。
+
+### 二、第 2 条：Kakao「我在中间看，它先从头开始翻，然后中途停下来」—— 两个独立缺陷
+
+模拟器夹具 `.verify/web/kakao-like.html`（12 张惰性 cut + 滚动时 `history.pushState('?cut=N')`，
+模仿 page.kakao.com 阅读器）完整复现两个症状，然后分别修掉：
+
+1. **「先从头开始翻」= 处理顺序是文档序**。扫描列表按 DOM 序排列，会话从第 1 张翻起，
+   用户停在第 8 页时眼前那几页等最久。修：新增 `BrowserImageOrder.rotateToReadingAnchor` ——
+   对齐参考项目 `scheduler.js#selectPendingAheadCandidates`：找文档序中第一张「底边越过
+   阅读锚点（视口高度 × 35%）」的图，从它开始按文档序往下翻，视口上方已读过的部分轮转
+   到末尾。**只旋转、不重排**：接缝/条带链路（incoming 交接、prevBottomStrip 复用）依赖
+   文档序内的相邻关系，旋转保证每个连续段内部仍是文档序，唯一断点在「已读末尾 ↔ 锚点
+   首张」——最不重要的边界。扫描输出新增 `vy`（元素视口纵坐标）与 `vh`（顶层视口高度），
+   视口高度缺失时退化为文档序。日志 `scan … anchor= first_vy=`。
+2. **「中途停下来」= pushState 被当成页面跳转**。会话每轮用
+   `webView.url != sessionPageUrl` 判「页面已跳转」，而阅读器滚动时用 pushState 把阅读
+   位置写进地址（`?cut=N`）——用户每次滚动都命中，状态行「页面已跳转，点『翻译』继续」、
+   整段会话终止。修：新增 `BrowserUrlResolver.isSameDocument`（忽略查询串与片段，只比
+   scheme/host/path），会话循环、截图贴回（`reShowScreenshot`）、截图作废
+   （`startScreenshotTranslation`）三处 URL 比较全部换成同文档判定。真跳转（换 path/host）
+   仍会被识别，且真正的整页导航本来就由 `onPageStarted` 负责停会话 —— 这里的比较只管
+   「同文档内的位置漂移不该误杀」。
+
+### 三、验证
+
+- 单测全绿：core-translate 165 / core-store 113 / app 264（新增 `BrowserImageOrderTest` 6 条、
+  `BrowserUrlResolverTest` 同文档 3 条；删除 `ScriptProbePolicyTest` 与 recognitionFamily 用例）；
+  JS 验收 223/223（渲染层未动）。
+- 模拟器（kakao-like 夹具）端到端：滚动到中部点翻译 → `scan … anchor=256 first_vy=200`
+  （第一张处理的图视口纵坐标 200，就在眼前）✓；翻译/监听中滚动 → `url_updated ?cut=6/?cut=7`
+  且会话仍存活（状态「已显示 12 张 · 监听新图中…」，无 session_stop）✓。
+
+### 未做 / 下一轮
+
+1. 真机 Kakao 复测：`adb logcat -s EmbeddedBrowser:V` 看 `scan … first_vy=` 是否始终
+   指向眼前那几页；若「取图规则」还有别的问题（漏图/多图），把 `scan pending=… explicit=…`
+   那行日志发我——它直接说明站点选择器命中情况。
+2. 旋转调度的唯一顺序断点（已读末尾 ↔ 锚点首张）理论上可能丢一次接缝交接；该边界是
+   已读内容，出现叠影概率低，真机若见到再说。
+
 ## 46. 用户 2026-10-15 六条反馈：语言提示实证修复 / 翻译提示词对齐插件 / 作废态收尾 / 档案不换语言 / 截图译文点不回来 / 公开仓库清理（2026-10-15）
 
 用户报障清单（编号沿用原话）：2 语言提示无效、3 插件翻译更好、4 作废后还能改译文、

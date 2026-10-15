@@ -36,7 +36,7 @@ class PageTranslationResolver(
         onTranslatorDownloading: ((Boolean) -> Unit)? = null
     ): TranslationOutcome {
         // 源语言自动识别（2026-10-14 定稿）：**只提示、不跟随**。识别不符的提示由
-        // `EngineSelectingTextDetector` 写入 `LanguageMismatchHint`（阅读底栏展示）；
+        // （2026-10-15：语言提示已按用户裁定移除；翻译语言恒等于用户配置。）
         // 翻译一律按用户配置的语言走，不再用识别结果改写 sourceLanguage。
         val effective = settings
         val sentenceRepo = ServiceLocator.sentenceTranslationRepository

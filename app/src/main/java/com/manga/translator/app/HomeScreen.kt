@@ -132,7 +132,8 @@ fun LauncherScreen(
     var profileSheetForVision by remember { mutableStateOf(false) }
     var baiduSheetOpen by remember { mutableStateOf(false) }
     // OCR 低质量回退多模态（2026-10-14，独立 pref，不属于 API 档案）。
-    // 源语言自动识别没有开关：识别与配置不符时只在浏览器底栏提示（`LanguageMismatchHint`）。
+    // 源语言没有「自动识别」：语言完全按用户配置走（2026-10-15 用户裁定移除「语言可能选错了」
+    // 提示 —— 韩漫夹汉字/英文是常态，按脚本族判「选错了」误报太多）。
     var lowQualityVisionOcr by remember { mutableStateOf(repo.isLowQualityVisionOcrEnabled()) }
     // 多模态重读的档案选择（2026-10-14 深夜定稿）：空 = 跟随翻译配置；选了就用那个档案的
     // 厂商 / Base URL / Key —— 翻译选 ML Kit 时也能单独选一个云端档案给重读用。

@@ -101,9 +101,11 @@ object BrowserScanScript {
      *
      * ```json
      * {"id":"mt7","src":"https://…","l":120,"t":3400,"w":760,"h":1200,
-     *  "hostId":"mtroot3","hostX":0,"hostY":0,"frame":0,"tag":"img","lazy":true}
+     *  "vy":-800,"hostId":"mtroot3","hostX":0,"hostY":0,"frame":0,"tag":"img","lazy":true}
      * ```
      *
+     * - `vy` —— 元素顶边的**视口**纵坐标（CSS px，已含 iframe 偏移）：会话侧
+     *   「阅读位置优先调度」用它把用户眼前的图排到最前（见 [BrowserImageOrder]）。
      * - `l/t` —— 在该图**定位宿主**坐标系里的位置；宿主 = 最近的可滚动祖先
      *   （没有则 `documentElement`），与 `mt-overlay-renderer.js` 的
      *   `resolveOverlayHost` 同一判据。
@@ -602,6 +604,9 @@ object BrowserScanScript {
         t: rect.t + frameOrigin.y,
         w: rect.w,
         h: rect.h,
+        // 视口纵坐标（顶层视口，CSS px）：会话侧的「阅读位置优先调度」靠它把当前看到的
+        // 图排到最前（2026-10-15，用户报 Kakao「我在中间看，它先从头开始翻」）。
+        vy: Math.round(rect.y) + frameOrigin.y,
         hostId: rect.hostId,
         hostX: rect.hostX,
         hostY: rect.hostY,
@@ -680,6 +685,8 @@ object BrowserScanScript {
     explicit: explicitTotal,
     frames: scopes.length - 1,
     cfg: CFG.id || "generic",
+    // 顶层视口高度（CSS px）：会话侧「阅读位置优先」的锚点基准（视口高度 35%）。
+    vh: (window.innerHeight || 0),
     errors: (window.__mtScanErrors || []).slice(0, 6)
   };
   window.__mtScanErrors = [];

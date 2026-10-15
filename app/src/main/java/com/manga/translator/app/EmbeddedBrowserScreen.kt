@@ -331,7 +331,14 @@ private data class ScannedImage(
      * `blob` 只在本页 origin 内有效，OkHttp 下载不了，必须走「让页面把像素交出来」
      * 的 [BrowserScanScript.EXTRACTOR_JS] 路径。
      */
-    val kind: String = "url"
+    val kind: String = "url",
+    /**
+     * 元素顶边的**视口**纵坐标（CSS px，顶层视口，扫描瞬间的值）。
+     *
+     * 「阅读位置优先调度」（[BrowserImageOrder]）靠它把用户眼前的图排到最前 ——
+     * 2026-10-15 用户报 Kakao「我在中间看，它先从头开始翻」。每轮扫描都会刷新。
+     */
+    val viewportTop: Int = 0
 ) {
     /** 同一 src 换尺寸（占位图 → 真图）时算不同 key，允许重新走一次翻译。 */
     fun attemptKey(): String = "$src#${width}x$height"
@@ -358,7 +365,9 @@ private data class ScanResult(
     val images: List<ScannedImage>,
     val explicitHits: Int = 0,
     val frameCount: Int = 0,
-    val adapterId: String = ""
+    val adapterId: String = "",
+    /** 顶层视口高度（CSS px，扫描脚本给）；<=0 时「阅读位置优先」退化为文档序。 */
+    val viewportHeight: Int = 0
 ) {
     val isEmpty: Boolean get() = images.isEmpty()
 }
@@ -907,7 +916,8 @@ private fun parseScannedImages(raw: String?): ScanResult {
                 frame = obj.optInt("frame", 0),
                 lazy = obj.optBoolean("lazy", false),
                 explicit = obj.optBoolean("explicit", false),
-                kind = obj.optString("kind", "url").ifBlank { "url" }
+                kind = obj.optString("kind", "url").ifBlank { "url" },
+                viewportTop = obj.optDouble("vy", 0.0).toInt()
             )
         }
         if (trimmedDecoded.startsWith("{")) {
@@ -916,7 +926,8 @@ private fun parseScannedImages(raw: String?): ScanResult {
                 images = images,
                 explicitHits = meta.optInt("explicit", 0),
                 frameCount = meta.optInt("frames", 0),
-                adapterId = meta.optString("cfg")
+                adapterId = meta.optString("cfg"),
+                viewportHeight = meta.optInt("vh", 0)
             )
         } else {
             ScanResult(images)
@@ -975,6 +986,13 @@ private class TranslationSession {
 
 private const val TAG = "EmbeddedBrowser"
 private const val IDLE_POLL_INTERVAL_MS = 1200L
+
+/**
+ * 「阅读位置优先」调度的锚点比例（2026-10-15）：视口高度 35% 处为「正在读的位置」，
+ * 与参考项目 `scheduler.js` 的 `viewportAnchor = innerHeight * 0.35` 同口径 ——
+ * 长条漫通常上下各露出半张，35% 线穿过的是用户视线的落点。
+ */
+private const val VIEWPORT_ANCHOR_RATIO = 0.35f
 
 /**
  * 「当前扫到的最后一张」等下一页出现的**单轮**等待时长（懒加载阅读器，2026-10-03）。
@@ -1355,20 +1373,16 @@ fun EmbeddedBrowserScreen(
                     pageUrl = url
                     matchedAdapter = BrowserSiteAdapterRegistry.resolveUrl(url)
                     // SPA 站内跳转换的是**同一份文档**里的另一页，onPageStarted 不会来 ——
-                    // 上一页的网页文字翻译状态与语言提示必须在这里一起清掉，否则新页面还没翻过，
+                    // 上一页的网页文字翻译状态必须在这里一起清掉，否则新页面还没翻过，
                     // 弹层按钮却已经写着「恢复页面原文」（用户 2026-10-15 报）。
                     webpageTextBusy = false
                     webpageTextApplied = false
-                    LanguageMismatchHint.report(null)
                     Log.d(TAG, "url_updated source=doUpdateVisitedHistory url=${BrowserHistoryRepository.urlWithoutScheme(url)}")
                 }
 
                 override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     pageUrl = url
-                    // 语言提示只属于当前页面：换页即清，下一页要不要提示由新一轮 OCR 说了算
-                    // （不然上一页的「页面是韩文」会带到不相干的下一页去）。
-                    LanguageMismatchHint.report(null)
                     // 新页面 = 旧页面的渲染层注入失效，落地后由 onPageFinished 重新注入。
                     rendererInjected = false
                     // 新页面既没有可隐藏的译文层，也没有可贴回的覆盖层：视图回「译文」，
@@ -1701,7 +1715,8 @@ fun EmbeddedBrowserScreen(
 
     /**
      * 「原文→译文」贴回截图结果：按捕获时存的几何原样重发（不重跑 OCR/翻译）。
-     * 页面换过（URL 不同，#fragment 忽略）→ 作废丢弃 —— 几何对新页面没有意义。
+     * 页面换过（「同一文档」判定不过：path/host 变了；查询与片段忽略——阅读器滚动会改写它们）
+     * → 作废丢弃 —— 几何对新页面没有意义。
      *
      * @return 是否真的发起了贴回（false = 没有可重看的结果 / 正忙 / 页面已换）。调用方
      *   （悬浮球单击）据此决定要不要落回「开始翻译」的默认动作。
@@ -1711,7 +1726,7 @@ fun EmbeddedBrowserScreen(
     fun reShowScreenshot(): Boolean {
         val render = screenshotRender ?: return false
         if (reShowBusy || running) return false
-        if (webView.url?.substringBefore("#") != render.pageUrl.substringBefore("#")) {
+        if (!BrowserUrlResolver.isSameDocument(webView.url, render.pageUrl)) {
             screenshotRender = null
             Log.d(TAG, "shot_reshow_drop reason=navigated")
             return false
@@ -1851,11 +1866,6 @@ fun EmbeddedBrowserScreen(
                 //    拟声词/人名这类混排节点交给翻译引擎自己兜）。
                 val settings = settingsRepository.getSettings()
                 val pageLanguage = com.manga.translator.translate.SourceScriptDetector.detect(collected.map { it.text })
-                // 网页文字链路不经过 OCR，以前完全不报「语言可能选错了」（用户 2026-10-15 报的同类问题）。
-                // 这里复用同一条底栏提示：pageLanguage 本来就算过一次，判定几乎零成本。
-                if (LanguageMismatchHint.isMismatch(pageLanguage?.languageId, settings.sourceLanguage)) {
-                    LanguageMismatchHint.report(pageLanguage?.languageId)
-                }
                 if (pageLanguage?.languageId == settings.targetLanguage) {
                     statusText = "页面语言与目标语言相同，无需翻译"
                     Log.d(TAG, "webpage_text_same_lang lang=${pageLanguage.languageId}")
@@ -2023,10 +2033,9 @@ fun EmbeddedBrowserScreen(
                 ownedByPipeline = true
                 val costMs = System.currentTimeMillis() - startedAt
                 // 3) 管线跑的这几秒里页面跳走了：结果作废（几何对新页面对不上）。
+                //    「同一文档」判定：阅读器滚动写 ?cut= 之类不算跳转，截图结果不该因此作废。
                 val urlNow = webView.url
-                if (urlNow.isNullOrBlank() ||
-                    urlNow.substringBefore("#") != captureUrl.substringBefore("#")
-                ) {
+                if (!BrowserUrlResolver.isSameDocument(urlNow, captureUrl)) {
                     Log.w(
                         TAG,
                         "shot_drop reason=navigated " +
@@ -2479,30 +2488,19 @@ fun EmbeddedBrowserScreen(
                             color = if (running) MtColors.Brand else MtColors.TextTertiary
                         )
                     }
-                    // 语言可能选错了提示（2026-10-14）：空闲时顶替兜底文案，橙色 = 要你留意。
-                    //
-                    // 「空闲」原先用 `statusText.isBlank()` 判 —— 那是错的：翻译结束后底栏会一直停在
-                    // 「截图翻译完成（N 处）· 点一下恢复原文」这类结果文案上，statusText 永不为空，
-                    // 提示就再也没机会露出来（用户 2026-10-15 报：源语言选日文、OCR 出的是韩文，
-                    // 却看不到任何提示）。改成按「有没有任务在跑」判：真跑任务时让位给进度，
-                    // 跑完就由提示盖过结果文案 —— 语言配错比「已完成」更需要马上被看到。
-                    val languageHint = LanguageMismatchHint.hintText()
-                    val translateBusy = running || reShowBusy || screenshotBusy || webpageTextBusy
-                    val showLanguageHint = languageHint != null && !translateBusy
+                    // 状态行：任务文案优先，空闲时兜底文案。
+                    // （2026-10-15 用户裁定移除「语言可能选错了」提示 —— 韩漫里夹汉字/英文是常态，
+                    // 按脚本族判「选错了」误报太多。这个位置不再有任何提示优先级逻辑。）
                     Text(
-                        text = if (showLanguageHint) {
-                            languageHint!!
-                        } else {
-                            statusText.ifBlank {
-                                BrowserTranslateUiPolicy.idleHint(
-                                    mode = viewMode,
-                                    hasRender = hasRenderOnPage,
-                                    pageLoaded = pageUrl.isNotBlank() && pageUrl != "about:blank"
-                                )
-                            }
+                        text = statusText.ifBlank {
+                            BrowserTranslateUiPolicy.idleHint(
+                                mode = viewMode,
+                                hasRender = hasRenderOnPage,
+                                pageLoaded = pageUrl.isNotBlank() && pageUrl != "about:blank"
+                            )
                         },
                         fontSize = 12.sp,
-                        color = if (showLanguageHint) MtColors.Warning else MtColors.TextTertiary,
+                        color = MtColors.TextTertiary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f)
@@ -3130,7 +3128,10 @@ private suspend fun runTranslationSession(
             // 而单张翻译只要 300–900ms —— 光看 TranslationPerf 完全看不出时间花在哪儿。
             // 有了这个就能直接分辨「是扫描慢」还是「是循环外面/线程被占住」。
             val loopStartedAt = System.currentTimeMillis()
-            if (webView.url != sessionPageUrl) {
+            // 「同一份文档」判定而不是字符串相等（2026-10-15，用户报 Kakao「翻到一半停下来」）：
+            // 阅读器滚动时用 pushState 把阅读位置写进地址（`?cut=N` / `#cut-N`），文档没换 ——
+            // 字符串比较会在用户每次滚动后命中，整段会话被误判为「页面已跳转」而终止。
+            if (!BrowserUrlResolver.isSameDocument(webView.url, sessionPageUrl)) {
                 reportStatus("页面已跳转，点「翻译」继续")
                 return
             }
@@ -3140,6 +3141,20 @@ private suspend fun runTranslationSession(
                 Log.w(TAG, "scan_slow cost=${scanCostMs}ms（扫描本身慢：页面大或主线程被占）")
             }
             val images = scan.images
+            // 阅读位置优先（2026-10-15，用户报 Kakao「我在中间看，它先从头开始翻」）：
+            // 把处理列表旋转到「当前阅读锚点」（视口高度 35% 处的图）起，往下翻；
+            // 视口上方已读过的部分轮转到末尾。视口高度缺失（老 payload）退化为文档序。
+            // 只改处理顺序，不改任何几何/接缝判据（它们按几何找相邻，与列表顺序无关）。
+            val orderedImages = if (scan.viewportHeight > 0 && images.isNotEmpty()) {
+                BrowserImageOrder.rotateToReadingAnchor(
+                    spans = images.map {
+                        BrowserImageOrder.ViewportSpan(top = it.viewportTop, bottom = it.viewportTop + it.height)
+                    },
+                    anchorY = (scan.viewportHeight * VIEWPORT_ANCHOR_RATIO).toInt()
+                ).map { images[it] }
+            } else {
+                images
+            }
             // 「原文」视图下**不算**贴回量：否则每轮都会认为"有待贴回的图"而不进空闲轮询，
             // 变成满速空转扫页面（2026-10-02 视图开关引入时特意避开这个坑）。
             val viewVisible = isViewVisible()
@@ -3173,11 +3188,13 @@ private suspend fun runTranslationSession(
                     "adapter=${scan.adapterId} explicit=${scan.explicitHits} " +
                     "frames=${scan.frameCount} lazy=${images.count { it.lazy }} " +
                     "hosted=${images.count { it.hostId.isNotBlank() }} " +
+                    "anchor=${(scan.viewportHeight * VIEWPORT_ANCHOR_RATIO).toInt()} " +
+                    "first_vy=${orderedImages.firstOrNull()?.viewportTop ?: -1} " +
                     "done=$doneCount shown=${placedIds.size}"
             )
 
             var batchIndex = 0
-            for (image in images) {
+            for (image in orderedImages) {
                 if (!currentCoroutineContext().isActive || !onSessionActive()) return
 
                 // 「原文 → 译文」贴回：已渲染结果直接重发（不重跑 OCR/翻译）。

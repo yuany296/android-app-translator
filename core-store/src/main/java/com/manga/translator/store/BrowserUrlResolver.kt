@@ -35,6 +35,26 @@ object BrowserUrlResolver {
     fun searchUrl(keyword: String, engine: BrowserSearchEngine): String =
         engine.buildSearchUrl(URLEncoder.encode(keyword.trim(), Charsets.UTF_8.name()))
 
+    /**
+     * 两个 URL 是否指向**同一份文档**（2026-10-15，Kakao「翻到一半停下来」修复）。
+     *
+     * 为什么不能用字符串相等：webtoon 阅读器（Kakao 实测）滚动时用 `history.pushState`
+     * 把阅读位置写进地址（`?cut=N`、`#cut-4`），文档本身没换。翻译会话原先用
+     * `webView.url != sessionPageUrl` 判「页面已跳转」—— 用户每次滚动都命中 → 状态行
+     * 「页面已跳转」、整段会话终止（用户报「中间停下来了，不进行翻译了」）。
+     *
+     * 判据：**忽略查询串与片段，只比 scheme/host/path**。真跳转（换 path/host）仍会被
+     * 识别为跳转；而且真正的整页导航本来就由 `onPageStarted` 负责停会话，这里的比较
+     * 只是同文档内的位置漂移不该误杀。尾部 `/` 视为等价。
+     */
+    fun isSameDocument(one: String?, other: String?): Boolean {
+        if (one.isNullOrBlank() || other.isNullOrBlank()) return false
+        return documentKey(one) == documentKey(other)
+    }
+
+    private fun documentKey(url: String): String =
+        url.substringBefore('#').substringBefore('?').trim().trimEnd('/')
+
     private fun looksLikeHost(value: String): Boolean =
         DOMAIN.matches(value) || IPV4.matches(value) || LOCALHOST.matches(value)
 }

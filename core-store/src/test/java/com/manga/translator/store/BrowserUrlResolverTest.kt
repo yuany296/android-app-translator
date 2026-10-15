@@ -1,6 +1,8 @@
 package com.manga.translator.store
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -56,5 +58,33 @@ class BrowserUrlResolverTest {
             "https://cn.bing.com/search?q=a%26b",
             BrowserUrlResolver.searchUrl(" a&b ", BrowserSearchEngine.BING)
         )
+    }
+
+    // ---- 同一文档判定（2026-10-15，Kakao「翻到一半停下来」）----
+
+    @Test
+    fun sameDocument_ignoresViewerPositionQueryAndFragment() {
+        val session = "https://page.kakao.com/content/123/viewer/456"
+        // 阅读器滚动时写进地址的位置参数：不算跳转。
+        assertTrue(BrowserUrlResolver.isSameDocument(session, "$session?cut=4"))
+        assertTrue(BrowserUrlResolver.isSameDocument(session, "$session#cut-4"))
+        assertTrue(BrowserUrlResolver.isSameDocument(session, "$session?cut=4#cut-4"))
+        assertTrue(BrowserUrlResolver.isSameDocument(session, "$session/"))
+    }
+
+    @Test
+    fun sameDocument_stillDetectsRealNavigation() {
+        val session = "https://page.kakao.com/content/123/viewer/456"
+        // 换话 / 换站：路径或主机变了 → 必须仍然判为跳转。
+        assertFalse(BrowserUrlResolver.isSameDocument(session, "https://page.kakao.com/content/123/viewer/789"))
+        assertFalse(BrowserUrlResolver.isSameDocument(session, "https://page.kakao.com/home"))
+        assertFalse(BrowserUrlResolver.isSameDocument(session, "https://www.lezhin.com/ko/comic/x/1"))
+    }
+
+    @Test
+    fun sameDocument_blankOrNullIsNeverSame() {
+        assertFalse(BrowserUrlResolver.isSameDocument(null, "https://a.com/x"))
+        assertFalse(BrowserUrlResolver.isSameDocument("https://a.com/x", ""))
+        assertFalse(BrowserUrlResolver.isSameDocument("about:blank", "https://a.com/x"))
     }
 }
