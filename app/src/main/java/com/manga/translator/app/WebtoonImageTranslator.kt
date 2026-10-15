@@ -3562,8 +3562,17 @@ internal fun growBubbleBottomPx(
     if (hardLineCount <= 0) return null
     val boxWidth = rectRight - rectLeft
     if (boxWidth <= 2f) return null
-    val neededBottom = rectTop + hardLineCount * medianLineHeightPx * 1.2f
-    if (neededBottom <= rectBottom + medianLineHeightPx * 0.3f) return null
+    // ⚠️ 行高优先取**气泡自己**的（框高 ÷ 行数），中位行高只做上限 —— 全页中位在混合字号
+    // 页面上会把小字气泡估成两三倍（2026-10-15 真机：跨缝圆泡 2 行小字被估成 312px，
+    // 扩出来的区域压住圆圈下弧线，墨迹收紧收不回来 → 盖板 = 文字两倍）。
+    val lineHeightPx = BubblePlausibility.effectiveLineHeightPx(
+        medianLineHeightPx = medianLineHeightPx,
+        boxHeightPx = rectBottom - rectTop,
+        lineCount = hardLineCount
+    )
+    if (lineHeightPx <= 0f) return null
+    val neededBottom = rectTop + hardLineCount * lineHeightPx * 1.2f
+    if (neededBottom <= rectBottom + lineHeightPx * 0.3f) return null
     var newBottom = neededBottom.coerceAtMost(stitchedHeightPx)
     others.forEach { other ->
         if (other.width <= 2f || other.height <= 2f) return@forEach

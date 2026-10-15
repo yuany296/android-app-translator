@@ -46,4 +46,31 @@ internal object BubblePlausibility {
         if (height <= maxHeight) return null
         return floatArrayOf(coverBoxPercent[0], coverBoxPercent[1], coverBoxPercent[2], maxHeight)
     }
+
+    /**
+     * 「按行数估文字高度」时该用的行高（2026-10-15 真机现场：跨缝圆泡盖板 = 文字两倍）。
+     *
+     * 背景：`growBubbleBottomPx` 用**全页中位行高**估「N 行文字要占多高」。混合字号页面上
+     * 这会系统性高估小字气泡（现场：中位 130px、气泡自己的行高 ~51px，2 行小字被估成
+     * 312px → 扩出来的区域包含圆圈下弧线的墨迹 → 后续墨迹收紧也收不回来，盖板 = 文字两倍）。
+     *
+     * 修法：**优先用气泡自己的行高**（框高 ÷ 行数，上限=中位行高）；只有框本身是「细条」
+     * （[MIN_LOCAL_BOX_PX] 以下，压根量不出行高 —— 2026-10-11 那种 `box=60x6` 的截缝碎片）
+     * 才退回中位行高。小字气泡不再按大字页面的中位被放大；「框真的只装了一半文字」的
+     * 老现场（框内行高接近中位）行为基本不变。
+     */
+    fun effectiveLineHeightPx(
+        medianLineHeightPx: Float,
+        boxHeightPx: Float,
+        lineCount: Int
+    ): Float {
+        if (!medianLineHeightPx.isFinite() || medianLineHeightPx <= 0f) return 0f
+        if (!boxHeightPx.isFinite() || boxHeightPx <= 0f) return medianLineHeightPx
+        if (boxHeightPx < MIN_LOCAL_BOX_PX) return medianLineHeightPx
+        val lines = lineCount.coerceAtLeast(1)
+        return minOf(medianLineHeightPx, boxHeightPx / lines)
+    }
+
+    /** 框矮到这个程度就量不出「自己的行高」了（截缝细条），退回中位行高。 */
+    const val MIN_LOCAL_BOX_PX = 20f
 }

@@ -1,5 +1,53 @@
 # Todolist
 
+## 53. 用户 2026-10-15 追加：跨缝气泡「盖板高度是文字区域的两倍」——扩框行高用错口径（2026-10-15）
+
+用户复测报：「盖住了，但是目测高度是文字区域的两倍」（配图：跨缝的圆形气泡）。
+用 Chrome 取到**同一话的真切图**（cut6/cut7，经 `chrome-devtools` 的
+`get_network_request(responseFilePath)` 拿原生 JPEG），在 emulator-5554 上用
+三张真图夹具 `1:1` 复现出手机的同一组数字：
+
+```
+真机（band payload）：band=227x263@152,1140，气泡框 203x232（文字仅 203x102）
+模拟器复现（同一张图，stitch=1456、cut_allow=501）：
+  ocr_blocks_all: ?싸매두긴 했는?@164,1152,203x102
+  ink_tilt: b0 lineH=116.0 lines=2 mask=203x232      ← 2 倍
+  seam_scene: band=227x263@152,1140                   ← 与真机完全一致
+```
+
+### 根因（两条叠加）
+
+1. **扩框口径错**（`growBubbleBottomPx`）：按 `行数 × **全页中位行高** × 1.2` 估「N 行
+   文字要占多高」。混合字号页面上（同页有 209px 高的大字气泡）中位行高 130px，而这个小
+   气泡自身行高只有 ~51px → 2 行小字被估成 312px（3 倍）；
+2. **扩出来的高度收不回来**：加高后的框里正好包含**圆圈的下弧线**（真墨迹），随后的
+   墨迹收紧（`TextInkBounds`）把它当字形锚住 → mask/盖板/接缝带全都 = 232px。
+
+### 修复
+
+- 新纯逻辑 `BubblePlausibility.effectiveLineHeightPx(median, boxHeight, lineCount)`：
+  **优先用气泡自己的行高**（框高 ÷ 行数），中位行高只做**上限**；只有框矮到
+  `MIN_LOCAL_BOX_PX(20px)` 以下的**截缝细条**（量不出行高，如 2026-10-11 的
+  `box=60x6`）才退回中位行高。
+- `growBubbleBottomPx` 改用这个行高（+0.3 行宽容差同步改）；
+- 单测：`BubbleBoxGrowerTest`（原 5 条按新口径更新 + 新增 2 条：混合字号页小气泡不被
+  放大 / 细条退回中位）、`BubblePlausibilityTest` +3 条（effectiveLineHeight 三种形态）。
+
+### 验证
+
+- 模拟器同夹具复跑（同一批日志位）：`mask=198x96`、`band=212x114`（修复前 203x232 /
+  227x263）—— 盖板 = 文字 + 少量外扩 ✓；
+- 全模块 **639 通过 / 0 失败**（+5 条新增/调整）；JS 验收 **223/223**；
+- 真机（AN3GUT4A22006400）+ emulator-5554 均已装新包，请用户重翻复测
+  （HumanTODO 第十五轮）。
+
+### 复现资料（已留在本地）
+
+- 真图：`.verify/web/cut-0/1/2.jpg`（= 真机 mt6/mt7/mt8）；夹具 `.verify/web/seam-cut012.html`；
+- 取图方法：Chrome 里开同一话 → `list_network_requests(image)` 找到切图请求 →
+  `get_network_request(reqid, responseFilePath)` 直接存原生 JPEG（画布被 CORS 污染，
+  `toDataURL` 不可用，这条路可复用）。
+
 ## 52. 按 §51 的结论清单执行 A：盖板宽高合理性钳制（2026-10-15）
 
 用户表示由我定（「我不知道哪个比较好」）——**选 A**：便宜、与参考项目同口径、不动现有

@@ -2420,3 +2420,28 @@ node app/src/test/js/mt-overlay-acceptance.test.js：223/223
   JS 验收 **223/223**；emulator-5554 已装新包；真机本次未连接（`device not found`），
   待插上补装（防御性改动，正常页面无可见差别）。
 - 挂起：B（切片尺寸元数据，需「上下切片宽度不同」夹具）、C（回退策略，需现场）。
+
+## 2026-10-15（第六轮）跨缝气泡「盖板 = 文字两倍」：扩框行高口径修复（Todolist §53）
+
+### 1. 1:1 复现（Chrome 取真切图 → emulator-5554）
+
+- 取图：Chrome 开着用户同话（viewer/70179570）→ `list_network_requests(image)` 找切图
+  请求 → `get_network_request(reqid, responseFilePath)` 存**原生 JPEG**
+  （canvas 被 CORS 污染，`toDataURL` 不可用；这条路可复用）；
+- 夹具：`.verify/web/seam-cut012.html`（cut0=mt6 起三张真图，`.verify/web/cut-*.jpg`）；
+- 复现数字与真机**逐字一致**：`ink_tilt b0 mask=203x232`（文字 203x102）、
+  `seam_scene band=227x263@152,1140`。
+
+### 2. 根因
+
+`growBubbleBottomPx` 用**全页中位行高**估文字高度：混合字号页面（同页 209px 大字气泡
+把中位拉到 130px）把小字气泡（自身行高 ~51px）估成 312px；扩出来的区域包含圆圈下弧线
+（墨迹）→ 后续墨迹收紧被锚住，收不回来。
+
+### 3. 修复与验证
+
+- `BubblePlausibility.effectiveLineHeightPx`：行高优先取「框高 ÷ 行数」，中位只做上限；
+  框 <20px 的截缝细条退回中位（保住 2026-10-11 的细条扩框现场）；`growBubbleBottomPx` 接上；
+- 同夹具复跑：`mask=198x96`、`band=212x114`（修复前 203x232 / 227x263）；
+- 单测 **639 通过 / 0 失败**（`BubbleBoxGrowerTest` 按新口径更新 +2、`BubblePlausibilityTest` +3）；
+  JS 验收 **223/223**；真机 + 模拟器均已装新包。

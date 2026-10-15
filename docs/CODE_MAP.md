@@ -130,6 +130,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
+| `BubblePlausibility.kt` | 盖板/文字高度的合理性：盖板高上限（单行 35%/多行 60% × 图高）+ 「按行数估文字高度」用的行高口径（优先气泡自身，中位做上限） | `clampCoverHeight` / `effectiveLineHeightPx` | 纯逻辑 + 单测 `BubblePlausibilityTest`；2026-10-15（§52/§53） |
 | ~~`CoverOutlinePolygon.kt`~~ | **已删除（2026-10-15 用户裁定）**：按容器内壁轮廓裁剪盖板 —— 量到的其实是文字噪声轮廓，会切出台阶（「锯齿状的背景」）。盖板/填充轮廓现在只按「合并文字区域 + 少量外扩」走（`defaultRegionPolygon`，与参考项目 `cover-geometry.js` 同口径） | — | 日志 `cover_outline` 一并删除（不再产生） |
 | `HandoffTextMatch.kt` | 移交可用性的**文本证据**（字符重合度 ≥0.7 才算同一句） | `explainedByHandoff` | `incoming_decision`；纯逻辑 |
 

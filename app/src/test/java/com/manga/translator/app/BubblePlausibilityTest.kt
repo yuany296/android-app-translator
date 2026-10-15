@@ -43,4 +43,29 @@ class BubblePlausibilityTest {
         assertNull(BubblePlausibility.clampCoverHeight(floatArrayOf(1f, 2f, 3f), 1))
         assertNull(BubblePlausibility.clampCoverHeight(floatArrayOf(1f, 2f, 3f, Float.NaN), 1))
     }
+
+    // ------------------------------------------------------------------
+    // effectiveLineHeightPx（2026-10-15：混合字号页面上的扩框行高）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun effectiveLineHeightPrefersTheBubblesOwnHeight() {
+        // 真机现场：中位 130、框 102、2 行 → 用 51（不是 130）。
+        assertEquals(51f, BubblePlausibility.effectiveLineHeightPx(130f, 102f, 2), 0.01f)
+    }
+
+    @Test
+    fun effectiveLineHeightIsCappedByMedian() {
+        // 框内行均比中位大（大字号气泡）→ 不超过中位。
+        assertEquals(43f, BubblePlausibility.effectiveLineHeightPx(43f, 200f, 2), 0.01f)
+    }
+
+    @Test
+    fun effectiveLineHeightFallsBackToMedianForSlivers() {
+        // 截缝细条（6px）量不出行高 → 中位。
+        assertEquals(43f, BubblePlausibility.effectiveLineHeightPx(43f, 6f, 2), 0.01f)
+        // 非法输入 → 中位；中位也非法 → 0。
+        assertEquals(43f, BubblePlausibility.effectiveLineHeightPx(43f, Float.NaN, 2), 0.01f)
+        assertEquals(0f, BubblePlausibility.effectiveLineHeightPx(0f, 100f, 2), 0.01f)
+    }
 }
