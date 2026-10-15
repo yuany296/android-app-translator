@@ -2399,3 +2399,24 @@ node app/src/test/js/mt-overlay-acceptance.test.js：223/223
 
 真机（AN3GUT4A22006400）已装新包；真机复测要点见 HumanTODO 第十三轮，
 接缝宽高 vs 参考项目的对照（先读不改）是下一项。
+
+## 2026-10-15（第五轮）接缝宽高对照参考项目 + 执行 A（盖板宽高钳制，Todolist §51/§52）
+
+### 1. 对照结论（读 `C:\homework\translator`，只读未改）
+
+- 参考项目的拼接图**每段切片都有显式矩形**（`drawRect` + `sourceCrop` + natural 尺寸），
+  映射回 owner 一律按 owner 矩形换算；轴对齐盖板 = **该页 OCR 证据并集**（`page_cover_boxes`），
+  **只有斜排**才按文字四边形裁 — 与今天删掉容器轮廓后的我们同口径；
+- 它另有两条我们没有的防线：**宽高闸门**（普通泡 ≤ 60%/35% owner 高；跨缝 h ≤ 60%、
+  越界丢弃）与**可信度回退**（拼接 OCR 丢弃 >70% 或坐标离谱 → 整批回退单页 OCR）；
+- 我们既有已知项：两切片尺寸不同时接缝带 scale 无口径（靠 2% 显示宽度检查兜底）。
+
+### 2. 执行 A（宽高钳制）
+
+- 新增 `BubblePlausibility`（单行 35% / 多行 60% 上限，钳高保持上沿）+ 接入
+  `resolveFinalBubbles`（被钳时 `regionPolygonPercent` 置空 → 退回纯矩形）；
+  `ink_tilt` 新增 `cover_clamped=` 诊断。
+- 验证：全模块 **634 通过 / 0 失败**（新增 `BubblePlausibilityTest` 4 条）；
+  JS 验收 **223/223**；emulator-5554 已装新包；真机本次未连接（`device not found`），
+  待插上补装（防御性改动，正常页面无可见差别）。
+- 挂起：B（切片尺寸元数据，需「上下切片宽度不同」夹具）、C（回退策略，需现场）。

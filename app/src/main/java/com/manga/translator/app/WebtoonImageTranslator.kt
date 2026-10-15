@@ -1671,6 +1671,17 @@ class WebtoonImageTranslator(
                     srcH,
                     bottomPadPx = coverPadBottomPx
                 )
+            // 宽高合理性钳制（2026-10-15，对齐参考项目 stitch-mapping 的窄高闸门）：
+            // 盖板高度超过 单行 35% / 多行 60% × 原图高时，这个尺寸只可能是换算错误
+            // （拼接/移交/条带的任何一环）—— 钳高并把轮廓多边形置空（退回纯矩形盖板），
+            // 把「一整块超大盖板」变成一个合规矩形。排版/字号不动（用户规则）。
+            val coverClamp = BubblePlausibility.clampCoverHeight(coverBoxPercent, lineCount)
+            if (coverClamp != null) {
+                tiltProbe.append(
+                    "|b$index cover_clamped=${"%.1f".format(coverBoxPercent[3])}->" +
+                        "${"%.1f".format(coverClamp[3])}% "
+                )
+            }
             val isCross = crossFlags.getOrElse(index) { false }
             // 跨图气泡：两半必须用**同一个字号**（否则本图 DOM 自适应、下一张图固定值 → 错位重影）。
             val fixedFontPx = if (isCross && srcH > 0) {
@@ -1689,9 +1700,10 @@ class WebtoonImageTranslator(
                 layoutRect = layoutRect,
                 maskRect = maskRect,
                 boxPercent = boxPercent,
-                coverBoxPercent = coverBoxPercent,
+                coverBoxPercent = coverClamp ?: coverBoxPercent,
                 maskPolygonPercent = paddedQuadPercent,
-                regionPolygonPercent = regionPolygonPercent,
+                // 钳过的盖板丢掉轮廓证据（用被污染的轮廓再裁只会更怪）—— 渲染层退回矩形。
+                regionPolygonPercent = if (coverClamp != null) null else regionPolygonPercent,
                 lineHeightPx = lineHeightPx,
                 fixedFontPx = fixedFontPx
             )
