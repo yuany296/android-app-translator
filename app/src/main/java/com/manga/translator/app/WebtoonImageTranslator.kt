@@ -1565,7 +1565,24 @@ class WebtoonImageTranslator(
             // `resolveCoverQuad`（文字几何 × coverScale）同口径 —— 那边的 region_polygon
             // 也只是 OCR 的文字区域，从不扫描气泡内壁。
             // -----------------------------------------------------------------
-            val layoutRect = RectF(maskRect)
+            // -----------------------------------------------------------------
+            // 「自适应缩小以对话框为界」（2026-10-16 用户要求）：
+            // 排版可用框（layoutRect）默认 = 字形框原样；量到**可信的对话框容器**时，
+            // 绕字形框中点对称扩到容器内壁 —— 译文字号仍以原文为基准（上限 1.08 倍），
+            // 但装不进字形框、装得进对话框时**不再缩字号**，先吃气泡里的空白；
+            // 真正超出对话框才缩（下限 8px、再不行才撑开的规则不变）。
+            //
+            // ⚠️ 只动**译文排版**：遮罩/盖板/擦字/移交轮廓继续一律用 maskRect —— 盖板按
+            // 容器轮廓裁会切出台阶（「锯齿状的背景」，2026-10-15 已删过一遍，别回加）。
+            // -----------------------------------------------------------------
+            val layoutRect = resolveLayoutFitRect(
+                stitched = stitched,
+                glyphRect = maskRect,
+                outerRect = percentRectToPx(BubbleGeometry.outerRect(bubble), stitched.width, stitched.height),
+                lineCount = lineCount,
+                bgColor = prep.colors[index]?.bgColor,
+                lineHeightPx = lineHeightPx
+            )
             // 字号输入诊断（2026-09-30 用户反馈「倾斜的文本看不清」）：
             // 真机上 `font_height_percent` 只有 3.13%（真值 11.09%），字号被 FONT_MIN 兜住 = 10px。
             // 只打最终字号是查不出「四边形厚度算错还是 srcH 口径不对」的，这里把三个输入全打出来。
@@ -1575,6 +1592,7 @@ class WebtoonImageTranslator(
                     " lines=$lineCount" +
                     " lb=${lineBoxesPx?.size ?: 0}" +
                     " mask=${"%.0f".format(maskRect.width())}x${"%.0f".format(maskRect.height())}" +
+                    " fit=${"%.0f".format(layoutRect.width())}x${"%.0f".format(layoutRect.height())}" +
                     " src=${srcW}x$srcH stitch=${stitched.width}x${stitched.height}" +
                     " topH=$topH poly=${bubble.polygon?.size ?: 0}" +
                     " maskQuad=${maskQuadSource?.size ?: 0} vertical=$vertical "
@@ -1710,6 +1728,73 @@ class WebtoonImageTranslator(
         }
         flushTiltProbe()
         return result
+    }
+
+    /**
+     * 「自适应缩小以对话框为界」的排版可用框（2026-10-16 用户要求，像素 = 拼接图坐标系）。
+     *
+     * 默认返回字形框 [glyphRect] 原样。容器证据按两级取：
+     * 1. `BubbleInteriorScanner` 量到的**可信内壁**（够宽、不贴页面边缘、不超字形框太多倍）；
+     * 2. 量不到（白气泡画在白面板上，内壁跨过描边量到整页）→ 用**气泡区域框**
+     *    [outerRect]（区域检测器按亮斑轮廓找的），但必须包住字形框且不超
+     *    [REGION_FIT_MAX_WIDTH_RATIO] / [REGION_FIT_MAX_HEIGHT_RATIO] 倍（防「整片亮区」）。
+     *
+     * 拿到容器后绕字形框中点对称扩到容器内缩一圈
+     * （[LAYOUT_FIT_INSET_RATIO] × 行高，最少 2px 不贴描边）。都没有 → 保持旧行为（装不下就缩）。
+     */
+    private fun resolveLayoutFitRect(
+        stitched: Bitmap,
+        glyphRect: RectF,
+        outerRect: RectF,
+        lineCount: Int,
+        bgColor: Int?,
+        lineHeightPx: Float
+    ): RectF {
+        val fallback = RectF(glyphRect)
+        if (glyphRect.width() < 8f || glyphRect.height() < 8f) return fallback
+        val glyph = BubbleFitBoxPolicy.Box(
+            glyphRect.left,
+            glyphRect.top,
+            glyphRect.right,
+            glyphRect.bottom
+        )
+        val bg = bgColor
+        val interiorContainer = if (bg != null) {
+            runCatching {
+                ServiceLocator.bubbleInteriorScanner.scan(stitched, glyphRect, lineCount, bg)
+            }.getOrNull()
+                ?.takeIf { it.hasContainer(glyphRect.width()) }
+                ?.takeIf {
+                    it.isTrustworthyContainer(
+                        glyphRect.width(),
+                        glyphRect.height(),
+                        stitched.width,
+                        stitched.height
+                    )
+                }
+                ?.let { BubbleFitBoxPolicy.Box(it.leftPx, it.topPx, it.rightPx, it.bottomPx) }
+        } else {
+            null
+        }
+        val container = interiorContainer ?: BubbleFitBoxPolicy.credibleContainer(
+            glyph = glyph,
+            candidate = BubbleFitBoxPolicy.Box(
+                outerRect.left,
+                outerRect.top,
+                outerRect.right,
+                outerRect.bottom
+            ),
+            maxWidthRatio = REGION_FIT_MAX_WIDTH_RATIO,
+            maxHeightRatio = REGION_FIT_MAX_HEIGHT_RATIO
+        ) ?: return fallback
+        val inset = maxOf(2f, lineHeightPx * LAYOUT_FIT_INSET_RATIO)
+        val fit = BubbleFitBoxPolicy.expandSymmetrically(glyph, container, inset)
+        if (fit.left == glyph.left && fit.top == glyph.top &&
+            fit.right == glyph.right && fit.bottom == glyph.bottom
+        ) {
+            return fallback
+        }
+        return RectF(fit.left, fit.top, fit.right, fit.bottom)
     }
 
     /**
@@ -3200,6 +3285,25 @@ class WebtoonImageTranslator(
         /** 幅图模式下小于该倾角不值得旋转；大于等于 60° 视为竖排误判，不旋转。 */
         private const val MIN_RENDER_TILT_DEG = 3f
         private const val MAX_RENDER_TILT_DEG = 60f
+
+        /**
+         * 「排版可用框」扩到对话框容器时的内缩 = `max(2px, 行高 × 它)` —— 不贴气泡描边。
+         *
+         * 用户 2026-10-16 要求「只要不超过漫画里的对话框，就可以不进行自适应缩小」，
+         * 见 [resolveLayoutFitRect]。
+         */
+        private const val LAYOUT_FIT_INSET_RATIO = 0.15f
+
+        /**
+         * 区域框当「对话框」用的尺寸闸（见 [BubbleFitBoxPolicy.credibleContainer]）。
+         *
+         * 白气泡画在白面板上时内壁测量会跨过描边量到整页、被可信闸拒绝，这时退到**区域框**；
+         * 但区域检测也可能给出「整片亮区」型假阳性（真机：24×21px 单字 chip 配到
+         * 597×587px 白色带，约 25 倍）—— 用这两道上限拒绝。真气泡的轮廓框通常落在
+         * 文字框的 2~3.5 倍内（真机样本：2.2×/3.6×、2.8×/3.3×）。
+         */
+        private const val REGION_FIT_MAX_WIDTH_RATIO = 3.0f
+        private const val REGION_FIT_MAX_HEIGHT_RATIO = 4.0f
     }
 }
 
@@ -3424,6 +3528,10 @@ class BubbleImageRenderer {
         return TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             textSize = textSizePx
             typeface = Typeface.SERIF
+            // 与 DOM 覆盖层的字重对齐（2026-10-16 用户要求「字体加粗一点」：
+            // mt-overlay-renderer.js 的默认字重已提到 700）。粗细也会参与字号拟合
+            // （measureText 跟着变宽），所以两条链路必须同粗同测。
+            isFakeBoldText = true
         }
     }
 

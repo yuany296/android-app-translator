@@ -113,7 +113,9 @@ internal data class SeamPlan(
      * 与 [detections] 下标一一对应的判决文本（诊断用，`seam_verdict` 日志直接打它）。
      *
      * 取值：`cross` / `cross_capped` / `paired_bottom` / `paired_top` / `orphan_adopted` /
-     * `handed_tail` / `dropped_top_handed` / `dropped_tail` / `suppressed` / `unknown`。
+     * `handed_tail` / `dropped_top_handed` / `dropped_tail` / `dropped_fragment` /
+     * `dropped_glyph_outside`（字形整体在可见区之外，本图没有可画的内容）/ `suppressed` /
+     * `unknown`。
      */
     val verdicts: List<String> = emptyList()
 )
@@ -395,10 +397,15 @@ internal fun planSeamOwnership(
                     detection
                 }
                 // 太薄的框是条带边缘的残片：不认领也不移交（留给下一张图看到整行的那侧处理）。
-                if (clipped != null && isFragment(clipped.outer.height)) {
+                if (clipped == null) {
+                    // 字形整体深在条带里（内容框裁完退化）—— 它是下一张图的正文，
+                    // 不认领不移交（历史上这里会退化成「区域大框当内容」，错位画一行）。
+                    dropped += 1
+                    verdicts[index] = "dropped_glyph_outside"
+                } else if (isFragment(clipped.outer.height)) {
                     dropped += 1
                     verdicts[index] = "dropped_fragment"
-                } else if (clipped != null) {
+                } else {
                     owned += SeamOwnership(clipped.bubble, cross = true)
                 }
             }
@@ -415,10 +422,15 @@ internal fun planSeamOwnership(
                     verdicts[index] = "dropped_top_handed"
                 } else {
                     val clipped = clipDetection(detection, top, Float.MAX_VALUE, canvasWidth, canvasHeight)
-                    if (clipped == null || isFragment(clipped.outer.height)) {
-                        // 跨上边界但整块都在上条带里 / 只剩一条残片 → 本图确实画不出东西。
+                    if (clipped == null) {
+                        // 字形整块在上条带里（= 上一张图的正文）：本图没有可画的内容。
+                        // 绝不退化成「区域大框当内容」（见 [clipDetection] 的注释）。
                         dropped += 1
-                        verdicts[index] = if (clipped == null) "dropped_top_handed" else "dropped_fragment"
+                        verdicts[index] = "dropped_glyph_outside"
+                    } else if (isFragment(clipped.outer.height)) {
+                        // 跨上边界但只剩一条残片 → 本图确实画不出东西。
+                        dropped += 1
+                        verdicts[index] = "dropped_fragment"
                     } else {
                         // 上一张**没有**整块移交它 → 本图认领并裁进可见区。
                         //
@@ -510,9 +522,14 @@ internal fun planSeamOwnership(
             // 整块落在**上**条带里 = 上一张图的正文。上一张没移交时本图认领，
             // 裁到本图可见区（否则它的框在本图画面之外，渲染层只能夹到页首）。
             val visible = clipDetection(detection, top, Float.MAX_VALUE, canvasWidth, canvasHeight)
-            if (visible == null || isFragment(visible.outer.height)) {
+            if (visible == null) {
+                // 字形整块在可见区之外（内容框裁完退化）→ 不认领。
+                // 绝不退化成「区域大框当内容」（见 [clipDetection] 的注释）。
                 dropped += 1
-                verdicts[index] = if (visible == null) "dropped_top_handed" else "dropped_fragment"
+                verdicts[index] = "dropped_glyph_outside"
+            } else if (isFragment(visible.outer.height)) {
+                dropped += 1
+                verdicts[index] = "dropped_fragment"
             } else {
                 orphanAdopted += 1
                 verdicts[index] = "orphan_adopted"
@@ -548,7 +565,9 @@ internal fun planSeamOwnership(
         }
         if (clipped == null) {
             dropped += 1
-            verdicts[index] = "dropped_tail"
+            // 字形整体深在条带里（内容框裁完退化）或外框退化 —— 都不认领
+            // （见 [clipDetection]：这里回退成区域大框会画出一行错位文字）。
+            verdicts[index] = "dropped_glyph_outside"
             return@forEachIndexed
         }
         owned += SeamOwnership(
@@ -580,6 +599,20 @@ internal fun planSeamOwnership(
  * 裁完**没有剩余高度**（框整个在区间之外）时返回 null —— 调用方据此判定「画不出来」。
  * ⚠️ 这里绝不能返回原框：调用方是靠「裁完还剩不剩」来区分「画面内」与「画面外」的，
  * 返回原框会让画面外的框被当成画面内（2026-10-03 单测当场抓到）。
+ *
+ * ## 字形不在可见区 → 一律不认领（2026-10-16 修）
+ *
+ * 历史实现里「裁完内容框退化 → 回退用 outer」有一条致命形态（真机 Lezhin 实测）：
+ * 单字 chip 的文字在上条带里（content = 75~96），而 outer 是**大区域框**（0~731）——
+ * 裁完 content 退化，于是 content 被换成 597×587px 的 outer。下游（`resolveFinalBubbles`
+ * / `refine_boxes` / `ink_tilt`）把这个大框当文字框：遮罩 597×587、译文被画到框中心
+ * （错位几百像素）、盖板只剩贴着 chip 的一小块 —— 用户看到「气泡没被处理 + 画面别处
+ * 多出一个字」（原文回退时就是那句韩文飘在错误位置）。
+ *
+ * 现在的口径：**外层框可见 ≠ 可认领** —— 只有当「字形（content）在可见区里还剩下一部分」
+ * 才裁入认领；字形整体在可见区之外（裁完退化）时返回 null，由调用方丢弃。
+ * 这块字的完整像素区在**邻居图**的可视范围里（它不在本图的画面内），邻居图的 OCR 会
+ * 看到整行，交给它自己的 owned 链路处理，坐标天然正确。
  */
 private fun clipDetection(
     detection: SeamDetection,
@@ -590,8 +623,15 @@ private fun clipDetection(
 ): SeamDetection? {
     val outer = detection.outer.clipVertical(topLimit, bottomLimit)
     if (outer.width <= 0.5f || outer.height <= 0.5f) return null
-    val content = detection.content.clipVertical(topLimit, bottomLimit)
-        .let { if (it.width <= 0.5f || it.height <= 0.5f) outer else it }
+    val sourceContent = detection.content
+    val clippedContent = sourceContent.clipVertical(topLimit, bottomLimit)
+    val content = when {
+        // 原内容框本身就退化（老数据的少数形态）→ 保持旧行为（退到 outer）。
+        sourceContent.width <= 0.5f || sourceContent.height <= 0.5f -> outer
+        // 字形整体落在可见区之外 → 本图没有可画的内容，交给邻居图（见上方注释）。
+        clippedContent.width <= 0.5f || clippedContent.height <= 0.5f -> return null
+        else -> clippedContent
+    }
     val visibleRatio = (outer.height / max(detection.outer.height, 1f)).coerceIn(0f, 1f)
     val bubble = detection.bubble.copy(
         x = percent(outer.left, canvasWidth),

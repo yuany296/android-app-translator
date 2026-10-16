@@ -144,15 +144,25 @@ class PaddleOcrLocalTextDetector(
         // 2026-08-27 新增：按首页选择的 OCR 速度模式调整检测/识别参数。
         val config = speedModeConfig()
 
-        // 1. 主检测：原图 + 默认参数（与参考项目 production 默认值对齐）
-        val primaryQuads = runDetPass(
-            bitmap = bitmap,
-            resizeLong = config.detResizeLong,
-            thresh = DET_THRESH,
-            boxThresh = DET_BOX_THRESH,
-            unclipRatio = DET_UNCLIP_RATIO,
-            tag = "primary"
-        )
+        // 1. 主检测：原图 + 默认参数（与参考项目 production 默认值对齐）。
+        //
+        // 长条图（Lezhin/RIDI 的 1280×5120 切图）改走**分块检测**（2026-10-16）：
+        // 整图缩到长边 960 时单字 chip 只剩几个像素高、检测器直接漏掉（用户报的
+        // 「有的单字气泡没有 DOM」）；沿长边切 2~3 块、逐块按接近原分辨率检测后合并。
+        // 普通切图（Kakao 760×1000 等）不满足闸门，行为与成本完全不变。
+        // 详见 [PaddleDetectionTiling]。
+        val primaryQuads = if (PaddleDetectionTiling.shouldTile(srcW, srcH, config.detResizeLong)) {
+            runDetTiled(bitmap, config)
+        } else {
+            runDetPass(
+                bitmap = bitmap,
+                resizeLong = config.detResizeLong,
+                thresh = DET_THRESH,
+                boxThresh = DET_BOX_THRESH,
+                unclipRatio = DET_UNCLIP_RATIO,
+                tag = "primary"
+            )
+        }
         val allQuads = primaryQuads.toMutableList()
 
         // 2. 如果主检测块数少 / 覆盖率低，跑 recovery 检测：
@@ -279,6 +289,75 @@ class PaddleOcrLocalTextDetector(
                 "vertical=${verticalCrops.get()} orient90=${verticalOrient90.get()} orient-90=${verticalOrientNeg90.get()} rot180=${rot180Retries.get()} " +
                 "crop_fail=${cropFailures.get()} degenerate=${degenerateQuads.get()} speed_mode=${speedModeProvider?.invoke() ?: "balanced"} " +
                 "lang=${recKey.id}"
+        )
+        return merged
+    }
+
+    /**
+     * 长条图分块检测（2026-10-16，见 [PaddleDetectionTiling]）。
+     *
+     * 沿长边切块 → 逐块 [runDetPass]（块长 ≈ `detResizeLong`，块内文字按接近原分辨率
+     * 检测）→ 四边形映射回原图坐标 → 按 IoU（[MERGE_IOU_THRESHOLD]，与 recovery 合并
+     * 同一口径）去重。
+     */
+    private fun runDetTiled(bitmap: Bitmap, config: SpeedModeConfig): List<Array<PointF>> {
+        val horizontal = bitmap.width > bitmap.height
+        val length = if (horizontal) bitmap.width else bitmap.height
+        val ranges = PaddleDetectionTiling.tiles(
+            length = length,
+            detResizeLong = config.detResizeLong
+        )
+        if (ranges.size <= 1) {
+            // 分不出两块（极短的长条）→ 退回单趟，不引入半边块的开销。
+            return runDetPass(
+                bitmap = bitmap,
+                resizeLong = config.detResizeLong,
+                thresh = DET_THRESH,
+                boxThresh = DET_BOX_THRESH,
+                unclipRatio = DET_UNCLIP_RATIO,
+                tag = "primary"
+            )
+        }
+        val merged = mutableListOf<Array<PointF>>()
+        var added = 0
+        for ((index, range) in ranges.withIndex()) {
+            val tile = if (horizontal) {
+                Bitmap.createBitmap(bitmap, range.start, 0, range.length, bitmap.height)
+            } else {
+                Bitmap.createBitmap(bitmap, 0, range.start, bitmap.width, range.length)
+            }
+            val quads = try {
+                runDetPass(
+                    bitmap = tile,
+                    resizeLong = config.detResizeLong,
+                    thresh = DET_THRESH,
+                    boxThresh = DET_BOX_THRESH,
+                    unclipRatio = DET_UNCLIP_RATIO,
+                    tag = "primary_tile$index"
+                )
+            } finally {
+                if (tile !== bitmap) tile.recycle()
+            }
+            for (quad in quads) {
+                val moved = Array(quad.size) { i ->
+                    PointF(
+                        (quad[i].x + if (horizontal) range.start.toFloat() else 0f)
+                            .coerceIn(0f, bitmap.width.toFloat()),
+                        (quad[i].y + if (horizontal) 0f else range.start.toFloat())
+                            .coerceIn(0f, bitmap.height.toFloat())
+                    )
+                }
+                if (merged.none { existing -> quadIoU(existing, moved) >= MERGE_IOU_THRESHOLD }) {
+                    merged += moved
+                    added += 1
+                }
+            }
+        }
+        Log.d(
+            TAG,
+            "det_tiled tiles=${ranges.size} axis=${if (horizontal) "x" else "y"} " +
+                "ranges=${ranges.joinToString(",") { "${it.start}-${it.endExclusive}" }} " +
+                "quads=$added img=${bitmap.width}x${bitmap.height}"
         )
         return merged
     }

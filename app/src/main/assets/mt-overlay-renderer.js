@@ -456,7 +456,7 @@
     ".mt-bubble{position:absolute;box-sizing:border-box;max-width:none;max-height:none;",
     "display:flex;flex-direction:column;align-items:center;justify-content:center;",
     "font-family:\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif;",
-    "font-weight:var(--mt-font-weight,600);border-radius:0.36em;padding:0.12em 0.34em;",
+    "font-weight:var(--mt-font-weight,700);border-radius:0.36em;padding:0.12em 0.34em;",
     "overflow:visible;cursor:pointer;user-select:none;pointer-events:auto;isolation:isolate;",
     "color:var(--mt-text-color,#111827);--mt-stroke-width:2px;--mt-base-transform:none;",
     "transform:var(--mt-base-transform);transition:opacity 0.15s ease;}",
@@ -589,6 +589,11 @@
   }
 
   function normalizeFontWeight(value, fallback) {
+    // ⚠️ 必须显式拦 null/空串：`Number(null) === 0` 且 isFinite(0) 为真 —— 场景 JSON 里
+    // host 下发 `"font_weight":null`，旧实现于是把 null 钳成 **100（极细）**，fallback 600
+    // 永远轮不到（2026-10-16 真机 CDP 实测：节点 --mt-font-weight=100）。这就是用户
+    // 「字体加粗一点」的直接原因。
+    if (value === null || value === undefined || value === "") return fallback;
     var n = Number(value);
     if (!Number.isFinite(n)) return fallback;
     n = Math.round(n / 100) * 100;
@@ -921,7 +926,7 @@
         measureCanvasContext = canvas && canvas.getContext ? canvas.getContext("2d") : null;
       }
       if (measureCanvasContext) {
-        var weight = String((node && node.dataset && node.dataset.mtFontWeight) || "600");
+        var weight = String((node && node.dataset && node.dataset.mtFontWeight) || "700");
         var family = "\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif";
         try {
           var style = node && typeof getComputedStyle === "function" ? getComputedStyle(node) : null;
@@ -1430,7 +1435,9 @@
     var bgType = normalizeBgType(bubble.bg_type);
     var rotation = resolveBubbleRotation(bubble);
     var alignment = normalizeAlignment(bubble.alignment);
-    var fontWeight = normalizeFontWeight(bubble.font_weight, 600);
+    // 默认字重 700（2026-10-16 用户要求「字体加粗一点」）：译文比原文笔画细时观感发虚，
+    // 加粗一档读起来更像漫画排版；场景显式下发 font_weight 时仍以它为准。
+    var fontWeight = normalizeFontWeight(bubble.font_weight, 700);
     var node = document.createElement("div");
     node.className = "mt-bubble mt-bg-" + bgType + " mt-text-layer mt-align-" + alignment;
     node.dataset.mtOverlay = "true";
@@ -1445,6 +1452,7 @@
     node.dataset.xPercent = String(box.x);
     node.dataset.yPercent = String(box.y);
     node.dataset.rotationDeg = String(rotation);
+    node.dataset.mtFontWeight = String(fontWeight);
     node.dataset.stitchOverflow = allowVerticalOverflow ? "true" : "";
     // 描边开关（2026-09-30 用户要求「白边黑边只在背景有多种颜色的时候有」）：
     // 宿主按**背景（清理图）的亮度离散度**判定后下发；缺省（老宿主 / 字段缺失）保留描边，
@@ -1499,6 +1507,11 @@
     resetOverflowExpansion(node);
     var probe = ensureMeasureProbe();
     probe.className = node.className + " mt-measure-probe";
+    // 字重必须与真实节点一致（否则粗体字宽不同、溢出测不出来）：节点上是 inline
+    // 自定义属性，探针复制不了 inline style，这里手动搬一份；没有就退回 CSS 默认（700）。
+    var weight = node.style && node.style.getPropertyValue("--mt-font-weight");
+    if (weight) probe.style.setProperty("--mt-font-weight", weight);
+    else probe.style.removeProperty("--mt-font-weight");
     probe.style.width = width + "px";
     probe.style.height = height + "px";
     probe.style.fontSize = fontSize + "px";

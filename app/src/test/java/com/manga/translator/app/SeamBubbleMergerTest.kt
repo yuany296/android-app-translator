@@ -562,4 +562,121 @@ class SeamBubbleMergerTest {
         assertEquals(1, plan.droppedNeighbor)
         assertEquals("dropped_top_handed", plan.verdicts.single())
     }
+
+    // -----------------------------------------------------------------------
+    // 2026-10-16：字形不在可见区 → 不认领（真机 Lezhin 单字 chip 的 597×587 事故）
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun glyphEntirelyInsideTopBandIsNotAdoptedEvenIfRegionCrossesBoundary() {
+        // 真机复刻（trace 31224250）：拼接图 600×2544、上条带 144。
+        //   单字 `억!` 的**区域框** outer = 0~731（大块亮区，跨过上边界），
+        //   而字形 content = 75~96（整块在上条带里 = 上一张图的正文）。
+        // 旧实现：content 裁完退化 → 回退用 outer → 597×587 的「文字框」→ 遮罩/译文全错位
+        //         （译文被画到框中心、盖板只剩贴着 chip 的一小块）。
+        // 新口径：字形不在可见区 → 不认领（上一张图自己完整看到它，交给它的 owned 链路）。
+        val bubble = Bubble(
+            x = 0f, y = 0f, w = 10f, h = 10f, bgType = "solid",
+            originalText = "억!", translatedText = ""
+        )
+        val plan = planSeamOwnership(
+            detections = listOf(
+                SeamDetection(bubble, SeamBox(0f, 0f, 597f, 731f), SeamBox(324f, 75f, 348f, 96f))
+            ),
+            config = SeamConfig(
+                topLimitPx = 144f,
+                bottomLimitPx = 2544f,
+                topBandPx = 144f,
+                bottomBandPx = 0f,
+                edgeWindowPx = 32f,
+                maxCrossHeightPx = 197f
+            ),
+            incomingCrossBoxes = emptyList(),
+            canvasWidth = 600,
+            canvasHeight = 2544
+        )
+        assertTrue("字形在条带里不该被认领（实际 ${plan.verdicts.single()}）", plan.owned.isEmpty())
+        assertEquals(0, plan.orphanAdopted)
+        assertEquals(1, plan.droppedNeighbor)
+        assertEquals("dropped_glyph_outside", plan.verdicts.single())
+    }
+
+    @Test
+    fun glyphPartlyVisibleAboveTopSeamIsStillAdoptedWithClippedContent() {
+        // 与上一条互补：字形**跨**上边界（部分是上一张的、部分在本图）→ 仍然认领，
+        // 且 content 跟着裁进可见区（不是退化成区域大框）。
+        val bubble = Bubble(
+            x = 0f, y = 0f, w = 10f, h = 10f, bgType = "solid",
+            originalText = "이어지는 문장", translatedText = ""
+        )
+        val plan = planSeamOwnership(
+            detections = listOf(
+                SeamDetection(bubble, SeamBox(100f, 120f, 500f, 400f), SeamBox(120f, 150f, 480f, 260f))
+            ),
+            config = SeamConfig(
+                topLimitPx = 200f,
+                bottomLimitPx = 1200f,
+                topBandPx = 200f,
+                bottomBandPx = 0f,
+                edgeWindowPx = 60f,
+                maxCrossHeightPx = 400f
+            ),
+            incomingCrossBoxes = emptyList(),
+            canvasWidth = 800,
+            canvasHeight = 1400
+        )
+        assertEquals(1, plan.owned.size)
+        assertEquals("orphan_adopted", plan.verdicts.single())
+        val owned = plan.owned.single()
+        // 内容框 = 裁到可见区后的字形框（200~260px），不是 outer（120~400px）
+        assertEquals(200f, owned.bubble.contentY / 100f * canvasHeight, 0.5f)
+        assertEquals(
+            60f, owned.bubble.contentH / 100f * canvasHeight, 0.5f
+        )
+    }
+
+    @Test
+    fun glyphEntirelyBelowCutAllowanceIsNotClaimedAsCross() {
+        // 跨下边界但字形整块深在条带里（超过切开余量）：下一张图会在自己的画面里
+        // 看到整行 —— 这里既不认领也不移交，更不允许「退化成区域大框」。
+        val bubble = Bubble(
+            x = 0f, y = 0f, w = 10f, h = 10f, bgType = "solid",
+            originalText = "다음 페이지 본문", translatedText = ""
+        )
+        val plan = planSeamOwnership(
+            detections = listOf(
+                SeamDetection(bubble, SeamBox(300f, 1100f, 700f, 1350f), SeamBox(320f, 1275f, 680f, 1340f))
+            ),
+            config = config().copy(cutAllowancePx = 60f),
+            incomingCrossBoxes = emptyList(),
+            canvasWidth = canvasWidth,
+            canvasHeight = canvasHeight
+        )
+        assertTrue("字形在切开余量之外不该认领（实际 ${plan.verdicts.single()}）", plan.owned.isEmpty())
+        assertEquals("dropped_glyph_outside", plan.verdicts.single())
+    }
+
+    @Test
+    fun glyphStraddlingCutAllowanceIsStillClaimedAsCross() {
+        // 互补：字形跨切开余量（后半截在余量内可见）→ 照常认领，content 裁到 cap。
+        val bubble = Bubble(
+            x = 0f, y = 0f, w = 10f, h = 10f, bgType = "solid",
+            originalText = "잘린 문장", translatedText = ""
+        )
+        val plan = planSeamOwnership(
+            detections = listOf(
+                SeamDetection(bubble, SeamBox(300f, 1100f, 700f, 1350f), SeamBox(320f, 1240f, 680f, 1300f))
+            ),
+            config = config().copy(cutAllowancePx = 60f),
+            incomingCrossBoxes = emptyList(),
+            canvasWidth = canvasWidth,
+            canvasHeight = canvasHeight
+        )
+        assertEquals(1, plan.owned.size)
+        val owned = plan.owned.single()
+        assertTrue(owned.cross)
+        // content 底边裁到 cap = 1200 + 60 = 1260
+        val contentBottomPx = (owned.bubble.contentY + owned.bubble.contentH) / 100f * canvasHeight
+        assertEquals(1260f, contentBottomPx, 0.5f)
+    }
 }
