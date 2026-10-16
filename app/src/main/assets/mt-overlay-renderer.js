@@ -2386,6 +2386,20 @@
     var target = findImageTarget(imageId);
     if (!target) return JSON.stringify({ ok: false, reason: "no_target" });
 
+    // 同一张 `<img>` 只允许一套覆盖层（2026-10-16，用户报「背景覆盖定位出错、超出对话框」）。
+    //
+    // 去重本来按 imageId 走，但 id 不总跟元素走：站点 SPA 重渲染 / 虚拟化重建 `<img>`
+    // 后扫描脚本会赋**新 id**（`__mtSeq` 归零重来），旧 id 的覆盖层还挂在同一张图上 ——
+    // `targetSrc` 判定只管「元素内容换人」，管不了「元素没换、id 换了」。两套覆盖层
+    // 各自被帧同步锚到不同时刻的矩形，肉眼就是「盖板错位/戳出气泡」。
+    // 这里按**目标元素**兜底清理：同一 `<img>` 上除当前 id 外的覆盖层一律卸掉。
+    overlaysById.forEach(function (stale, staleId) {
+      if (staleId === imageId) return;
+      if (stale.target !== target) return;
+      console.log("MTSTALE drop image=" + staleId + " reason=same_target_new_id current=" + imageId);
+      destroyOverlay(stale);
+    });
+
     var bubbles = Array.isArray(payload.bubbles) ? payload.bubbles : [];
     var signature = djb2Hash(JSON.stringify([
       payload.cleaned_url || "", payload.page_cleaned_url || "", bubbles
