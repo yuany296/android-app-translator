@@ -3527,11 +3527,10 @@ class BubbleImageRenderer {
     private fun newTextPaint(textSizePx: Float): TextPaint {
         return TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
             textSize = textSizePx
-            typeface = Typeface.SERIF
-            // 与 DOM 覆盖层的字重对齐（2026-10-16 用户要求「字体加粗一点」：
-            // mt-overlay-renderer.js 的默认字重已提到 700）。粗细也会参与字号拟合
+            // 与 DOM 覆盖层的字重对齐（2026-10-16 用户定稿 **500 / Medium**）：
+            // minSdk 29 可直接用数字字重 API，交给系统挑最接近的面。粗细会参与字号拟合
             // （measureText 跟着变宽），所以两条链路必须同粗同测。
-            isFakeBoldText = true
+            typeface = Typeface.create(Typeface.SERIF, 500, false)
         }
     }
 

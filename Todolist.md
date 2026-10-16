@@ -38,10 +38,11 @@
   逐块按接近原分辨率检测 → 四边形映射回原图 → 按 IoU（与 recovery 合并同口径）去重。
   `PaddleOcrLocalTextDetector.runDetTiled` 接入主检测；日志 `det_tiled tiles= axes= ranges= quads=`。
   Kakao 760×1000 这类常规切图不满足闸门，行为与成本不变。单测 +10。
-- **C 字号**（用户定稿：维持原文字号 + 加粗一档 + **装得进对话框就不缩**）：
-  - **字重 100 → 700 的 bug**：`normalizeFontWeight` 里 `Number(null)===0` 且 isFinite(0)
+- **C 字号**（用户定稿：维持原文字号 + 略加重字重 + **装得进对话框就不缩**）：
+  - **字重 100 → 500 的 bug**：`normalizeFontWeight` 里 `Number(null)===0` 且 isFinite(0)
     为真，场景 JSON 的 `"font_weight":null` 被钳成 **100**（CDP 实测全站 `--mt-font-weight=100`）——
-    fallback 600 永远轮不到。修掉 null 分支 + 默认 700；探针同步字重（不然按 600 测量
+    fallback 永远轮不到。修掉 null 分支 + 默认字重（先 700，用户试看后定为 **500/Medium**）；
+    探针同步字重（不然按另一档测量的
     的溢出测不出来）、`measureTextPx` 同步、PNG 兜底链路 `isFakeBoldText=true`。
   - **排版可用框 = 对话框内部**（新纯逻辑 `BubbleFitBoxPolicy` + `resolveLayoutFitRect`）：
     两级证据 —— ①`BubbleInteriorScanner` 可信内壁；②量不到（白气泡画在白面板上，内壁
@@ -59,9 +60,10 @@
   - `seam_verdict … d2=dropped_glyph_outside`（旧代码这里会画出错位文字）；
   - `fit` 扩框 **13/15** 个气泡（比值 1.14~2.68×，全部在闸内）；
   - DOM 字号对比（同一批气泡）：`哦，是的！` 13.4→**17.3px**、`流`（흐음）11.1→**15.3px**、
-    `有效的问题` 13.4→16.1px、`你没有任何问题。` 11.1→13.9px；字重全部 **700**。
+    `有效的问题` 13.4→16.1px、`你没有任何问题。` 11.1→13.9px；字重全部 **500/Medium**
+    （修 bug 后先定 700，用户试看后当轮改为 500）。
 - 单测全模块 **664 通过 / 0 失败**（app 280 / core-translate 176 / core-store 113 /
-  core-overlay 60 / core-capture 35）；JS 验收 **228/228**（+5：默认 700 / 显式字重优先 /
+  core-overlay 60 / core-capture 35）；JS 验收 **228/228**（+5：默认 500 / 显式字重优先 /
   探针同步字重）。
 - 模拟器已装新包；真机（AN3GUT4A22006400）待用户复测（HumanTODO 第十六轮）。
 

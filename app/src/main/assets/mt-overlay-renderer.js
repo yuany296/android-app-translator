@@ -456,7 +456,7 @@
     ".mt-bubble{position:absolute;box-sizing:border-box;max-width:none;max-height:none;",
     "display:flex;flex-direction:column;align-items:center;justify-content:center;",
     "font-family:\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif;",
-    "font-weight:var(--mt-font-weight,700);border-radius:0.36em;padding:0.12em 0.34em;",
+    "font-weight:var(--mt-font-weight,500);border-radius:0.36em;padding:0.12em 0.34em;",
     "overflow:visible;cursor:pointer;user-select:none;pointer-events:auto;isolation:isolate;",
     "color:var(--mt-text-color,#111827);--mt-stroke-width:2px;--mt-base-transform:none;",
     "transform:var(--mt-base-transform);transition:opacity 0.15s ease;}",
@@ -926,7 +926,7 @@
         measureCanvasContext = canvas && canvas.getContext ? canvas.getContext("2d") : null;
       }
       if (measureCanvasContext) {
-        var weight = String((node && node.dataset && node.dataset.mtFontWeight) || "700");
+        var weight = String((node && node.dataset && node.dataset.mtFontWeight) || "500");
         var family = "\"Source Han Sans SC\",\"Noto Sans SC\",\"Noto Sans CJK SC\",sans-serif";
         try {
           var style = node && typeof getComputedStyle === "function" ? getComputedStyle(node) : null;
@@ -1435,9 +1435,10 @@
     var bgType = normalizeBgType(bubble.bg_type);
     var rotation = resolveBubbleRotation(bubble);
     var alignment = normalizeAlignment(bubble.alignment);
-    // 默认字重 700（2026-10-16 用户要求「字体加粗一点」）：译文比原文笔画细时观感发虚，
-    // 加粗一档读起来更像漫画排版；场景显式下发 font_weight 时仍以它为准。
-    var fontWeight = normalizeFontWeight(bubble.font_weight, 700);
+    // 默认字重 500（Medium；2026-10-16 用户定稿）：此前 host 下发 `font_weight:null` 被
+    // null 陷阱钳成 100（极细），修掉后先定 700，用户试看后定为 500 ——
+    // 比正文（400）重半档，压在插画上够稳、又不像 Bold 那么黑。
+    var fontWeight = normalizeFontWeight(bubble.font_weight, 500);
     var node = document.createElement("div");
     node.className = "mt-bubble mt-bg-" + bgType + " mt-text-layer mt-align-" + alignment;
     node.dataset.mtOverlay = "true";
@@ -1508,7 +1509,7 @@
     var probe = ensureMeasureProbe();
     probe.className = node.className + " mt-measure-probe";
     // 字重必须与真实节点一致（否则粗体字宽不同、溢出测不出来）：节点上是 inline
-    // 自定义属性，探针复制不了 inline style，这里手动搬一份；没有就退回 CSS 默认（700）。
+    // 自定义属性，探针复制不了 inline style，这里手动搬一份；没有就退回 CSS 默认（500）。
     var weight = node.style && node.style.getPropertyValue("--mt-font-weight");
     if (weight) probe.style.setProperty("--mt-font-weight", weight);
     else probe.style.removeProperty("--mt-font-weight");

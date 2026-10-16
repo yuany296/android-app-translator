@@ -578,33 +578,33 @@ const TILTED_POLYGON = [
 })();
 
 // ---------------------------------------------------------------------------
-// §7.3 字重默认加粗（2026-10-16 用户要求「字体加粗一点」）：默认 700、显式下发仍以它为准；
-//      测量探针必须用与节点**相同**的字重 —— 否则探针按 600 量宽度、节点按 700 显示，
+// §7.3 字重默认 500/Medium（2026-10-16 用户定稿）：显式下发仍以它为准；
+//      测量探针必须用与节点**相同**的字重 —— 否则探针按一个档位量宽度、节点按另一档显示，
 //      溢出测不出来，译文会戳出气泡。
 // ---------------------------------------------------------------------------
-(function boldFontWeight() {
+(function mediumFontWeight() {
   const page = freshPage();
-  apply(page, scene(page, [bubble({ id: "bold", translated_text: "默认加粗" })]));
+  apply(page, scene(page, [bubble({ id: "medium", translated_text: "默认字重" })]));
   const root = page.document.querySelector(".__mt_scene_root");
-  const boldText = root.children.find((node) => node.className.includes("mt-text-layer"));
-  check("default font weight is 700",
-    boldText.style.getPropertyValue("--mt-font-weight") === "700",
-    boldText.style.getPropertyValue("--mt-font-weight"));
+  const mediumText = root.children.find((node) => node.className.includes("mt-text-layer"));
+  check("default font weight is 500",
+    mediumText.style.getPropertyValue("--mt-font-weight") === "500",
+    mediumText.style.getPropertyValue("--mt-font-weight"));
   check("node records the effective weight for the line rebalancer",
-    boldText.dataset.mtFontWeight === "700", boldText.dataset.mtFontWeight);
+    mediumText.dataset.mtFontWeight === "500", mediumText.dataset.mtFontWeight);
   const probe = page.document.querySelector(".mt-measure-probe");
   check("measure probe carries the same weight as the node",
-    !!probe && probe.style.getPropertyValue("--mt-font-weight") === "700",
+    !!probe && probe.style.getPropertyValue("--mt-font-weight") === "500",
     probe && probe.style.getPropertyValue("--mt-font-weight"));
 
-  apply(page, scene(page, [bubble({ id: "explicit", translated_text: "显式字重", font_weight: 500 })]));
+  apply(page, scene(page, [bubble({ id: "explicit", translated_text: "显式字重", font_weight: 300 })]));
   const root2 = page.document.querySelector(".__mt_scene_root");
   const explicitText = root2.children.find((node) => node.className.includes("mt-text-layer"));
   check("explicit font weight still wins over the default",
-    explicitText.style.getPropertyValue("--mt-font-weight") === "500",
+    explicitText.style.getPropertyValue("--mt-font-weight") === "300",
     explicitText.style.getPropertyValue("--mt-font-weight"));
   check("probe follows the explicit weight too",
-    probe.style.getPropertyValue("--mt-font-weight") === "500",
+    probe.style.getPropertyValue("--mt-font-weight") === "300",
     probe.style.getPropertyValue("--mt-font-weight"));
 })();
 
