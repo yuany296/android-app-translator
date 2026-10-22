@@ -1,6 +1,6 @@
 # MangaTranslatorMobile — Android 漫画翻译器
 
-一款运行在 Android 上的**无后端漫画/漫画翻译工具**。采用「前台服务 + 悬浮球 + 覆盖层」的形态，主链路为 **截图 → OCR → 翻译 → 覆写渲染 → 翻页清理**。支持云端视觉模型与本地离线引擎（PaddleOCR 本地 OCR + ML Kit 本地翻译）。
+一款运行在 Android 上的**无后端漫画/漫画翻译工具**。采用「前台服务 + 悬浮球 + 覆盖层」的形态，主链路为 **截图 → OCR → 翻译 → 覆写渲染 → 翻页清理**。支持云端视觉模型与本地离线引擎（PaddleOCR 本地 OCR + ML Kit 本地翻译）。还实现了在内嵌浏览器中的漫画翻译和网页翻译。
 
 工程结构说明见 [`docs/PROJECT_STRUCTURE.md`](docs/PROJECT_STRUCTURE.md)。
 
