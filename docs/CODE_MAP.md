@@ -69,7 +69,9 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 ```
 
 浏览器会话另有 `EmbeddedBrowser` 这个 Tag（`scene_ok` / `seam_dispatch` / `band_pair` / `scan` …）；
-截图翻译同 Tag（`shot_start` / `shot_ok` / `shot_fail` / `shot_drop` / `shot_empty` / `shot_reshow`）。
+截图翻译同 Tag（`shot_start` / `shot_ok` / `shot_fail` / `shot_drop` / `shot_empty` / `shot_dismiss`），
+另有显示权威日志 `layer_show source=snapshot|live` / `layer_hide reason=` / `shot_wait_prev` / `shot_frame_wait`
+（2026-10-16 重设计，§56；旧的 `shot_reshow*` 已随"可重看快照"机制删除）。
 
 ---
 
@@ -242,7 +244,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `AccessibilityMonitor.kt` | 把无障碍事件转成全局事件流并记住前台包名 | `publish` / `events` / `currentForegroundPackage` | 由 `OverlayAccessibilityService` 发布，`CaptureForegroundService` 消费 → 决定切应用/翻页是否清覆盖层 |
 | `OverlayAccessibilityService.kt` | 系统无障碍服务，转发窗口/滚动事件 | `onAccessibilityEvent` | 需用户在系统设置手动开启；只转发 4 类事件，不做业务判断 |
 | `OverlayAccessibilityPolicy.kt` | 按包名与事件类型决定覆盖层清理动作 | `decide` | 纯函数 + 单测；直接决定「翻页/切应用后译文还挂不挂在屏上」 |
-| `BrowserTranslateUiPolicy.kt` | 算出浏览器底栏按钮的可用性与文案 | `resolve` / `idleHint` | 被 `EmbeddedBrowserScreen` 底栏调用；纯数据可单测（2026-10-02「原文/翻译语义不统一」的收口点） |
+| `BrowserTranslateUiPolicy.kt` | 算出浏览器悬浮球与「原文｜译文」开关的可用性、文案与**三态动作**（翻译/停止/恢复原文） | `resolve` / `idleHint` | 被 `EmbeddedBrowserScreen` 的球、菜单开关与状态行调用；纯数据可单测（2026-10-02「原文/翻译语义不统一」的收口点；2026-10-16 §56 删掉 `canReshow` 与"点球重放旧快照"的隐藏优先级） |
+| `BrowserLayerPolicy.kt` | 屏上译文层的唯一事实来源 + 「一次只有一个来源」的切换判据 | `BrowserShownLayer`（NONE/LIVE/SNAPSHOT）、`retireBefore` | 纯函数 + `BrowserLayerPolicyTest`；宿主里只有 `hideTranslationLayer` / `displaySnapshotLayer` / `showLiveLayer` / 会话 `onRendered` 四处写它 |
 
 ### 4.6 `app`：界面
 
@@ -261,7 +264,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 
 | 文件 | 一句话职责 | 关键入口 | 备注 |
 |---|---|---|---|
-| `mt-overlay-renderer.js` | 注入 WebView 的译文 DOM 覆盖层：收 Kotlin 下发的场景 JSON，在目标 `<img>` 上建绝对定位 DOM，cover 层遮原文、text 层画译文，逐帧跟随滚动 | `applySceneJson` / `applySeamSceneJson` / `showLoadingJson` | 单文件 IIFE，92 个函数只经 `window.MtOverlay` 暴露；无任何前端依赖；注入点 `EmbeddedBrowserScreen.onPageFinished`（脚本带 `cached`，首行 `if (window.MtOverlay) return;` 保证幂等） |
+| `mt-overlay-renderer.js` | 注入 WebView 的译文 DOM 覆盖层：收 Kotlin 下发的场景 JSON，在目标 `<img>` 上建绝对定位 DOM，cover 层遮原文、text 层画译文，逐帧跟随滚动 | `applySceneJson` / `applySeamSceneJson` / `showLoadingJson` / `removeScene`（定向摘单张图，§56） | 单文件 IIFE，92 个函数只经 `window.MtOverlay` 暴露；无任何前端依赖；注入点 `EmbeddedBrowserScreen.onPageFinished`（脚本带 `cached`，首行 `if (window.MtOverlay) return;` 保证幂等） |
 
 **Kotlin 真正调用的 7 个出口**（其余导出只服务 Node 验收测试）：
 
@@ -324,10 +327,10 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/.../HandoffTextMatchTest.kt` | 移交文本证据（真机两形态 0.83 / 0.54） |
 | `app/.../SeamBandGeometryTest.kt` | 接缝带几何与盖板外扩 |
 | `app/.../BrowserSceneBuilderTest.kt` / `BrowserScanScriptTest.kt` | Kotlin↔JS 契约 |
-| `app/.../BrowserScreenshotTranslateTest.kt` | 截图翻译的几何采集/锚点/贴图 JS 契约（免授权链路） |
+| `app/.../BrowserScreenshotTranslateTest.kt` | 截图翻译的几何采集/锚点/贴图 JS 契约（免授权链路）+ 收起覆盖层的定向摘除与"解除一次性点屏监听"契约（§56） |
 | `app/.../EraseTargetsTest.kt` | 「读不出就别动」判据 |
 | `app/.../BubbleFontRulesTest.kt` | 译文字号规则 |
-| `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` | 会话/无障碍/底栏状态表 |
+| `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` / `BrowserLayerPolicyTest.kt` | 会话/无障碍/球与开关状态表/显示来源切换判据 |
 | `app/src/test/js/mt-overlay-acceptance.test.js` | 渲染层验收（node + `dom-stub.js`，含接缝/恢复/加载卡 + 字号自适应缩放/MTGEOM 重叠诊断） |
 | `core-store/...`（术语表/历史/浏览器数据） | 持久化与归一化 |
 | `core-overlay/...`（背景描边/取色/写出区域/清理图墨迹） | 擦字与配色判据 |

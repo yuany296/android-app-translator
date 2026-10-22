@@ -90,4 +90,53 @@ class BrowserScreenshotTranslateTest {
         // BrowserOverlayImageStore.put 同 key 会顶掉旧字节：token 必须是常量而不是每张新生。
         assertEquals("shotpng", BrowserScreenshotTranslate.PNG_TOKEN)
     }
+
+    /**
+     * 收起截图覆盖层（2026-10-16 重设计，Todolist §56）必须是**定向摘除**。
+     *
+     * 为什么钉死：覆盖层与活翻译层共用同一套 imageId 通道。收起时若用 `removeScenes()`
+     * （整体摘除），屏上活翻译的译文会一起消失，而 Kotlin 侧的 `placedIds` 还记着
+     * "已经贴过" → 那些译文再也不会回来（用户 2026-10-16 报「点球无法翻译」的现场）。
+     */
+    @Test
+    fun teardownJs_removesOnlyItsOwnNodes() {
+        val js = BrowserScreenshotTranslate.teardownJs()
+        assertTrue(js.contains("data-mt-id=\"${BrowserScreenshotTranslate.ANCHOR_ID}\""))
+        assertTrue(js.contains("data-mt-ov-for=\"${BrowserScreenshotTranslate.ANCHOR_ID}\""))
+        assertTrue(js.contains("removeScene('${BrowserScreenshotTranslate.ANCHOR_ID}')"))
+        // 定向摘除：绝不许出现整体摘除入口。
+        assertFalse(js.contains("removeScenes"))
+    }
+
+    /**
+     * 收起覆盖层时必须**解除**一次性点屏监听（修的是"残留监听把活译文清掉"那条链）。
+     *
+     * 改造前只有监听自己触发时才自摘，`showOriginal()` 与 REMOVE_JS 都不解除它 ——
+     * 一旦被留下，之后任意一次页面点击就会整体摘除场景，而宿主还以为是截图译文被点掉。
+     */
+    @Test
+    fun teardownJs_disarmsTheOneShotTapListener() {
+        val js = BrowserScreenshotTranslate.teardownJs()
+        assertTrue(js.contains("__mtShotDismiss"))
+        assertTrue(js.contains("removeEventListener"))
+    }
+
+    @Test
+    fun dismissOnTapJs_isOneShotAndTargetsOnlyTheScreenshotLayer() {
+        val js = BrowserScreenshotTranslate.dismissOnTapJs()
+        // 武装 + 自摘（只吃这一次点击）。
+        assertTrue(js.contains("window.__mtShotDismiss=function()"))
+        assertTrue(js.contains("addEventListener('click',window.__mtShotDismiss,true)"))
+        // 通知宿主复位状态（状态行/开关/球都靠它）。
+        assertTrue(js.contains("MTShotBridge"))
+        assertTrue(js.contains("removeScene('${BrowserScreenshotTranslate.ANCHOR_ID}')"))
+        assertFalse(js.contains("removeScenes"))
+    }
+
+    /** 「原文」视图的整体摘除同样要解除监听：否则切回译文后第一次点击就把它清掉。 */
+    @Test
+    fun removeAllJs_disarmsTheScreenshotTapListener() {
+        assertTrue(BrowserScreenshotTranslate.removeAllJs().contains("__mtShotDismiss"))
+        assertTrue(BrowserScreenshotTranslate.removeAllJs().contains("removeScenes"))
+    }
 }

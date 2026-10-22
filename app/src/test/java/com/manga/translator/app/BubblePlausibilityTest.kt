@@ -45,6 +45,63 @@ class BubblePlausibilityTest {
     }
 
     // ------------------------------------------------------------------
+    // 2026-10-18 真机：竖排/3 行韩文盖板下面露原文
+    // 现场 mt185：cover_box=35.0%（旧 35% 上限），text=39.79%（3 行韩文）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun tallVerticalColumnIsNotClampedByHorizontalLineCap() {
+        // 竖排固定 sourceLineCount=1；旧逻辑会把 70% 高的竖列钳到 35%，下沿全露。
+        assertNull(
+            BubblePlausibility.clampCoverHeight(
+                coverBoxPercent = floatArrayOf(10f, 5f, 20f, 70f),
+                lineCount = 1,
+                vertical = true
+            )
+        )
+    }
+
+    @Test
+    fun normalGlyphDerivedCoverIsNotClampedEvenWhenLineCountIsUnderestimated() {
+        // 现场：3 行文字被报成 1 行 → 旧上限 35%，但字形底+外扩在 40.2%，
+        // 正常盖板（= 字形 + 外扩）不能被钳短。
+        assertNull(
+            BubblePlausibility.clampCoverHeight(
+                coverBoxPercent = floatArrayOf(32.6f, 19.2f, 36.4f, 40.2f),
+                lineCount = 1,
+                vertical = false,
+                glyphBottomPercent = 59.4f
+            )
+        )
+    }
+
+    @Test
+    fun clampNeverCutsBelowDetectedGlyphBottom() {
+        // 40% 高、字形底在 48%：即使超过 35% 上限，也只能钳到字形底（38%），不能钳到 35%。
+        val clamped = requireNotNull(
+            BubblePlausibility.clampCoverHeight(
+                coverBoxPercent = floatArrayOf(10f, 10f, 50f, 50f),
+                lineCount = 1,
+                glyphBottomPercent = 48f
+            )
+        )
+        assertArrayEquals(floatArrayOf(10f, 10f, 50f, 38f), clamped, 0.001f)
+    }
+
+    @Test
+    fun abnormalCoverStillClampedWhenGlyphIsSmall() {
+        // 换算错误：盖板 80% 高，但字形底只有 20% → 仍钳到 35%（安全网保留）。
+        val clamped = requireNotNull(
+            BubblePlausibility.clampCoverHeight(
+                coverBoxPercent = floatArrayOf(5f, 10f, 90f, 80f),
+                lineCount = 1,
+                glyphBottomPercent = 20f
+            )
+        )
+        assertArrayEquals(floatArrayOf(5f, 10f, 90f, 35f), clamped, 0.001f)
+    }
+
+    // ------------------------------------------------------------------
     // effectiveLineHeightPx（2026-10-15：混合字号页面上的扩框行高）
     // ------------------------------------------------------------------
 

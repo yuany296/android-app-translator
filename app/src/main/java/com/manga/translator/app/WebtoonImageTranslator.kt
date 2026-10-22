@@ -1075,7 +1075,13 @@ class WebtoonImageTranslator(
         val lineHeightPx: Float,
         val fixedFontPx: Float?
     ) {
-        /** 带必须覆盖的全部框（遮罩 + 轮廓 + 排版框：译文排版可能比字形框大一圈）。 */
+        /**
+         * 带必须覆盖的全部框（遮罩 + 轮廓 + 排版框：译文排版可能比字形框大一圈）。
+         *
+         * 2026-10-19 用户裁定：跨缝竖排**不做横向右移/外扩**。右移会把盖板压到人物脸上，
+         * 再叠上实底就是一块黑板（用户截图「为什么要右移，回退」）。这里恢复原始口径：
+         * 盖板/排版仍用本半页 OCR 得到的框；下半列若横向错位，宁可少盖一点，也不动整块。
+         */
         val boxes: List<SeamBandGeometry.Box> = listOfNotNull(
             coverBox,
             SeamBandGeometry.boundsOfPoints(maskPolygon),
@@ -1693,11 +1699,31 @@ class WebtoonImageTranslator(
             // 盖板高度超过 单行 35% / 多行 60% × 原图高时，这个尺寸只可能是换算错误
             // （拼接/移交/条带的任何一环）—— 钳高并把轮廓多边形置空（退回纯矩形盖板），
             // 把「一整块超大盖板」变成一个合规矩形。排版/字号不动（用户规则）。
-            val coverClamp = BubblePlausibility.clampCoverHeight(coverBoxPercent, lineCount)
+            //
+            // 2026-10-18 真机（Kakao 竖排 + 3 行韩文）：竖排固定 sourceLineCount=1 →
+            // 35% 上限把竖排/多行盖板从下面切掉（实测 cover=35.0%、text=39.79%，最后一行
+            // 原文全露）。现在竖排不做高度钳制，横排也以「字形底 + 下沿外扩」为下限 ——
+            // 正常盖板（字形框 + 外扩）永远不会被钳短，详见 BubblePlausibility。
+            val glyphBottomPercent = maskRectPercent[1] + maskRectPercent[3] +
+                if (srcH > 0) coverPadBottomPx / srcH * 100f else 0f
+            val coverClamp = BubblePlausibility.clampCoverHeight(
+                coverBoxPercent = coverBoxPercent,
+                lineCount = lineCount,
+                vertical = vertical,
+                glyphBottomPercent = glyphBottomPercent
+            )
             if (coverClamp != null) {
                 tiltProbe.append(
                     "|b$index cover_clamped=${"%.1f".format(coverBoxPercent[3])}->" +
-                        "${"%.1f".format(coverClamp[3])}% "
+                        "${"%.1f".format(coverClamp[3])}% " +
+                        "glyph_floor=${"%.1f".format(glyphBottomPercent)}% "
+                )
+            } else if (coverBoxPercent[3] > BubblePlausibility.maxCoverHeightPercent(lineCount)) {
+                // 超过旧上限但没有钳：要么是竖排，要么是字形底本来就在上限以下。
+                // 留一行诊断，下一轮真机核对「盖板是否完整」时不用再猜。
+                tiltProbe.append(
+                    "|b$index cover_kept=${"%.1f".format(coverBoxPercent[3])}%" +
+                        " glyph_floor=${"%.1f".format(glyphBottomPercent)}% "
                 )
             }
             val isCross = crossFlags.getOrElse(index) { false }

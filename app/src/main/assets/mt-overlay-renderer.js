@@ -290,9 +290,14 @@
    * 几何自洽：|倾角| ≥ 60° 且框宽 > 框高 → 判为误判（OCR 把多行横排读成竖排），按水平渲染。
    * 真正的竖排（框高大于宽）与斜排 SFX（|倾角| < 60°）不受影响。
    */
-  function sanitizeRenderRotationDeg(rotation, boxWidth, boxHeight) {
+  function sanitizeRenderRotationDeg(rotation, boxWidth, boxHeight, vertical) {
     var angle = Number(rotation) || 0;
     if (Math.abs(angle) < RENDER_ROTATION_VERTICAL_MIN_DEG) return angle;
+    // 2026-10-18 真机：竖排接缝气泡的 OCR 四边形是斜的，quad 角度给到 -82.6°。
+    // 这个角度是「这一列的方向」，不是要把整列再转 82°；竖排已经由 writing-mode
+    // 表达，再旋转会把一条竖列转成横跨画面的巨大横排（用户截图「巨大横排中文」）。
+    // 框的宽高在这种近方形/竖长框上又不足以触发下面的自动纠偏，所以必须显式看 vertical。
+    if (vertical === true) return 0;
     var width = Number(boxWidth) || 0;
     var height = Number(boxHeight) || 0;
     if (!(width > 0 && height > 0)) return angle;
@@ -1074,7 +1079,8 @@
     return sanitizeRenderRotationDeg(
       resolveTiltRotationDeg(explicit, candidates),
       Number(bubble && bubble.w) || 0,
-      Number(bubble && bubble.h) || 0
+      Number(bubble && bubble.h) || 0,
+      bubble && bubble.vertical === true
     );
   }
 
@@ -1869,7 +1875,8 @@
       var angle = sanitizeRenderRotationDeg(
         polygonRotationDeg(polygon, sx, sy),
         Number(node.dataset.wPercent) || 0,
-        Number(node.dataset.hPercent) || 0
+        Number(node.dataset.hPercent) || 0,
+        node.classList.contains("mt-jp-vertical")
       );
       // 只在真的需要倾斜时改写：轴对齐的多边形 polygonRotationDeg 返回 0，
       // 覆盖成 rotate(0.00deg) 与原来的 translate(-50%,-50%) 等价。
@@ -2572,6 +2579,38 @@
   }
 
   /**
+   * 定向摘掉**某一张图**的场景层（2026-10-16，Todolist §56）。
+   *
+   * 为什么不能用 [removeScenes] 代替：那是「原文」视图的整体摘除，会把**所有**图的场景一起
+   * 拔掉并清空登记表。截图翻译的覆盖层走的是同一个 imageId 通道（`mt-shot`），收起它时若用
+   * removeScenes，屏上活翻译的译文会跟着消失 —— 而会话的 `placedIds` 还记着"已经贴过"，
+   * 那些译文就再也不会回来（用户 2026-10-16 报「点球无法翻译」的一条真实成因）。
+   *
+   * @return 摘掉的 root 数量（0 = 本来就没有）
+   */
+  function removeScene(imageId) {
+    var key = String(imageId || "");
+    if (!key) return 0;
+    var entry = overlaysById.get(key);
+    if (entry) {
+      destroyOverlay(entry);
+      return 1;
+    }
+    // 登记表里没有（例如页面重建过、登记被清）：按 data-image-id 兜底扫一遍。
+    // 用 dataset 比对而不是属性选择器：dataset 是渲染层写 root 的唯一途径，
+    // 两者一定一致；也免得依赖个别环境里属性反射的差异。
+    var removed = 0;
+    document.querySelectorAll(".__mt_scene_root").forEach(function (node) {
+      if (!node || !node.dataset) return;
+      if (String(node.dataset.imageId || "") !== key) return;
+      node.remove();
+      removed += 1;
+    });
+    if (removed > 0) stopFrameSyncIfIdle();
+    return removed;
+  }
+
+  /**
    * 清理图晚绑定（§5 第 2 步）：整页清理图是页面级异步产物，覆盖层永远先上屏
    * （透明遮罩）。图落地那一刻**直接写到已经存在的 DOM 上**，不等下一次场景下发 ——
    * 少了这一步就会出现「同一章里有些分片有遮罩、有些没有」。
@@ -3193,6 +3232,8 @@
     seamSceneState: seamSceneState,
     removeSeamScene: dropSeam,
     removeScenes: removeScenes,
+    // 定向摘除单张图的场景（截图覆盖层收起时用，绝不许用 removeScenes 代替）。
+    removeScene: removeScene,
     // loading 框（2026-10-02）：正在处理的图上方浮一个胶囊，文案由 Kotlin 按阶段下发。
     showLoadingJson: showLoadingJson,
     hideLoading: hideLoading,

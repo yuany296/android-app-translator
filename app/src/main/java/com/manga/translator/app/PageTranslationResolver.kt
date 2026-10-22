@@ -39,6 +39,12 @@ class PageTranslationResolver(
         // （2026-10-15：语言提示已按用户裁定移除；翻译语言恒等于用户配置。）
         // 翻译一律按用户配置的语言走，不再用识别结果改写 sourceLanguage。
         val effective = settings
+        // 2026-10-18（用户选 A）：整页台词作为上下文（含缓存命中、本次不翻的句子）。
+        // 缓存命中句以前根本不会送给模型，模型只能看到半页碎句，这是「不流畅」的来源之一。
+        // 阅读顺序沿用调用方给的 bubbles 顺序（浏览器链路是文档序，截图链路是 OCR 序）。
+        val pageContext = bubbles.map { it.originalText }
+            .map { it.trim().replace(Regex("\\s+"), " ") }
+            .filter { it.isNotEmpty() }
         val sentenceRepo = ServiceLocator.sentenceTranslationRepository
         val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
             val map = hashMapOf<String, String>()
@@ -100,6 +106,11 @@ class PageTranslationResolver(
         }
 
         val fresh = runCatching {
+            timer.mark(
+                "translate_context",
+                "page=${pageContext.size} missing=${missing.size} " +
+                    "cached=${cacheStats.hitCount} skipped=${cacheStats.skipped}"
+            )
             timer.mark("request_send", "stage=translate missing=${missing.size} total=${bubbles.size}")
             val (translated, fallbackHint) = withContext(ioDispatcher) {
                 translateMissing(
@@ -107,7 +118,8 @@ class PageTranslationResolver(
                     texts = missing.map { it.originalText.replace(Regex("\\s+"), " ").trim() },
                     glossaryEntries = glossaryEntries,
                     timer = timer,
-                    onTranslatorDownloading = onTranslatorDownloading
+                    onTranslatorDownloading = onTranslatorDownloading,
+                    pageContext = pageContext
                 )
             }
             timer.mark("response_ok", "stage=translate count=${translated.size}")
@@ -168,7 +180,8 @@ class PageTranslationResolver(
         texts: List<String>,
         glossaryEntries: List<GlossaryEntry>,
         timer: TranslationTimer,
-        onTranslatorDownloading: ((Boolean) -> Unit)? = null
+        onTranslatorDownloading: ((Boolean) -> Unit)? = null,
+        pageContext: List<String> = emptyList()
     ): Pair<List<String>, String?> {
         // 本地引擎优先：离线、无网络往返，显著提速。
         // 2026-08-27 用户要求：选择 ML Kit 引擎时失败**不回退云端**，直接显示原文并提示原因。
@@ -253,7 +266,8 @@ class PageTranslationResolver(
             targetLanguageId = settings.targetLanguage,
             enableThinking = settings.enableThinking,
             thinkingBudget = settings.thinkingBudget,
-            glossary = glossaryEntries.map { it.source to it.target }
+            glossary = glossaryEntries.map { it.source to it.target },
+            pageContext = pageContext
         )
         // 2026-10-14：重试后仍有句子等于原文（解析失败/截断/模型没翻）时给提示，不再静默。
         val failed = cloud.failedIndices.size

@@ -1,6 +1,307 @@
 # Todolist
 
+## 58. 用户 2026-10-19：三行韩文被读成 3→1→2 / 下面一句分成两块 —— Paddle 多行框逐行重排（2026-10-19）
+
+用户报：①「下面那一句没有完全合并，它是分为了两块；交界处的有一块文字被合并到上面和下面都有了」；
+②「历史记录里文字不是从上到下合并的，『못된 / 아이는 / 벌받아』被读成第三行、第一行、第二行，
+所以翻成『角受罚没出息的孩子』」。
+
+### 一、历史记录实证
+
+同一页 `pageHash c731998c…` 的历史里能看到多次 OCR 结果：
+
+```
+h1792331576617  orig = "아이는\n벌받아"        （只有第 2、3 行，第 1 行漏掉）
+h1792332179779  orig = "뿔받하못된아이는"       （第 3 行 → 第 1 行 → 第 2 行）
+h1792337992178  orig = "뿔받하못된아이는"
+h1792340909264  orig = "뿔받하못된아이는"
+```
+
+翻译模型只是照这个顺序翻，所以出现「角受罚没出息的孩子」。根因在 **Paddle 检测框把三行框成了一个 crop**，
+`recognizeQuad` 只跑一次整框 rec，模型返回顺序不受控；`TextBlock.lineCount` 仍写 1，
+后续排字/合并也拿不到真实行数。
+
+### 二、修复
+
+- 新增 `core-translate/PaddleTextLineSplitter.kt`（纯逻辑）：
+  - 以整张 crop 的亮度中位数为背景，逐行统计偏离像素 → 墨迹投影（深底浅字/浅底深字都成立）；
+  - 连续墨迹行成带，合并小间隙，丢掉描边/噪点碎片；2~6 行才切，单行/复杂排版返回空。
+- `PaddleOcrLocalTextDetector.recognizeSplitLines`：
+  - 只对横排、非竖排 crop、`allowLineSplit` 模式生效（均衡/质量开启，快速模式关闭）；
+  - 按投影切行 → 每行单独 rec → 按 top 从上到下拼回；
+  - 任一行失败 / 切分后字数少于整框 60% / 质量闸门不过 → 保留整框结果（旧行为）；
+  - 整框 rec 为空但逐行成功时用逐行结果；
+  - 填充 `lineCount` 与 `lineBoxes`（原图像素），后续字号/气泡归属直接受益；
+  - 日志 `paddle_line_split quad_idx=… lines=… text=…`。
+- 新增 `PaddleTextLineSplitterTest` +6（深底/浅底投影、三行顺序、间隙合并、描边过滤、
+  均匀行空结果、上下限）。
+
+### 三、验证
+
+- 逐行实验版曾 `testDebugUnitTest` **695 通过 / 0 失败**（core-translate 194）；
+  回退后当前为 **689 通过 / 0 失败**（core-translate 188），JS 验收 **240/240**。
+- `:app:assembleDebug` 通过，已装 AN3GUT4A22006400。
+- 真机复测（待用户）：重新打开这一话 → 点球重翻；历史里应看到
+  `못된…아이는…벌받아` 的顺序，译文应接近「坏孩子要受罚」。
+- 快速模式仍不切行（速度优先）；均衡/质量模式生效。
+
+### 四、2026-10-19 回退（用户：识别越来越慢 + 出现「ii」）
+
+- 逐行投影 + 二次 det + 逐行 rec 的实验**整体回退**：
+  - `PaddleOcrLocalTextDetector` 恢复「单框一次 rec」，删除 `recognizeSplitLines` /
+    `LineSplitResult` / 行 det / 调试落盘；
+  - `PaddleTextLineSplitter.kt` 及其单测删除；
+  - `SpeedModeConfig.allowLineSplit` 与 `LINE_SPLIT_*` 常量删除。
+- 原因：真机上 ①仍出现 3→1→2；②有一版多出「ii」一行；③多行框多跑 det/rec，识别明显变慢。
+- 当前结论：`3→1→2` 是 **Paddle mobile det** 的检测/行框问题；参考项目用的是
+  `PP-OCRv5_server_det + split_multiline`，不是同一套模型。要修需要独立行检测/server det，
+  不能靠当前 mobile det 上叠投影/二次 rec，否则只会更慢。
+- 保留：竖排 ±90° 不旋转、盖板高度修正、页面上下文 A。
+- 验证：回退后全模块测试通过（app 293 / core-translate 188 / core-store 113 /
+  core-overlay 60 / core-capture 35 = 689），JS 240/240；APK 已重装，速度恢复单次识别。
+
+### 五、未做 / 下一轮
+
+1. **接缝重复**（同一行上下都有）：行序修好后，如果仍出现，下一步读活页面的
+   seam root / 两张相邻图的气泡，确认是 `SeamBubbleMerger` 没合并、还是
+   `suppressSeamHalves` 只摘掉了一半。优先做“行级文本 + 行几何”去重。
+2. 如果三行仍被拆成两块：说明 Paddle 检测返回了**两个 quad**，逐行切分管不到跨 quad；
+   需要在 `PaddleOcrBlockMerger` / `BubbleFirstRegionPlanner` 里按行框把同一气泡的
+   上下块并回来。
+3. 多行框多跑 N 次 rec，均衡/质量模式单张耗时会增加（当前未量化）；真机如果明显变慢，
+   再按“行数/置信度”收紧闸门。
+
+## 57. 用户 2026-10-18：竖排/多行盖板下面露原文 + 翻译上下文（A）——盖板钳制误伤真机实证（2026-10-18）
+
+用户报两条：①「韩漫里竖排的文字，很容易下面没有背景覆盖，挡不住原文」；
+②「漫画翻译不太流畅，是不是需要上下文」→ 用户选 **A（页面级上下文）**，翻译引擎 DeepSeek API。
+
+### 一、真机取证（AN3GUT4A22006400，HONOR MAA-AN10 / Android 16）
+
+这台机器的系统 logcat 受限（`adb logcat -g` 显示 main buffer `0 B readable`，`ink_tilt`
+抓不到）。debug 包 WebView 开了 `setWebContentsDebuggingEnabled`，改用 CDP 直接读活页面 DOM
+（`adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>` + `scripts/cdp-eval.mjs`）：
+
+```
+mt185（Kakao 760x1000，3 行韩文「角受罚/没出息/的孩子」）：
+  cover  x=32.6  y=19.2  w=36.43 h=35.0   (%)   ← 正好是 35% 上限
+  text   x=33.91 y=20.2  w=33.8  h=39.79  (%)   ← 文字层多出 4.79%
+  dataset.sourceLineCount=1
+
+竖排接缝层 mt197|mt198（「哦哦好可怕呀海神发怒了」）：
+  cover  h=31.17% of band
+  text   h=99.46% of band, mt-jp-vertical, sourceLineCount=1
+```
+
+结论：不是 OCR 没读到（文字层已经包含最后一行），是 §52 的
+`BubblePlausibility.clampCoverHeight` 对所有气泡套 35%/60%：
+竖排固定 `sourceLineCount=1` → 35%；`mt185` 的 3 行被检测器报成 1 行 → 也走 35%。
+钳制只保上沿，下沿被切；接缝层的 cover 又来自被钳过的 owned 半块，所以竖排整列只盖了
+31.17%。
+
+### 二、修复
+
+- **盖板钳制按方向/字形底修正**（`app/BubblePlausibility.kt`）：
+  - `clampCoverHeight(coverBox, lineCount, vertical, glyphBottomPercent)`；
+  - 竖排不做 35%/60% 高度钳制（高度上限 100%）；
+  - 横排仍钳，但下限 = 字形底 + 下沿外扩；`maxHeight = max(ratioCap, glyphFloor)`，
+    正常盖板（字形框 + 外扩）永远不会被钳短；只有「盖板明显高于字形底」才触发安全网。
+- **调用点**（`WebtoonImageTranslator.resolveFinalBubbles`）：传入 `vertical` 与
+  `maskRectPercent.bottom + coverPadBottomPx`；`ink_tilt` 诊断新增
+  `cover_kept=<h>% glyph_floor=<...>%`，下一轮可直接看是否被钳。
+- **页面级上下文 A**（`app/PageTranslationResolver.kt` + `core-translate/OpenAiVisionClient.kt`）：
+  - `pageContext` = 整页台词（含缓存命中句）；只翻未命中的，但上下文全给；
+  - prompt 新增 `The full page, in reading order, is context only` 块，要求利用相邻句
+    解代词/省略/称呼/语气，仍保持 1:1、不合并/不拆分；上限 80 行 / 6000 字符；
+  - 新增「Prefer natural word order over literal translation」；
+  - 日志 `translate_context page=… missing=… cached=… skipped=…`。
+- **句子缓存版本**（`core-store/SentenceTranslationRepository.kt`）：`version=2`；
+  版本不符整份丢弃一次，避免旧硬译永远命中、页面上下文只对新句子生效。
+- **测试**：`BubblePlausibilityTest` +4（竖排高列不钳 / 3 行误报 1 行不钳 /
+  字形底不被切 / 异常盖板仍钳）；`TranslatePromptTest` +3（上下文注入 / 整页==input 不重复 /
+  上下文 80 行截断）。
+
+### 三、验证
+
+- 全模块 `testDebugUnitTest`：**689 通过 / 0 失败**
+  （app 293 / core-translate 188 / core-store 113 / core-overlay 60 / core-capture 35）；
+  JS 验收 `mt-overlay-acceptance.test.js` **240/240**。
+- `:app:assembleDebug` 通过，已装 AN3GUT4A22006400（app-debug）。
+- 真机安装后旧会话停止；用户手机当时锁屏，**待解锁复测**：
+  - `mt185` 的 cover 应从 35.0% 变成约 40.2%（文字 39.79% + pad），底部韩文被盖住；
+  - 竖排接缝层 cover 应从 31.17% 变成接近 99%（整列）。
+- 本轮用 CDP 读 DOM 取证，**不需要真机 logcat**（HONOR 限制）；后续排障可复用
+  `adb forward` + `scripts/cdp-eval.mjs`。
+
+### 四、2026-10-18 用户复测「没完全解决」的追加修复
+
+用户 23:41 再报，截图是「一行巨大横排中文压在竖排韩文上」。CDP 抓到三条新证据：
+
+```
+mt21|mt22 竖排接缝：
+  rotation_deg=-82.6，writing-mode: vertical-rl，text rect 503.9x116.7
+  → 竖排 writing-mode + 近乎 90° 的 CSS rotate，竖列被转成横跨画面的巨大横排
+mt20|mt21 接缝：
+  cover 仍只在 band 左侧（1.77%..98.2%），原文列右侧约 40px 落在带外
+深色岩石上的清理图 patch：
+  仍残留原韩文（擦字没擦净），盖板铺满也“透”出白字
+```
+
+修复（保留）：
+
+- **竖排不再吃 ±90° 旋转**（`mt-overlay-renderer.js`）：`sanitizeRenderRotationDeg`
+  增加 `vertical` 参数，竖排 |角度| ≥ 60° 直接归零；`applyAspectCorrectedTilt`
+  对 `.mt-jp-vertical` 同样跳过。竖排方向由 `writing-mode` 表达，不再二次旋转。
+- JS 验收 +3（竖排文字节点不旋转、`_sanitizeRenderRotationDeg` 的 vertical 分支）。
+
+### 五、2026-10-19 用户裁定回退「右移 + 深色实底」
+
+用户看到上一版（右移 + `flat_cover`）后截图：竖排中文变成一块**很大的纯黑矩形**，
+压在人物脸上，明确说「为什么要右移，回退」。
+
+已回退：
+
+- `SeamBubbleGeometry` 的 `verticalShiftX` / `verticalBleedX` / `layoutRectForBand` /
+  `coverBoxForBand` / `maskPolygonForBand` / `regionPolygonForBand`；
+- `buildSeamBubble` 的 `forceFlatCover` / `flatCover`；
+- `SeamBandGeometry` 的 `verticalLayoutHorizontalShiftPx` /
+  `verticalLayoutHorizontalBleedPx` / `shouldForceFlatCoverForVertical` 及两条单测。
+
+当前口径：
+
+- 接缝竖排 cover/layout **仍用本半页 OCR 得到的框**，不做横向平移/外扩；
+- 深色竖排不再强制实底，回到清理图纹理；
+- **保留**竖排 ±90° 不旋转、盖板高度钳制修正、页面上下文 A。
+- 代价：下半列横向错位时右侧可能少盖一点（之前灰带的状态），但不会再把人物脸
+  涂成黑板。
+
+- 验证：全模块 **689 通过 / 0 失败**（app 293 / core-translate 188 / core-store 113 /
+  core-overlay 60 / core-capture 35）；JS 验收 **240/240**；已装真机。
+
+### 六、未做 / 下一轮
+
+1. 「竖排接缝右下角少盖一点」如果要继续修：优先用「每页各自的 cover segment」
+   或「下半列自己的 OCR 框」，不要再整块右移/实底（已证明代价太大）。
+2. 图 5 的「巨大横排」已按 `rotation` 修掉；若用户仍看到，优先查是否旧场景/旧包
+   （重开页面应消失），再读 `mt-jp-vertical` / `rotationDeg` / 场景 root 数量。
+3. 页面上下文目前取调用方 `bubbles` 顺序（浏览器链路文档序、截图链路 OCR 序）；
+   跨页/跨切图的上下文还没做（需要会话级上一张台词缓存）。
+4. 上下文只走云端（ML Kit/百度逐句引擎无提示词入口）；本地引擎的连贯性仍是引擎上限。
+
+## 56. 用户 2026-10-16/17：「截图翻译后换回原文，再点悬浮球就无法翻译了」—— 截图翻译 = 首页同款一次性覆盖层（重设计，2026-10-17）
+
+用户原话两段：「截图翻译后，点击换回原文再次点击悬浮球就好像无法进行翻译了。总之就是截图翻译和
+悬浮球翻译模式冲突了。需要重新设计。」+「我之前的的想法是截图翻译和首页的启动服务的交互相同，
+点击截图翻译，截图在整个屏幕上建立译文层，不过这是在应用内，所以不要权限，然后点击译文层任意一个
+地方，译文层消失。」
+
+### 一、现场复现（emulator-5554 + `pages.html`，改代码前先取证）
+
+`adb logcat -s EmbeddedBrowser:V` 抓到的真实序列（旧包，即 §46 修完后的行为）：
+
+```
+17:27:02 shot_start url=lezhin.com/ko/comic/gods_will/7 dom_overlay=true
+17:27:06 shot_ok mode=dom bubbles=7 cost=3471ms
+17:27:11 shot_dismiss source=page_tap            ← 点屏幕 = 恢复原文（首页同款，用户要的）
+17:27:13 shot_reshow mode=dom bubbles=7          ← 点球：**重放了同一张截图**（不是翻译！）
+17:27:14 session_start token=12 mode=TRANSLATE
+17:27:14 scan … shown=3                          ← 会话以为 3 张"已在屏上"，一张都不会重贴
+```
+
+`shot_reshow` 就是用户看到的「点球没翻译」：球没有开始翻译，只是把刚摘掉的同一张截图又贴了回来；
+紧接着那次 `session_start` 又因为屏上状态与宿主记账对不上，一张都上不了屏（状态行却写着
+「原文显示中 · 后台继续翻译」）。
+
+### 二、根因（四条，全部有代码定位）
+
+- **A 球被"旧快照"劫持**：`onPrimaryAction` 前置拦截「空闲 + 有截图结果 + 屏上无译文 →
+  重发截图」并 `return`，**永远轮不到 START**；而截图结果既不过期也不让位。
+  且重发贴在**捕获时的文档位置**，用户滚动后回看就在屏外 —— 看起来更是"点了没反应"。
+- **B 重发不动 `viewMode`**：`reShowScreenshot` 只写 `hasRenderOnPage`/状态行；点屏幕恢复原文已把
+  `viewMode` 拨成 ORIGINAL，于是随后的会话 `isViewVisible` 恒假 → `canPlace()` 恒假 →
+  OCR/翻译全做了却只 `scene_cached_hidden`。
+- **C 一次性点屏监听跨模式泄漏**：它挂在 document 捕获阶段，**只在自身触发时自摘**；
+  `showOriginal()` 与 `REMOVE_JS` 都不解除。留下后任意一次页面点击就 `querySelectorAll('.__mt_overlay,
+  .__mt_scene_root').remove()` + `MtOverlay.removeScenes()` —— 把**活翻译层一起清掉**，再回宿主把
+  视图拨成原文。
+- **D 收层不还记账**：点屏幕收起时页面侧删了场景根，宿主 `placedIds` 却不清 → 会话判「已在屏上」
+  （`needsReShow` 假）→ 译文再也不会回来。
+
+小结：屏上状态散在 `hasRenderOnPage` / `viewMode` / `screenshotRender` 三处，各写各的；
+再叠加"截图结果 = 第二种译文来源"，球就成了两种模式抢的同一个按钮。
+
+### 三、重设计（定稿）
+
+**截图翻译 = 首页那条链路的应用内版本：一次性覆盖层。**
+
+| 动作 | 行为 |
+| --- | --- |
+| ⋮ 菜单「截图翻译」 | 停会话 → 等上一会话收尾 → **收起当前译文层** → 等一次视觉提交 → 截图 → 管线 → 建立覆盖整个视口的译文层 |
+| 点译文层任意处 | 收起覆盖层（恢复原文），状态行「已恢复原文 · 再点球翻译整页」 |
+| 覆盖层在屏时点球 | **恢复原文**（`BrowserPrimaryAction.RESTORE`，对齐 `CaptureForegroundService.handleFloatingTap`：译文层在屏时点球 = 恢复原文，不触发新翻译） |
+| 收起后点球 | **开始整页翻译**，并切到「译文」视图（保证点球一定看到中文） |
+| 想再来一次 | ⋮ 菜单「截图翻译」再点一次（**不再有"可重看"状态**：§46 那条"点球重看截图译文"整个删除） |
+
+硬规则：**R1 一次只有一个译文来源**（`BrowserShownLayer`：NONE/LIVE/SNAPSHOT，唯一事实来源）、
+**R2 球单击只有一个语义**（翻译/停止/恢复原文，由 `BrowserTranslateUiPolicy.resolve` 判定）、
+**R3 「原文｜译文」段只显隐当前层**。
+
+### 四、改动清单
+
+- 新增 `app/BrowserLayerPolicy.kt`（`BrowserShownLayer` + `retireBefore`）；
+  `BrowserTranslateUiPolicy` 增三态动作（`BrowserPrimaryAction.RESTORE`）、`screenshotBusy`、
+  `primaryBusy`，删 `canReshow`；`idleHint` 口径改为"不再承诺点球重看"。
+- `EmbeddedBrowserScreen`：删掉 `screenshotRender` / `ScreenshotRender` / `reShowScreenshot()` /
+  `onPrimaryAction` 的重看拦截 / `hasRenderOnPage`；新增唯一写入口
+  `hideTranslationLayer` / `displaySnapshotLayer` / `showLiveLayer` + `shotDismissBridge` 收紧为
+  「屏上是不是快照」并补 `placedIds.clear()`。
+- 截图链路：截图前 `stopSession` + **join 上一会话**（协作式停止是延迟生效的，防两个 OCR 抢引擎）、
+  收层、`postVisualStateCallback` **等一次视觉提交**再 PixelCopy（顺带修掉「截图把已有译文一起截进去」）、
+  失败/空/跳转自动贴回活翻译层（`layer_show source=live reason=shot_restore`）。
+- 页面侧：`BrowserScreenshotTranslate.teardownJs()`（定向摘锚点/贴片/`MtOverlay.removeScene('mt-shot')`
+  + 解除一次性监听）；`dismissOnTapJs` 的响应体从「整片摘除 + removeScenes」改成同一段定向逻辑；
+  `REMOVE_JS` 拼装 `SHOT_DISARM_JS`（切原文也解除监听）；渲染层新增 `MtOverlay.removeScene(imageId)`。
+- 球 UI：三态（蓝「译」/ 红方块「停止」/ 蓝 ✕「恢复原文」）+ 忙碌态（转圈、降透明度、
+  点它把原因写进状态行，不再静默）；无障碍描述随三态变化。
+
+### 五、验证
+
+- 单测全模块 **682 通过 / 0 失败**（app 289 / core-translate 185 / core-store 113 /
+  core-overlay 60 / core-capture 35；新增 `BrowserLayerPolicyTest` 4 条、
+  `BrowserTranslateUiPolicyTest` 重写 11 条、`BrowserScreenshotTranslateTest` +4 条契约）。
+- JS 验收 `mt-overlay-acceptance.test.js` **ALL_OK 237/237**（+9：`removeScene` 定向摘除/
+  幂等/空 id/不动别的图）。
+- 模拟器端到端（emulator-5556 / Pixel_8，`.verify/web/pages.html`，新包；日志 `EmbeddedBrowser`）：
+
+  | # | 断言 | 实测 |
+  | --- | --- | --- |
+  | 1 | 截图翻译全链路 | `shot_start` → `shot_frame_wait committed=true` → `shot_capture … pixelcopy` → `layer_show source=snapshot mode=dom bubbles=3` → `shot_ok … cost=482~1051ms` |
+  | 2 | 点屏幕 = 恢复原文（首页同款） | `shot_dismiss source=page_tap`；CDP：`roots=0`、`window.__mtShotDismiss=null` |
+  | 3 | **核心回归**：收起后点球 | `ball_tap action=start shown=NONE` + `session_start … scan reshow=3`，8s 内 3 张译文上屏；**全程无 `shot_reshow`** |
+  | 4 | 覆盖层在屏时点球 = 恢复原文 | 球 desc 变「点按恢复原文（截图译文显示中）」；`layer_hide reason=ball_restore previous=SNAPSHOT`，**不启动会话**，CDP `roots=0` |
+  | 5 | 有活层时点「截图翻译」 | `shot_wait_prev waited=1106ms` + `layer_hide reason=shot_capture previous=LIVE` + `layer_show source=snapshot` |
+  | 6 | 活层在屏时点页面 | **无 `shot_dismiss`**，3 个 root 保留（修 C 的硬断言） |
+  | 7 | 菜单「原文」后点球 | `layer_hide reason=menu_original` → `ball_tap action=start` → 3 张秒回（D4：START 一并切回译文视图） |
+
+  未在环内验证（留人工/下一轮）：截图**失败**时自动贴回活层（`layer_show source=live reason=shot_restore`；
+  需要构造截图失败，本轮 pages.html 全成功）、球忙碌态（截图管线在本夹具上仅 0.5~1s，手的反应追不上）。
+
+- 构建注意：本机 DSH 会话早前对仓库**旧有**目录（`app/`、`build/`）写入会报 `数据无效 (13)`（aapt2），
+  本轮验证期间用 `mtbuild/redirect.gradle` 把 buildDirectory 重定向到工作区根下新建目录绕过；
+  用户改完机器权限后**标准构建已恢复正常**（`:app:assembleDebug` 直接产出
+  `app/build/outputs/apk/debug/app-debug.apk`），`mtbuild/` 已删除，仓库里不留临时文件。
+
+### 六、未做 / 下一轮
+
+1. 「原文｜译文」段在覆盖层期间显隐的是覆盖层本身（E2 定稿）；若用户希望这个开关完全不参与
+   覆盖层（置灰 + "截图译文显示中"），是一行改动。
+2. 覆盖层期间页面仍可滚动（`noTouch` 只禁指针事件）；滚动后覆盖层跟着文档走，位置正确但与
+   当前视口错开 —— 与首页那条链路"锁定到点一下"不同，本轮没做"滚动即收起"。
+3. 回到旧版本式的"截图结果重看"已被删除；若后续真需要，应该做成 ⋮ 菜单里的独立入口
+   （不碰球的语义），不要恢复"球优先重放"。
+
 ## 55. 用户 2026-10-16 追加（ML Kit 模式）：「还有漏掉的」+「模拟器盖板定位出错/超出对话框」——两修（2026-10-16）
+
 
 用户补充：这些问题**只在 ML Kit OCR 模式下出现，Paddle 没有**；并怀疑是 a3e5839 之后
 的提交引入（「a3e5839 这个版本 ML Kit 都是好的」）。

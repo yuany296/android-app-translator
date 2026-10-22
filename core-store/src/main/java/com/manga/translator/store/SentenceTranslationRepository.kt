@@ -202,7 +202,16 @@ class SentenceTranslationRepository(context: Context) {
         if (!file.exists()) return
         val text = runCatching { file.readText() }.getOrNull() ?: return
         runCatching {
-            val arr = JSONObject(text).optJSONArray("entries") ?: JSONArray()
+            val root = JSONObject(text)
+            // 2026-10-18：缓存语义版本。提示词/上下文策略变化后，旧译文不能继续命中，
+            // 否则「页面上下文」永远只对新句子生效。版本不符时整份丢弃，一次性重翻。
+            val version = root.optInt("version", 0)
+            if (version != CACHE_VERSION) {
+                Log.d(TAG, "cache_reset old_version=$version current=$CACHE_VERSION")
+                file.delete()
+                return
+            }
+            val arr = root.optJSONArray("entries") ?: JSONArray()
             for (itemIndex in 0 until arr.length()) {
                 val item = arr.optJSONObject(itemIndex) ?: continue
                 val sourceLanguage = item.optString("sourceLanguage", "").trim()
@@ -255,7 +264,12 @@ class SentenceTranslationRepository(context: Context) {
                     .put("translatedText", entry.translatedText)
             )
         }
-        file.writeText(JSONObject().put("entries", arr).toString())
+        file.writeText(
+            JSONObject()
+                .put("version", CACHE_VERSION)
+                .put("entries", arr)
+                .toString()
+        )
     }
 
     private fun keyOf(sourceLanguage: String, targetLanguage: String, originalText: String): String {
@@ -325,6 +339,13 @@ class SentenceTranslationRepository(context: Context) {
     companion object {
         const val FILE_NAME = "mt_sentence_translation.json"
         const val MAX_ENTRIES = 5000
+
+        /**
+         * 句子缓存语义版本（2026-10-18）。提示词、页面上下文策略或翻译规则发生
+         * 影响译文的改变时 +1：旧条目在 [ensureLoaded] 时整份丢弃，避免旧硬译
+         * 永远命中、新策略只对新句子生效。
+         */
+        const val CACHE_VERSION = 2
         private const val TAG = "SentenceCache"
         private const val MIN_FUZZY_COMPACT_LEN = 8
         private const val MIN_COMMON_PREFIX = 6

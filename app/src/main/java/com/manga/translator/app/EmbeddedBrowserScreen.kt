@@ -396,12 +396,50 @@ private fun installSiteConfigJs(adapter: BrowserSiteAdapter, siteRulesEnabled: B
     BrowserScanScript.installScript(BrowserScanScript.scriptConfigJson(adapter, siteRulesEnabled))
 
 /**
+ * 截图覆盖层在页面里的锚点 `data-mt-id`（同一时刻只有一张截图结果，重复截图原地替换）。
+ *
+ * 提到顶层常量是为了让「建立覆盖层」与「收起覆盖层」两边的 JS 拼装引用同一个值 ——
+ * 名字抄错一次就会留下摘不掉的孤儿节点（2026-10-16 重设计时统一到这里）。
+ */
+private const val SHOT_ANCHOR_ID = "mt-shot"
+
+/**
+ * 解除「点一下恢复原文」的一次性监听（2026-10-16，Todolist §56）。
+ *
+ * 为什么必须显式解除：那是挂在 document 捕获阶段的监听，**只在它自己触发时自摘**。
+ * 改造前 `showOriginal()` 与 REMOVE_JS 都不解除它 —— 一旦被留下，之后任意一次页面点击
+ * 就会把 `.__mt_scene_root` 整片删掉（连活翻译的译文一起），再回宿主把视图状态拨成原文，
+ * 于是"会话还在跑、屏上一张都上不来"。这是用户报「点球无法翻译」的另一条真实成因。
+ */
+private const val SHOT_DISARM_JS =
+    "if(window.__mtShotDismiss){document.removeEventListener('click',window.__mtShotDismiss,true);" +
+        "window.__mtShotDismiss=null;}"
+
+/**
+ * 页面侧摘除截图覆盖层的语句（**定向**：锚点 + 整图贴片 + 它自己的场景根 + 解除监听）。
+ *
+ * 定向是硬要求：截图覆盖层与活翻译层共用同一套 imageId 通道，整体摘除（`removeScenes()`）
+ * 会把活翻译的译文一起拔掉，而会话的 `placedIds` 仍记着"已贴过" → 那些译文再也不回来。
+ */
+private const val SHOT_TEARDOWN_STMT =
+    "var a=document.querySelector('[data-mt-id=\"$SHOT_ANCHOR_ID\"]');" +
+        "if(a&&a.parentNode){a.parentNode.removeChild(a);}" +
+        "var o=document.querySelectorAll('[data-mt-ov-for=\"$SHOT_ANCHOR_ID\"]');" +
+        "for(var i=0;i<o.length;i++){o[i].remove();}" +
+        "try{if(window.MtOverlay&&MtOverlay.removeScene){MtOverlay.removeScene('$SHOT_ANCHOR_ID');}}" +
+        "catch(e){}"
+
+/**
  * 「原文」视图：把覆盖层节点与渲染层场景一起摘掉。
  *
  * 注意它**不碰会话** —— 译文结果仍留在 `renderedTokens` / `renderedScenes` 里，
  * 切回「译文」可以按同样的数据重发（不重跑 OCR/翻译）。
+ *
+ * 2026-10-16：整层摘除之前先**解除截图覆盖层的一次性点击监听**（见 [SHOT_DISARM_JS]）——
+ * 不解除的话，切回原文之后用户在页面上的任意一次点击都会把刚贴回来的活译文清掉。
  */
 private const val REMOVE_JS = """(function(){
+  $SHOT_DISARM_JS
   var els = document.querySelectorAll('.__mt_overlay, .__mt_scene_root, .__mt_loading_root');
   for (var i = 0; i < els.length; i++) { els[i].remove(); }
   if (window.MtOverlay && MtOverlay.removeScenes) { try { MtOverlay.removeScenes(); } catch (e) {} }
@@ -559,6 +597,51 @@ private suspend fun captureViaPixelCopy(view: android.view.View, bitmap: Bitmap)
         }
     }
 }
+
+/**
+ * 截图前等上一会话收尾的上限（2026-10-16）。
+ *
+ * `stopSession` 是**协作式**的（不 cancel，理由见 `sessionScope` 的注释），它可能正卡在
+ * 一张图的 OCR 里；不等它，截图管线就会和它抢同一个 Paddle 引擎（会话不是并发安全的）。
+ * 超时只是兜底：宁可继续截图，也不让用户对着"正在截取画面…"干等。
+ */
+private const val PREV_SESSION_JOIN_TIMEOUT_MS = 15_000L
+
+/**
+ * 截图前等「DOM 变更已合成」的上限（2026-10-16）。
+ *
+ * PixelCopy 读的是**合成后**的窗口帧：先把当前译文层摘掉再截图时，如果不等一次视觉提交，
+ * 抓到的还是带着旧译文的那一帧（老限制「截图把已有译文一起截进去」就是这么来的）。
+ */
+private const val SHOT_VISUAL_COMMIT_TIMEOUT_MS = 600L
+
+/**
+ * 等 WebView 下一次**视觉提交**（真的画到窗口上），用于"摘层之后再截像素"。
+ *
+ * 为什么用 `postVisualStateCallback` 而不是 `post{}`：后者只保证 UI 线程跑过一轮，
+ * 不保证渲染线程已经把新的 DOM 状态合成出来；而 PixelCopy 抓的是合成结果。
+ * 超时/不支持（API < 23 或 View 未附着）都按"已提交"处理 —— 截图宁可有极小概率带上
+ * 旧译文，也不能把流程卡住。
+ */
+private suspend fun awaitVisualCommit(view: android.webkit.WebView, timeoutMs: Long): Boolean =
+    withTimeoutOrNull(timeoutMs) {
+        suspendCancellableCoroutine<Unit> { continuation ->
+            val posted = runCatching {
+                // VisualStateCallback 是抽象类（Java），没有 SAM 转换，必须显式 object。
+                view.postVisualStateCallback(
+                    android.os.SystemClock.uptimeMillis(),
+                    object : WebView.VisualStateCallback() {
+                        override fun onComplete(requestId: Long) {
+                            if (continuation.isActive) continuation.resume(Unit)
+                        }
+                    }
+                )
+                true
+            }.getOrDefault(false)
+            if (!posted && continuation.isActive) continuation.resume(Unit)
+        }
+        true
+    } ?: false
 
 /**
  * 截图翻译的**取证日志**（2026-10-14 用户报「截图里没读到可翻译的文字」）：
@@ -722,7 +805,7 @@ private fun placeOverlayJs(image: ScannedImage, token: String): String {
 internal object BrowserScreenshotTranslate {
 
     /** 视口锚点的 `data-mt-id`。同一时刻只有一张截图结果，重复截图原地替换。 */
-    const val ANCHOR_ID = "mt-shot"
+    const val ANCHOR_ID = SHOT_ANCHOR_ID
 
     /** 整图模式的 mtlocal token。固定复用一个：`put` 同 key 会顶掉旧字节，不积累内存。 */
     const val PNG_TOKEN = "shotpng"
@@ -824,20 +907,37 @@ internal object BrowserScreenshotTranslate {
             "return MtOverlay.noTouch('$ANCHOR_ID');})())"
 
     /**
+     * 收起截图覆盖层（页面侧定向摘除 + 解除一次性监听）。
+     *
+     * 调用点：球/菜单把覆盖层收起、开始活翻译前让位、设置变更作废、跳转前兜底。
+     * 与 [dismissOnTapJs] 用的是同一段语句，保证"点屏幕收起"和"宿主收起"结果一致。
+     */
+    fun teardownJs(): String = "((function(){${SHOT_DISARM_JS}${SHOT_TEARDOWN_STMT}return 1;})())"
+
+    /**
+     * 「原文」视图的整层摘除脚本（[REMOVE_JS]）。
+     *
+     * 暴露成函数只为一个原因：契约单测要钉住「它必须顺便解除一次性点屏监听」——
+     * 漏了解除，切回原文之后用户在页面上的任意一次点击都会把刚贴回来的活译文清掉。
+     */
+    fun removeAllJs(): String = REMOVE_JS
+
+    /**
      * 截图译文「点一下消失」（用户 2026-10-14：要悬浮球翻译那种交互 —— 点屏幕就恢复原文）。
      *
-     * 在页面捕获阶段挂**一次性** click 监听：任何点击都先摘掉截图译文层（含锚点/场景根/贴图，
-     * 与 REMOVE_JS 同口径），再通过 `MTShotBridge` 通知宿主更新状态；监听随即自摘
-     * （只吃这一次点击，之后的点击照常操作页面）。
+     * 在页面捕获阶段挂**一次性** click 监听：任何点击都先摘掉**截图自己的**覆盖层
+     * （锚点/贴片/它的场景根，定向，绝不整体清场景），再通过 `MTShotBridge` 通知宿主更新状态；
+     * 监听随即自摘（只吃这一次点击，之后的点击照常操作页面）。
+     *
+     * 2026-10-16：响应体从"整片摘除 + removeScenes()"改成定向摘除 —— 改造前它会把活翻译的
+     * 译文一并清掉，而宿主侧的 `placedIds` 还记着已贴过，那些译文再也不会回来。
      */
     fun dismissOnTapJs(): String =
         "((function(){" +
-            "if(window.__mtShotDismiss){document.removeEventListener('click',window.__mtShotDismiss,true);}" +
+            SHOT_DISARM_JS +
             "window.__mtShotDismiss=function(){" +
-            "document.removeEventListener('click',window.__mtShotDismiss,true);window.__mtShotDismiss=null;" +
-            "var els=document.querySelectorAll('.__mt_overlay, .__mt_scene_root');" +
-            "for(var i=0;i<els.length;i++){els[i].remove();}" +
-            "try{if(window.MtOverlay&&MtOverlay.removeScenes){MtOverlay.removeScenes();}}catch(e){}" +
+            SHOT_DISARM_JS +
+            SHOT_TEARDOWN_STMT +
             "try{if(window.MTShotBridge&&MTShotBridge.onDismissed){MTShotBridge.onDismissed();}}catch(e){}" +
             "};" +
             "document.addEventListener('click',window.__mtShotDismiss,true);" +
@@ -871,19 +971,6 @@ internal object BrowserScreenshotTranslate {
 })()"""
     }
 }
-
-/**
- * 截图翻译的已渲染结果（「原文→译文」贴回用），与图链路 `renderedScenes` 同一思想：
- * 结果按百分比几何存着，随时重发、不重跑 OCR/翻译。DOM 模式存 [ScreenshotRender.scene]，
- * 整图模式存 [ScreenshotRender.pngToken]。[pageUrl] 是捕获时的页面 —— 贴回前先比对
- * （忽略 #fragment：同文档的锚点跳转不改变几何），页面换过就作废。
- */
-private data class ScreenshotRender(
-    val pageUrl: String,
-    val geometry: BrowserScreenshotTranslate.ViewportGeometry,
-    val scene: BrowserSceneBuilder.Scene?,
-    val pngToken: String?
-)
 
 /**
  * 扫描脚本返回值 → [ScanResult]。
@@ -1206,16 +1293,23 @@ fun EmbeddedBrowserScreen(
     // 渲染层 JS 是否已注入当前页面（页面跳转后要重新注入）。
     var rendererInjected by remember { mutableStateOf(false) }
     // 视图模式（2026-10-02 用户反馈「原文/翻译两个按钮功能不统一」后拆分）：
-    // 只决定译文层挂不挂在页面上，**不**启停任何任务；任务启停只由底栏主按钮负责。
+    // 只决定译文层挂不挂在页面上，**不**启停任何任务；任务启停只由悬浮球负责。
     var viewMode by remember { mutableStateOf(BrowserViewMode.TRANSLATED) }
-    // 当前页面是否至少成功贴过一张译文：驱动底栏分段开关的可用性（没有译文就没得切）。
-    var hasRenderOnPage by remember { mutableStateOf(false) }
-    // 「一次性贴回」会话在跑（不翻译，只把已有译文层贴回）；这期间两个控件都禁用，避免被打断。
+    /**
+     * 屏上此刻挂着哪一种译文层 —— **唯一事实来源**（2026-10-16 重设计）。
+     *
+     * 改造前这里有三个各自为政的布尔/可空状态（`hasRenderOnPage` / `viewMode` /
+     * `screenshotRender`），于是出现「截图译文点掉之后点球翻不动」那类事故。
+     * 现在只保留这一个：写它的只有 hideTranslationLayer / displaySnapshotLayer /
+     * showLiveLayer 与会话的 onRendered，其余代码一律读。
+     */
+    var shownLayer by remember { mutableStateOf(BrowserShownLayer.NONE) }
+    // 「一次性贴回」会话在跑（不翻译，只把已有译文层贴回）；这期间球与开关都禁用，避免被打断。
     var reShowBusy by remember { mutableStateOf(false) }
-    // 截图翻译（2026-10-12 悬浮球 ⋮ 菜单，免系统授权）：busy = 一次截图翻译在跑；
-    // render = 已有结果（「原文→译文」贴回时按存的几何重发，不重跑 OCR/翻译）。
+    // 截图翻译（2026-10-12 悬浮球 ⋮ 菜单，免系统授权）：busy = 一次截图翻译在跑。
+    // 2026-10-16 起**不再保存可重看的截图结果** —— 覆盖层是一次性的（点任意处即收起，
+    // 对齐首页那条链路的交互），想再来一次就重新截。
     var screenshotBusy by remember { mutableStateOf(false) }
-    var screenshotRender by remember { mutableStateOf<ScreenshotRender?>(null) }
     // 已经贴过覆盖层的图（DOM 元素 id）。提升到 composable 作用域的原因：切「原文」要清空它，
     // 而贴回可能发生在**另一个会话**里 —— 必须是同一份状态，「贴回」才有依据。
     val placedIds = remember { HashSet<String>() }
@@ -1411,11 +1505,10 @@ fun EmbeddedBrowserScreen(
                     // 底栏分段开关回禁用态。不清 renderedTokens/renderedScenes（src 复用有价值，
                     // 但绝不能拿它当「本页已渲染」——那会让「译文」开关点了没反应）。
                     viewMode = BrowserViewMode.TRANSLATED
-                    hasRenderOnPage = false
+                    // 屏上真实状态随旧文档一起消失（截图覆盖层也是一次性的：跳转即结束）。
+                    shownLayer = BrowserShownLayer.NONE
                     placedIds.clear()
                     seamBySrc.clear()
-                    // 截图结果的几何绑定在旧页面上：跳转即作废（贴回时的 URL 比对只是兜底）。
-                    screenshotRender = null
                     // 网页文字翻译的注册表随旧文档一起没了：状态复位（运行中的回填会因
                     // 注册表失效自动返回 applied=0，不用专门取消）。
                     webpageTextBusy = false
@@ -1470,7 +1563,7 @@ fun EmbeddedBrowserScreen(
      * （不重跑 OCR/翻译），也不会出现「原文之后再点翻译回不来」。
      */
     fun removeOverlayNodes() {
-        webView.evaluateJavascript(REMOVE_JS, null)
+        webView.evaluateJavascript(BrowserScreenshotTranslate.removeAllJs(), null)
     }
 
     /** 彻底丢弃已渲染结果（切换「清理图/覆盖层渲染」选项时用：旧结果是旧设置画的，必须重画）。 */
@@ -1481,9 +1574,8 @@ fun EmbeddedBrowserScreen(
         renderedSrcs.clear()
         seamBySrc.clear()
         placedIds.clear()
-        // 截图结果同理：它是旧设置（覆盖层渲染开关决定画法）下产出的。
-        screenshotRender = null
-        hasRenderOnPage = false
+        // 屏上真实状态一并复位：旧结果（含截图覆盖层）是旧设置下产出的，留着只会误导开关。
+        shownLayer = BrowserShownLayer.NONE
         BrowserOverlayImageStore.clear()
     }
 
@@ -1491,19 +1583,25 @@ fun EmbeddedBrowserScreen(
      * 截图译文「点一下消失」的宿主侧状态（页面侧监听见 [BrowserScreenshotTranslate.dismissOnTapJs]）：
      * 点击发生在 WebView 里，需要它回来说一声，把「屏上还有没有译文」收掉、状态行说实话。
      * 用户 2026-10-14：要悬浮球翻译那种交互 —— 点屏幕就恢复原文。
+     *
+     * 2026-10-16 重设计：
+     * - 守卫从「有没有贴过译文」收紧为「屏上挂的是不是截图覆盖层」——活翻译层被页面点击
+     *   摘掉时不该冒充"用户点了截图译文"；
+     * - `placedIds.clear()` 必须一起做：页面侧已经把场景根删了，若宿主还记着"已贴过"，
+     *   会话就再也不会把它们贴回来（`needsReShow` 判假）；
+     * - 状态行不再承诺「点球重看截图译文」（那条机制已删除）：球只负责整页翻译，
+     *   想再来一次当前画面走 ⋮ 菜单的「截图翻译」。
      */
     val shotDismissBridge = object {
         @android.webkit.JavascriptInterface
         fun onDismissed() {
             mainHandler.post {
-                if (!hasRenderOnPage) return@post
-                hasRenderOnPage = false
-                // 视图状态跟着真实画面走（2026-10-15）：译文层被点掉后用户看到的就是原文，
-                // viewMode 停在「译文」会让 ⋮ 菜单的「译文」段处于已选中且不可点 —— 唯一的
-                // 回去路径看起来是死的（用户反馈「翻译层点不回来」）。拨回「原文」后
-                // 「译文」段可点 → showTranslations() → reShowScreenshot() 正常接手。
+                if (shownLayer != BrowserShownLayer.SNAPSHOT) return@post
+                shownLayer = BrowserShownLayer.NONE
+                // 视图状态跟着真实画面走：覆盖层收起后用户看到的就是原文。
                 viewMode = BrowserViewMode.ORIGINAL
-                statusText = "已恢复原文 · 点球重看截图译文"
+                placedIds.clear()
+                statusText = "已恢复原文 · 再点球翻译整页"
                 Log.d(TAG, "shot_dismiss source=page_tap")
             }
         }
@@ -1699,7 +1797,8 @@ fun EmbeddedBrowserScreen(
                     }
                 },
                 isViewVisible = { viewMode == BrowserViewMode.TRANSLATED },
-                onRendered = { hasRenderOnPage = true },
+                // 活翻译真的把一张贴上了屏：屏上事实变成 LIVE（唯一写入口之一）。
+                onRendered = { shownLayer = BrowserShownLayer.LIVE },
                 onFinished = { reShowBusy = false },
                 translator = translator,
                 downloader = downloader,
@@ -1716,126 +1815,147 @@ fun EmbeddedBrowserScreen(
     }
 
     /**
-     * 切到「原文」视图：摘掉译文层，**不停会话**。
+     * 收起屏上挂着的译文层 —— **唯一**的「回到原文」入口（2026-10-16 重设计）。
      *
-     * 「不停会话」是 2026-10-02 定稿的：运行中切原文只是换个看法，后台继续翻，
-     * 切回来立刻就有已经翻好的结果（与参考项目 `displayMode` 的语义一致）。
-     * 清 [placedIds] 是贴回的关键 —— 会话下一轮扫描时 `needsReShow` 才会认为这些图没上屏。
+     * 一次只有一个译文来源（[BrowserLayerPolicy]），所以收起只有一个实现：
+     * - 页面侧整层摘除（[REMOVE_JS]，它同时解除截图覆盖层的一次性点屏监听）；
+     * - [placedIds] 清空 —— 这是切回「译文」时 `needsReShow` 能把它们贴回来的唯一依据；
+     * - [shownLayer] 归 NONE、[viewMode] 拨回「原文」，让开关/球/状态行三处说的是同一件事。
+     *
+     * 它**不停会话**（2026-10-02 定稿）：运行中切原文只是换个看法，后台继续翻。
+     *
+     * @param reason 日志用的稳定原因（menu_original / shot_capture / ball_restore / …）
      */
-    fun showOriginal() {
+    fun hideTranslationLayer(reason: String) {
+        val previous = shownLayer
         viewMode = BrowserViewMode.ORIGINAL
         removeOverlayNodes()
         placedIds.clear()
-        if (!running) {
-            statusText = BrowserTranslateUiPolicy.idleHint(
-                viewMode, hasRender = hasRenderOnPage, pageLoaded = true
-            )
-        }
-        Log.d(
-            TAG,
-            "view_mode_set mode=original running=$running " +
-                "cached=${renderedTokens.size + renderedScenes.size}"
-        )
+        shownLayer = BrowserShownLayer.NONE
+        Log.d(TAG, "layer_hide reason=$reason previous=$previous running=$running")
     }
 
     /**
-     * 「原文→译文」贴回截图结果：按捕获时存的几何原样重发（不重跑 OCR/翻译）。
-     * 页面换过（「同一文档」判定不过：path/host 变了；查询与片段忽略——阅读器滚动会改写它们）
-     * → 作废丢弃 —— 几何对新页面没有意义。
+     * 把截图覆盖层挂上屏（DOM 场景 / 整图两条画法）。
      *
-     * @return 是否真的发起了贴回（false = 没有可重看的结果 / 正忙 / 页面已换）。调用方
-     *   （悬浮球单击）据此决定要不要落回「开始翻译」的默认动作。
+     * 一次性覆盖层：不保存任何"可重放"结果，收起即结束；**只有真的挂上屏才写**
+     * [shownLayer]/[viewMode]。改造前的 `reShowScreenshot` 不写 `viewMode`，
+     * 于是随后的会话以为自己在「原文」视图 —— 扫描/OCR/翻译全做了却一张都不上屏，
+     * 用户看到的就是「点球无法翻译」。
      *
-     * 声明在 [showTranslations] 之前：Kotlin 局部函数不能前向引用。
+     * @param bubbles 读到多少处文字（只用于状态行文案）
+     * @param pngBytes 整图模式的成图（DOM 模式传 null）
+     * @return true = 真的挂上屏了
      */
-    fun reShowScreenshot(): Boolean {
-        val render = screenshotRender ?: return false
-        if (reShowBusy || running) return false
-        if (!BrowserUrlResolver.isSameDocument(webView.url, render.pageUrl)) {
-            screenshotRender = null
-            Log.d(TAG, "shot_reshow_drop reason=navigated")
-            return false
-        }
-        reShowBusy = true
-        sessionScope.launch {
-            try {
-                when {
-                    render.scene != null -> {
-                        if (!rendererInjected) {
-                            webView.evaluateJavascriptSuspend(OverlayRendererScript.load(context))
-                            rendererInjected = true
-                        }
-                        webView.evaluateJavascriptSuspend(
-                            BrowserScreenshotTranslate.anchorJs(render.geometry),
-                            what = "shot_anchor"
-                        )
-                        val result = decodeJsJsonResult(
-                            webView.evaluateJavascriptSuspend(
-                                applySceneJs(
-                                    BrowserSceneBuilder.buildSceneJson(
-                                        BrowserScreenshotTranslate.ANCHOR_ID,
-                                        render.scene
-                                    )
-                                )
-                            )
-                        )
-                        if (result?.optBoolean("ok") == true) {
-                            hasRenderOnPage = true
-                            statusText = "已显示截图译文 · 点一下恢复原文"
-                            // 纯展示：触摸穿透（截图译文盖在可交互网页上）+ 点一下恢复原文。
-                            webView.evaluateJavascript(BrowserScreenshotTranslate.noTouchJs(), null)
-                            webView.evaluateJavascript(BrowserScreenshotTranslate.dismissOnTapJs(), null)
-                            Log.d(TAG, "shot_reshow mode=dom bubbles=${render.scene.bubbles.size}")
-                        } else {
-                            statusText = "截图译文显示失败"
-                            Log.w(TAG, "shot_reshow_fail mode=dom")
-                        }
-                    }
-
-                    render.pngToken != null -> {
-                        webView.evaluateJavascriptSuspend(
-                            BrowserScreenshotTranslate.overlayJs(render.pngToken, render.geometry),
-                            what = "shot_overlay"
-                        )
-                        hasRenderOnPage = true
-                        statusText = "已显示截图译文"
-                        Log.d(TAG, "shot_reshow mode=png")
-                    }
-                }
-            } finally {
-                reShowBusy = false
+    suspend fun displaySnapshotLayer(
+        geometry: BrowserScreenshotTranslate.ViewportGeometry,
+        scene: BrowserSceneBuilder.Scene?,
+        pngBytes: ByteArray?,
+        bubbles: Int
+    ): Boolean {
+        if (scene == null && pngBytes == null) return false
+        if (scene != null) {
+            if (!rendererInjected) {
+                webView.evaluateJavascriptSuspend(
+                    OverlayRendererScript.load(context),
+                    what = "shot_renderer"
+                )
+                rendererInjected = true
             }
+            webView.evaluateJavascriptSuspend(
+                BrowserScreenshotTranslate.anchorJs(geometry),
+                what = "shot_anchor"
+            )
+            val result = decodeJsJsonResult(
+                webView.evaluateJavascriptSuspend(
+                    applySceneJs(
+                        BrowserSceneBuilder.buildSceneJson(BrowserScreenshotTranslate.ANCHOR_ID, scene)
+                    ),
+                    what = "shot_scene"
+                )
+            )
+            if (result?.optBoolean("ok") != true) {
+                val why = result?.optString("reason").orEmpty().ifBlank { "未知原因" }
+                Log.w(TAG, "layer_show_fail source=snapshot mode=dom reason=$why")
+                statusText = "覆盖层渲染失败：$why"
+                // 半成品不要留在页面上（锚点已经建好了，场景却没挂上）。
+                webView.evaluateJavascript(BrowserScreenshotTranslate.teardownJs(), null)
+                return false
+            }
+            // 纯展示：触摸穿透（覆盖层盖在仍可交互的网页上）+ 点一下恢复原文。
+            webView.evaluateJavascript(BrowserScreenshotTranslate.noTouchJs(), null)
+            webView.evaluateJavascript(BrowserScreenshotTranslate.dismissOnTapJs(), null)
+            viewMode = BrowserViewMode.TRANSLATED
+            shownLayer = BrowserShownLayer.SNAPSHOT
+            statusText = "截图翻译完成（$bubbles 处）· 点屏幕恢复原文"
+            Log.d(TAG, "layer_show source=snapshot mode=dom bubbles=$bubbles")
+            return true
         }
+        val bytes = pngBytes ?: return false
+        // 整图模式固定复用同一个 token：`put` 同 key 会顶掉旧字节，不积累内存。
+        BrowserOverlayImageStore.put(BrowserScreenshotTranslate.PNG_TOKEN, bytes)
+        webView.evaluateJavascriptSuspend(
+            BrowserScreenshotTranslate.overlayJs(BrowserScreenshotTranslate.PNG_TOKEN, geometry),
+            what = "shot_overlay"
+        )
+        webView.evaluateJavascript(BrowserScreenshotTranslate.dismissOnTapJs(), null)
+        viewMode = BrowserViewMode.TRANSLATED
+        shownLayer = BrowserShownLayer.SNAPSHOT
+        statusText = "截图翻译完成（$bubbles 处）· 点屏幕恢复原文"
+        Log.d(TAG, "layer_show source=snapshot mode=png bubbles=$bubbles")
         return true
     }
 
     /**
-     * 切到「译文」视图。
+     * 显示**活翻译层**（⋮ 菜单「译文」段；截图链路失败后的自动贴回也走它）。
      *
      * - 会话在跑：什么都不用做 —— 下一轮轮询（≤ [IDLE_POLL_INTERVAL_MS]）就会因 [placedIds] 已清而重新贴回；
-     * - 会话没跑但有截图结果：按存的几何原样贴回（不重跑 OCR/翻译）；
-     * - 会话没跑但有图链路缓存：起一次**只贴回**的一次性会话（不 OCR、不下图、不轮询）；
-     * - 什么都没有：只在状态行提示。改造前这里就是「点了没反应」的来源。
+     * - 会话没跑但有缓存：起一次**只贴回**的一次性会话（不 OCR、不下图、不轮询）；
+     * - 什么都没有：只在状态行提示（改造前这里就是「点了没反应」的来源）。
+     *
+     * 截图覆盖层**不在**这里重放：它是一次性的（点屏幕即收起），想再来一次走 ⋮ 菜单「截图翻译」。
      */
-    fun showTranslations() {
+    fun showLiveLayer(reason: String) {
         viewMode = BrowserViewMode.TRANSLATED
         Log.d(
             TAG,
-            "view_mode_set mode=translated running=$running " +
-                "cached=${renderedTokens.size + renderedScenes.size} shot=${screenshotRender != null}"
+            "layer_show source=live reason=$reason running=$running " +
+                "cached=${renderedTokens.size + renderedScenes.size}"
         )
         when {
             running -> Unit
-            // 截图结果优先：它有自己的几何与贴回通道（不进 RE_SHOW 会话）。
-            // 图链路缓存与截图结果并存的场景极少见，此时先贴截图，图链路再点一次即可。
-            screenshotRender != null -> reShowScreenshot()
             renderedTokens.isEmpty() && renderedScenes.isEmpty() ->
                 statusText = BrowserTranslateUiPolicy.idleHint(
-                    viewMode, hasRender = hasRenderOnPage, pageLoaded = true
+                    viewMode = viewMode,
+                    running = running,
+                    shown = shownLayer,
+                    pageLoaded = true
                 )
 
             else -> startSession(BrowserSessionMode.RE_SHOW_ONLY)
         }
+    }
+
+    /**
+     * 切到「原文」视图（⋮ 菜单「原文」段；截图覆盖层在屏时它也是"收起覆盖层"的入口）。
+     */
+    fun showOriginal() {
+        hideTranslationLayer("menu_original")
+        if (!running) {
+            statusText = BrowserTranslateUiPolicy.idleHint(
+                viewMode = viewMode,
+                running = false,
+                shown = shownLayer,
+                pageLoaded = true
+            )
+        }
+    }
+
+    /**
+     * 切到「译文」视图（⋮ 菜单「译文」段）：只贴回活翻译层。
+     */
+    fun showTranslations() {
+        showLiveLayer("menu_translated")
     }
 
     /**
@@ -1995,15 +2115,40 @@ fun EmbeddedBrowserScreen(
         statusText = "正在截取画面…"
         Log.d(
             TAG,
-            "shot_start url=${BrowserHistoryRepository.urlWithoutScheme(captureUrl)} dom_overlay=$domOverlay"
+            "shot_start url=${BrowserHistoryRepository.urlWithoutScheme(captureUrl)} " +
+                "dom_overlay=$domOverlay shown=$shownLayer"
         )
         sessionScope.launch {
             // 位图所有权：translateImage 的所有出口（成功/失败）都会回收入参位图；
             // 只有「还没交出去」的路径（量几何失败 / 管线没跑）才由 finally 兜底回收。
             var captured: Pair<BrowserScreenshotTranslate.ViewportGeometry, Bitmap>? = null
             var ownedByPipeline = false
+            // 截图前被收起来的是活翻译层吗（用于失败时原样贴回）。
+            var hidLiveLayer = false
             try {
-                // 1) 主线程：量几何与截图必须是同一瞬间（中间隔一次用户滚动就对不上）。
+                // 0) 等上一会话真正收尾：`stopSession` 是协作式的（不 cancel），它可能正卡在
+                //    一张图的 OCR 里 —— 不等它，截图管线就会和它抢同一个 Paddle 引擎。
+                val previousJob = session.job
+                if (previousJob != null) {
+                    val waitStartedAt = System.currentTimeMillis()
+                    withTimeoutOrNull(PREV_SESSION_JOIN_TIMEOUT_MS) { previousJob.join() }
+                    Log.d(
+                        TAG,
+                        "shot_wait_prev waited=${System.currentTimeMillis() - waitStartedAt}ms"
+                    )
+                }
+                // 1) 先收起当前译文层（R1：一次只有一个来源）——顺带修掉「截图把已有译文一起
+                //    截进去、OCR 读到中文」的老限制；失败时 finally 会贴回。
+                val previousLayer = shownLayer
+                if (previousLayer != BrowserShownLayer.NONE) {
+                    hideTranslationLayer("shot_capture")
+                    hidLiveLayer = previousLayer == BrowserShownLayer.LIVE
+                }
+                // 2) 等一次视觉提交：PixelCopy 读的是**合成后**的窗口，DOM 刚摘掉的那一帧
+                //    可能还没提交，不等就会把旧译文一起截进去。超时照旧截图（不阻塞用户）。
+                val committed = awaitVisualCommit(webView, SHOT_VISUAL_COMMIT_TIMEOUT_MS)
+                Log.d(TAG, "shot_frame_wait committed=$committed")
+                // 3) 主线程：量几何与截图必须是同一瞬间（中间隔一次用户滚动就对不上）。
                 captured = withContext(mainThreadDispatcher) {
                     if (webView.width <= 0 || webView.height <= 0) return@withContext null
                     val metrics = BrowserScreenshotTranslate.parseMetrics(
@@ -2040,7 +2185,7 @@ fun EmbeddedBrowserScreen(
                     Log.w(TAG, "shot_fail stage=capture")
                     return@launch
                 }
-                // 2) 共用管线（IO）：位图交给 translateImage，此后不再手动回收。
+                // 4) 共用管线（IO）：位图交给 translateImage，此后不再手动回收。
                 val useDom = domOverlay
                 statusText = "识别翻译中…"
                 val startedAt = System.currentTimeMillis()
@@ -2057,7 +2202,7 @@ fun EmbeddedBrowserScreen(
                 }
                 ownedByPipeline = true
                 val costMs = System.currentTimeMillis() - startedAt
-                // 3) 管线跑的这几秒里页面跳走了：结果作废（几何对新页面对不上）。
+                // 5) 管线跑的这几秒里页面跳走了：结果作废（几何对新页面对不上）。
                 //    「同一文档」判定：阅读器滚动写 ?cut= 之类不算跳转，截图结果不该因此作废。
                 val urlNow = webView.url
                 if (!BrowserUrlResolver.isSameDocument(urlNow, captureUrl)) {
@@ -2069,75 +2214,39 @@ fun EmbeddedBrowserScreen(
                     statusText = "页面已跳转，截图结果已丢弃"
                     return@launch
                 }
-                // 4) 回贴：DOM 场景 → 视口锚点 + applySceneJson；整图 → mtlocal 贴图。
+                // 6) 回贴：DOM 场景 → 视口锚点 + applySceneJson；整图 → mtlocal 贴图。
+                //    两条画法都收口到 [displaySnapshotLayer]（它负责 shownLayer/viewMode/监听）。
                 val scene = outcome.scene
                 val png = outcome.renderedPng
-                if (useDom && scene != null && outcome.bubbleCount > 0) {
-                    if (!rendererInjected) {
-                        webView.evaluateJavascriptSuspend(
-                            OverlayRendererScript.load(context),
-                            what = "shot_renderer"
-                        )
-                        rendererInjected = true
+                val shown = when {
+                    useDom && scene != null && outcome.bubbleCount > 0 ->
+                        displaySnapshotLayer(geometry, scene, null, outcome.bubbleCount)
+
+                    png != null ->
+                        displaySnapshotLayer(geometry, null, png, outcome.bubbleCount)
+
+                    outcome.warningMessage != null -> {
+                        // 管线自己失败了（translateImage 的兜底 Outcome：scene/png 都是 null）。
+                        statusText = "截图翻译失败：${outcome.warningMessage.take(50)}"
+                        Log.w(TAG, "shot_fail stage=pipeline msg=${outcome.warningMessage.take(60)}")
+                        false
                     }
-                    webView.evaluateJavascriptSuspend(
-                        BrowserScreenshotTranslate.anchorJs(geometry),
-                        what = "shot_anchor"
-                    )
-                    val result = decodeJsJsonResult(
-                        webView.evaluateJavascriptSuspend(
-                            applySceneJs(
-                                BrowserSceneBuilder.buildSceneJson(
-                                    BrowserScreenshotTranslate.ANCHOR_ID,
-                                    scene
-                                )
-                            ),
-                            what = "shot_scene"
+
+                    else -> {
+                        // 确定性空结果：绝大多数是截图里真没有可读文字。
+                        statusText = "截图里没读到可翻译的文字"
+                        Log.d(
+                            TAG,
+                            "shot_empty bubbles=${outcome.bubbleCount} scene=${scene != null} useDom=$useDom"
                         )
-                    )
-                    if (result?.optBoolean("ok") != true) {
-                        val reason = result?.optString("reason").orEmpty()
-                        statusText = "覆盖层渲染失败：${reason.ifBlank { "未知原因" }}"
-                        Log.w(TAG, "shot_fail stage=scene reason=$reason")
-                        return@launch
+                        false
                     }
-                    screenshotRender = ScreenshotRender(captureUrl, geometry, scene, null)
-                    hasRenderOnPage = true
-                    statusText = "截图翻译完成（${outcome.bubbleCount} 处）· 点一下恢复原文"
-                    // 纯展示：触摸穿透到页面（气泡自带的 click 会吃掉站内交互）；
-                    // 再挂一次性点击监听 = 悬浮球款式（点屏幕就恢复原文）。
-                    webView.evaluateJavascript(BrowserScreenshotTranslate.noTouchJs(), null)
-                    webView.evaluateJavascript(BrowserScreenshotTranslate.dismissOnTapJs(), null)
-                    Log.d(TAG, "shot_ok mode=dom bubbles=${outcome.bubbleCount} cost=${costMs}ms")
-                } else if (png != null) {
-                    BrowserOverlayImageStore.put(BrowserScreenshotTranslate.PNG_TOKEN, png)
-                    webView.evaluateJavascriptSuspend(
-                        BrowserScreenshotTranslate.overlayJs(
-                            BrowserScreenshotTranslate.PNG_TOKEN,
-                            geometry
-                        ),
-                        what = "shot_overlay"
-                    )
-                    screenshotRender =
-                        ScreenshotRender(captureUrl, geometry, null, BrowserScreenshotTranslate.PNG_TOKEN)
-                    hasRenderOnPage = true
-                    statusText = "截图翻译完成（${outcome.bubbleCount} 处）· 点一下恢复原文"
-                    // 点屏幕恢复原文（与 DOM 模式同款；PNG 贴图本身已是 pointer-events:none）。
-                    webView.evaluateJavascript(BrowserScreenshotTranslate.dismissOnTapJs(), null)
+                }
+                if (shown) {
                     Log.d(
                         TAG,
-                        "shot_ok mode=png bubbles=${outcome.bubbleCount} bytes=${png.size} cost=${costMs}ms"
-                    )
-                } else if (outcome.warningMessage != null) {
-                    // 管线自己失败了（translateImage 的兜底 Outcome：scene/png 都是 null）。
-                    statusText = "截图翻译失败：${outcome.warningMessage.take(50)}"
-                    Log.w(TAG, "shot_fail stage=pipeline msg=${outcome.warningMessage.take(60)}")
-                } else {
-                    // 确定性空结果：绝大多数是截图里真没有可读文字。
-                    statusText = "截图里没读到可翻译的文字"
-                    Log.d(
-                        TAG,
-                        "shot_empty bubbles=${outcome.bubbleCount} scene=${scene != null} useDom=$useDom"
+                        "shot_ok mode=${if (useDom && scene != null) "dom" else "png"} " +
+                            "bubbles=${outcome.bubbleCount} cost=${costMs}ms"
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -2150,11 +2259,18 @@ fun EmbeddedBrowserScreen(
                 if (!ownedByPipeline) {
                     captured?.second?.let { if (!it.isRecycled) it.recycle() }
                 }
+                // 失败贴回：截图前收起了活翻译层，结果却没挂上屏 —— 把用户原来的译文还给他
+                // （走一次性贴回，不再跑 OCR）。页面已跳转则什么都不做。
+                if (hidLiveLayer && shownLayer == BrowserShownLayer.NONE &&
+                    BrowserUrlResolver.isSameDocument(webView.url, captureUrl)
+                ) {
+                    showLiveLayer("shot_restore")
+                }
             }
         }
     }
 
-    // 底栏「原文｜译文」开关与悬浮球共用的控件状态（纯函数，成本可忽略；提升到
+    // 悬浮球与「原文｜译文」开关共用的控件状态（纯函数，成本可忽略；提升到
     // when(browserPage) 之前是因为悬浮球在网页态 Box 里也要用同一份判定）。
     // 声明必须在 onPrimaryAction 之前：Kotlin 局部函数看不到自己后面才声明的变量
     // （2026-10-12 修复：原来声明在使用点之后，app 模块整体编译不过）。
@@ -2162,30 +2278,55 @@ fun EmbeddedBrowserScreen(
         pageLoaded = pageUrl.isNotBlank() && pageUrl != "about:blank",
         running = running,
         reShowBusy = reShowBusy,
-        hasRender = hasRenderOnPage,
-        mode = viewMode,
-        canReshow = screenshotRender != null
+        screenshotBusy = screenshotBusy,
+        shown = shownLayer
     )
 
     /**
      * 翻译任务的主操作（2026-10-12 起唯一入口是悬浮球单击；原底栏主按钮已移除）。
      *
-     * 与改造前的底栏主按钮同一套语义：运行中 → 停止（译文保留）；空闲 → 开始翻译。
-     * [controls] 按当前状态给出这一下该做什么，两个入口永远说同样的话。
+     * 三个语义由 [BrowserTranslateUiPolicy.resolve] 判定，这里只负责执行 ——
+     * 判定与执行分开是为了让"按钮文案说它会做什么"这件事可单测：
      *
-     * 例外（2026-10-15，用户反馈「截图译文点一下恢复原文后就点不回来了」）：空闲且
-     * 有「已被点掉」的截图结果时，点球 = 状态行承诺的「重看截图译文」（重发已有场景，
-     * 秒回），不是再起一整轮扫描-识别-翻译。贴回发起失败（页面已换等）则照旧开始翻译。
+     * - [BrowserPrimaryAction.RESTORE]：截图覆盖层在屏 → **恢复原文**（对齐首页那条链路：
+     *   译文层在屏时点球 = 恢复原文，不触发新翻译）；
+     * - [BrowserPrimaryAction.STOP]：会话在跑 → 停止（译文保留）；
+     * - [BrowserPrimaryAction.START]：**开始整页翻译**，并把视图切到「译文」——
+     *   否则用户切过「原文」之后点球，会话会安静地后台翻、屏上一张都不上（"点球没反应"）。
+     *
+     * 2026-10-16 删除：改造前这里有一条「空闲且屏上无译文 → 重发上一次截图结果」的前置拦截
+     * （§46 的实现）。它正是用户报「点球无法翻译」的直接原因 —— 截图结果既不过期也不让位，
+     * 球被它劫持后永远起不了新翻译。现在截图覆盖层是一次性的，重放机制整个不存在。
      */
     fun onPrimaryAction() {
-        if (!running && !reShowBusy && screenshotRender != null && !hasRenderOnPage) {
-            if (reShowScreenshot()) return
-        }
-        when (controls.primaryAction) {
-            BrowserPrimaryAction.START -> startSession()
-            BrowserPrimaryAction.STOP -> stopSession(
-                if (placedIds.isNotEmpty()) "已停止 · 译文保留" else "已停止"
+        val action = controls.primaryAction
+        if (!controls.primaryEnabled || action == null) {
+            statusText = controls.modeToggleDisabledReason ?: "暂时不可用"
+            Log.d(
+                TAG,
+                "ball_tap_rejected busy=${controls.primaryBusy} shown=$shownLayer running=$running"
             )
+            return
+        }
+        when (action) {
+            BrowserPrimaryAction.RESTORE -> {
+                // 覆盖层收起走统一的收层入口（页面侧定向摘除 + 解除监听 + 记账复位）。
+                hideTranslationLayer("ball_restore")
+                statusText = "已恢复原文 · 再点球翻译整页"
+                Log.d(TAG, "ball_tap action=restore")
+            }
+
+            BrowserPrimaryAction.STOP -> {
+                stopSession(if (placedIds.isNotEmpty()) "已停止 · 译文保留" else "已停止")
+                Log.d(TAG, "ball_tap action=stop")
+            }
+
+            BrowserPrimaryAction.START -> {
+                // 保证点球一定看到中文：START 同时切到「译文」视图。
+                viewMode = BrowserViewMode.TRANSLATED
+                Log.d(TAG, "ball_tap action=start shown=$shownLayer")
+                startSession()
+            }
         }
     }
 
@@ -2453,11 +2594,13 @@ fun EmbeddedBrowserScreen(
                     }
                 }
                 // 翻译悬浮球（2026-10-12 用户要求「翻译按钮变成悬浮球，好按一点」）：
-                // 单击 = 翻译/停止（原底栏主按钮的唯一动作）；长按 = 原文/译文 + 截图翻译菜单。
-                // 只盖在网页内容区上，不遮顶栏与底栏。
+                // 单击 = 翻译/停止/恢复原文（三态由 [BrowserTranslateUiPolicy.resolve] 判定）；
+                // 长按或点 ⋮ 胶囊 = 截图翻译 + 原文/译文菜单。只盖在网页内容区上。
                 BrowserTranslateFloatingBall(
                     running = running,
-                    reShowBusy = reShowBusy,
+                    busy = controls.primaryBusy,
+                    enabled = controls.primaryEnabled,
+                    action = controls.primaryAction,
                     pageUrl = pageUrl,
                     viewMode = viewMode,
                     modeToggleEnabled = controls.modeToggleEnabled,
@@ -2519,8 +2662,9 @@ fun EmbeddedBrowserScreen(
                     Text(
                         text = statusText.ifBlank {
                             BrowserTranslateUiPolicy.idleHint(
-                                mode = viewMode,
-                                hasRender = hasRenderOnPage,
+                                viewMode = viewMode,
+                                running = running,
+                                shown = shownLayer,
                                 pageLoaded = pageUrl.isNotBlank() && pageUrl != "about:blank"
                             )
                         },
@@ -4993,9 +5137,10 @@ private fun BrowserHistoryRow(
  * 内嵌浏览器翻译悬浮球（2026-10-12 用户要求「翻译按钮变成悬浮球，好按一点」）。
  *
  * 手势表（与常见「小白点」一致，无需学习成本）：
- * - **单击球** = 开始 / 停止翻译（原底栏主按钮的唯一动作；运行中变红、白方块 = 停止）；
- * - **单击球上的 ⋮ 胶囊** = 展开 / 收起菜单（2026-10-12 新增：用户要「点开那三个点」，
- *   长按不再是想开菜单的唯一手势）；
+ * - **单击球** = 三态动作（由 [BrowserTranslateUiPolicy.resolve] 判定，文案与图标跟着变）：
+ *   开始翻译（蓝底「译」）/ 停止翻译（红底白方块）/ **恢复原文**（蓝底 ✕，截图覆盖层在屏时，
+ *   对齐首页那条链路的交互）；
+ * - **单击球上的 ⋮ 胶囊** = 展开 / 收起菜单；
  * - **长按球** = 展开菜单（老手势保留）；
  * - **拖动球** = 移动位置，松手吸附到左/右边缘（纵向保持拖到的高度）。
  *
@@ -5007,13 +5152,19 @@ private fun BrowserHistoryRow(
  * 3. 截图翻译快捷方式 → ⋮ 菜单：只截 WebView 自己的视口（`webView.draw`），
  *    免 MediaProjection / 悬浮窗授权（[onScreenshotTranslate]，2026-10-12 由首页授权链路改来）。
  *
+ * 2026-10-16 重设计：删掉 `reShowBusy` 一个参数的"半禁用"写法，改成明确的
+ * `enabled` / `busy` / `action` 三件套 —— 截图翻译与一次性贴回期间球呈忙碌态且不响应，
+ * 用户点它时会看到状态行给出原因，而不是静默无事发生。
+ *
  * 几何规则（夹紧 / 吸附 / 菜单朝向）全部在 [BrowserFloatingBallPolicy]（纯函数 + 单测），
  * 本组件只负责手势与绘制。菜单展开时有一层透明 scrim：点空白收起，也防止误触网页。
  */
 @Composable
 private fun BrowserTranslateFloatingBall(
     running: Boolean,
-    reShowBusy: Boolean,
+    busy: Boolean,
+    enabled: Boolean,
+    action: BrowserPrimaryAction?,
     pageUrl: String,
     viewMode: BrowserViewMode,
     modeToggleEnabled: Boolean,
@@ -5030,10 +5181,11 @@ private fun BrowserTranslateFloatingBall(
     var dragging by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
     // ⚠️ `pointerInput(Unit)` 里的手势 lambda **只在首次组合时创建**：直接读 `running` /
-    // `reShowBusy` / `onPrimaryTap` 会永远停在那一刻的值（实测：点「停止」时日志里 running 仍是
+    // `busy` / `onPrimaryTap` 会永远停在那一刻的值（实测：点「停止」时日志里 running 仍是
     // false）。用 rememberUpdatedState 让回调读到最新状态 —— 这是「点不动」类问题的排查线索之一。
     val latestRunning by rememberUpdatedState(running)
-    val latestReShowBusy by rememberUpdatedState(reShowBusy)
+    val latestBusy by rememberUpdatedState(busy)
+    val latestAction by rememberUpdatedState(action)
     val latestExpanded by rememberUpdatedState(expanded)
     val latestPrimaryTap by rememberUpdatedState(onPrimaryTap)
     // 页面跳转后菜单里的「原文/译文」已与新页无关（onPageStarted 也会停会话）：收起。
@@ -5215,25 +5367,31 @@ private fun BrowserTranslateFloatingBall(
             modifier = Modifier
                 .offset { IntOffset(ballX.roundToInt(), ballY.roundToInt()) }
                 .size(BrowserFloatingBallPolicy.SIZE_DP.dp)
+                .alpha(if (enabled) 1f else 0.65f)
                 .shadow(6.dp, CircleShape)
                 .clip(CircleShape)
                 .background(
                     // 轻微透底：悬浮球不该让用户感觉「挡了一大块画面」，
                     // 但也不能太透以至于和页面内容混在一起。
-                    (if (running) MtColors.Danger else MtColors.Brand).copy(alpha = 0.92f)
+                    // 红色只给「停止」（会话在跑）；忙碌时压暗，表示"这一下不会被采纳"。
+                    (if (action == BrowserPrimaryAction.STOP) MtColors.Danger else MtColors.Brand)
+                        .copy(alpha = if (busy) 0.55f else 0.92f)
                 )
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onTap = {
                             if (latestExpanded) {
                                 expanded = false
-                            } else if (!latestReShowBusy) {
-                                Log.d(TAG, "ball_primary_tap running=$latestRunning")
-                                latestPrimaryTap()
                             } else {
-                                // 贴回会话进行中（通常 <1s）：以前这里是**静默忽略** ——
-                                // 用户「点不动」的排查因此没有一行日志可看（2026-10-14）。
-                                Log.d(TAG, "ball_tap_ignored reason=reshow_busy")
+                                // 忙碌（截图翻译/一次性贴回）时也照常上报：宿主会把原因写进状态行。
+                                // 以前这里是**静默忽略**，用户「点不动」的排查连一行日志都没有
+                                // （2026-10-14 的教训），这条已留成硬约束。
+                                Log.d(
+                                    TAG,
+                                    "ball_primary_tap running=$latestRunning busy=$latestBusy " +
+                                        "action=${latestAction ?: "none"}"
+                                )
+                                latestPrimaryTap()
                             }
                         },
                         onLongPress = {
@@ -5253,25 +5411,43 @@ private fun BrowserTranslateFloatingBall(
                     }
                 }
                 .semantics {
-                    contentDescription = if (running) {
-                        "翻译悬浮球：点按停止翻译，长按打开菜单"
-                    } else {
-                        "翻译悬浮球：点按开始翻译，长按打开菜单"
+                    // 三态各有自己的说法：无障碍（与 .verify 的 dump 断言）靠它区分球此刻干什么。
+                    contentDescription = when {
+                        busy -> "翻译悬浮球：正在截图翻译，稍后可用"
+                        action == BrowserPrimaryAction.RESTORE ->
+                            "翻译悬浮球：点按恢复原文（截图译文显示中），长按打开菜单"
+
+                        action == BrowserPrimaryAction.STOP ->
+                            "翻译悬浮球：点按停止翻译，长按打开菜单"
+
+                        else -> "翻译悬浮球：点按开始翻译，长按打开菜单"
                     }
                 },
             contentAlignment = Alignment.Center
         ) {
-            if (running) {
+            when {
+                busy -> CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
                 // 运行中 = 红底白方块（停止）；material-icons-core 没有 Stop 图标，
                 // 画一个 14dp 方块比硬凑语义相近的图标更直白（与原底栏按钮的决定一致）。
-                Box(
+                action == BrowserPrimaryAction.STOP -> Box(
                     modifier = Modifier
                         .size(14.dp)
                         .clip(RoundedCornerShape(3.dp))
                         .background(Color.White)
                 )
-            } else {
-                Text(
+                // 截图覆盖层在屏 = 蓝底白 ✕（点它就收起，恢复原文）——首页那条链路同款语义。
+                action == BrowserPrimaryAction.RESTORE -> Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp)
+                )
+
+                else -> Text(
                     text = "译",
                     color = Color.White,
                     fontSize = 19.sp,

@@ -63,6 +63,44 @@ class TranslatePromptTest {
     }
 
     @Test
+    fun userPrompt_injectsFullPageContextWhenBatchIsOnlyMissingLines() {
+        // 2026-10-18 用户选 A：整页台词是上下文，本次只翻未命中的那一句。
+        val page = listOf("첫 줄", "둘째 줄", "셋째 줄")
+        val prompt = client.buildTranslatePrompt(
+            texts = listOf("둘째 줄"),
+            sourceLanguageId = "ko",
+            targetLanguageId = "zh-cn",
+            pageContext = page
+        )
+        assertTrue(prompt.contains("context only"))
+        assertTrue(prompt.contains("[1] 첫 줄"))
+        assertTrue(prompt.contains("[3] 셋째 줄"))
+        assertTrue(prompt.contains("do not translate the context lines"))
+        // 本批仍然只要求 1 条输出，不能把上下文也翻出来。
+        assertTrue(prompt.contains("input length = 1"))
+    }
+
+    @Test
+    fun userPrompt_doesNotDuplicateContextWhenBatchIsWholePage() {
+        val texts = listOf("첫 줄", "둘째 줄")
+        val prompt = client.buildTranslatePrompt(
+            texts = texts,
+            sourceLanguageId = "ko",
+            targetLanguageId = "zh-cn",
+            pageContext = texts
+        )
+        assertFalse(prompt.contains("context only"))
+    }
+
+    @Test
+    fun pageContextBlock_capsLinesAndMarksTruncation() {
+        val page = (1..120).map { "line$it" }
+        val block = requireNotNull(client.buildPageContextBlock(page, listOf("line1")))
+        assertTrue(block.contains("context truncated"))
+        assertEquals(80, Regex("\\[\\d+\\]").findAll(block).count())
+    }
+
+    @Test
     fun languageDisplayName_coversSupportedIds() {
         assertEquals("Simplified Chinese", client.languageDisplayName("zh-cn"))
         assertEquals("Traditional Chinese", client.languageDisplayName("zh-tw"))

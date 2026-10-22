@@ -172,7 +172,12 @@ class OpenAiVisionClient(
         targetLanguageId: String,
         enableThinking: Boolean,
         thinkingBudget: Int,
-        glossary: List<Pair<String, String>> = emptyList()
+        glossary: List<Pair<String, String>> = emptyList(),
+        /**
+         * 整页台词（阅读顺序，含已经命中句子缓存、这次不翻的句子）。只作为上下文
+         * 注入提示词，不参与逐条输出 —— 见 [buildTranslatePrompt]。
+         */
+        pageContext: List<String> = emptyList()
     ): TextTranslationOutcome {
         if (texts.isEmpty()) return TextTranslationOutcome(emptyList(), emptyList())
         if (provider.trim().equals(BAIDU_PROVIDER_ID, ignoreCase = true)) {
@@ -202,7 +207,8 @@ class OpenAiVisionClient(
                 texts = chunk,
                 sourceLanguageId = sourceLanguageId,
                 targetLanguageId = targetLanguageId,
-                glossary = glossary
+                glossary = glossary,
+                pageContext = pageContext
             )
             val inputArray = JSONArray().apply { chunk.forEach { put(it) } }
             return requestWithFallback(
@@ -1673,7 +1679,8 @@ return parseGroups(result.raw, blocks)
         texts: List<String>,
         sourceLanguageId: String,
         targetLanguageId: String,
-        glossary: List<Pair<String, String>> = emptyList()
+        glossary: List<Pair<String, String>> = emptyList(),
+        pageContext: List<String> = emptyList()
     ): String {
         val targetName = languageDisplayName(targetLanguageId)
         val lines = mutableListOf(
@@ -1684,12 +1691,16 @@ return parseGroups(result.raw, blocks)
             "The translations array length must equal input length = ${texts.size}.",
             "Write natural spoken $targetName that matches the tone of the source " +
                 "(casual speech stays casual, exclamations stay exclamations).",
+            "Prefer natural $targetName word order over literal word-for-word translation.",
             "Preserve quotation marks as in the source; a quoted phrase must stay quoted.",
             "Proper nouns (character names, places, brands) must be translated or transliterated " +
                 "into $targetName, never left in the source script.",
             "Onomatopoeia should be translated or transliterated naturally, not dropped.",
             "Do not include explanations."
         )
+        // 2026-10-18（用户选 A）：整页台词作为上下文。命中句子缓存的句子不在这批 input 里，
+        // 但它们是理解代词/省略/语气的关键。只在本批比整页少时注入，避免重复占 token。
+        buildPageContextBlock(pageContext, texts)?.let { lines += it }
         val relevant = glossary.filter { (source, target) ->
             val s = source.trim()
             val t = target.trim()
@@ -1699,6 +1710,52 @@ return parseGroups(result.raw, blocks)
             buildGlossaryLine(relevant)?.let { lines += it }
         }
         return lines.joinToString("\n")
+    }
+
+    /**
+     * 整页上下文块（2026-10-18）。
+     *
+     * 只在「整页行数 > 本批行数」时生成：同一页全都没命中缓存时，整页 == input，
+     * 再抄一遍只会白烧 token。缓存命中/拆批重试时，本批只是整页的一部分，这时
+     * 上下文才真正补上「模型看不到的相邻句」。
+     *
+     * 上限 [MAX_CONTEXT_LINES] 行 / [MAX_CONTEXT_CHARS] 字符，防止超长章节把请求撑爆；
+     * 截断时明确告诉模型，避免它以为页面到此结束。
+     */
+    internal fun buildPageContextBlock(
+        pageContext: List<String>,
+        texts: List<String>
+    ): String? {
+        val normalizedPage = pageContext
+            .map { it.trim().replace(Regex("\\s+"), " ") }
+            .filter { it.isNotEmpty() }
+        if (normalizedPage.size <= texts.size) return null
+        val normalizedInput = texts.map { it.trim().replace(Regex("\\s+"), " ") }
+        if (normalizedPage == normalizedInput) return null
+        val shown = mutableListOf<String>()
+        var chars = 0
+        for (line in normalizedPage) {
+            if (shown.size >= MAX_CONTEXT_LINES) break
+            if (chars + line.length > MAX_CONTEXT_CHARS) break
+            shown += line
+            chars += line.length
+        }
+        if (shown.size <= texts.size) return null
+        val truncated = shown.size < normalizedPage.size
+        return buildString {
+            append("The full page, in reading order, is context only")
+            append(" (some lines may be omitted or already translated):\n")
+            shown.forEachIndexed { index, line ->
+                append("[").append(index + 1).append("] ").append(line).append('\n')
+            }
+            if (truncated) append("... (context truncated)\n")
+            append(
+                "Use this context to resolve pronouns, omitted subjects, speaker tone, " +
+                    "honorifics, and continuity across nearby lines. Translate only " +
+                    "INPUT_TEXTS_JSON; do not translate the context lines, and do not merge " +
+                    "or split input lines."
+            )
+        }
     }
 
     /** 语言 id 的英文名（提示词里用；与 AppLanguage 无依赖，core-translate 内自持一份）。 */
@@ -1908,6 +1965,9 @@ private companion object {
         const val TRANSLATE_OUTPUT_TOKENS_PER_TEXT = 96
         /** 单次翻译请求的输出 token 上限（再大就该靠拆批，而不是赌模型不啰嗦）。 */
         const val TRANSLATE_OUTPUT_TOKENS_CAP = 8192
+        /** 整页上下文最多注入多少行/多少字符（2026-10-18，页面上下文）。 */
+        const val MAX_CONTEXT_LINES = 80
+        const val MAX_CONTEXT_CHARS = 6000
         /** 解析失败/截断时最多对半拆几层（2 层 = 最多 4 个子批）。 */
         const val MAX_SPLIT_DEPTH = 2
         /** OpenAI 兼容响应的截断标记（`choices[0].finish_reason`）。 */

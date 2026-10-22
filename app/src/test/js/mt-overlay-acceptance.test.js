@@ -237,6 +237,18 @@ const TILTED_POLYGON = [
     parseFloat(clip.style.height) > parseFloat(clip.style.width),
     { w: clip.style.width, h: clip.style.height, clip: clip.style.clipPath });
 
+  // (a2) 竖排文字节点本身也不能被 ±90° 旋转（2026-10-18 真机：-82.6° 把竖列转成
+  // 横跨画面的巨大横排中文；盖板是对的，文字却横着飞出去）。
+  const pageText = freshPage();
+  apply(pageText, scene(pageText, [bubble({
+    vertical: true, polygon: column, rotation_deg: -82.6, x: 45, y: 10, w: 10, h: 60, bg_type: "none"
+  })]));
+  const textNode = pageText.document.querySelector(".__mt_scene_root").querySelector(".mt-text-layer");
+  check("vertical text node ignores near-vertical rotation",
+    !!textNode &&
+    textNode.style.getPropertyValue("--mt-base-transform").indexOf("-82") === -1,
+    { transform: textNode && textNode.style.getPropertyValue("--mt-base-transform") });
+
   // 没有四边形时同理：框本身 = 那一列，旋转它只会把盖板转成横条。
   const page2 = freshPage();
   apply(page2, scene(page2, [bubble({ rotation_deg: 89.97, x: 45, y: 10, w: 10, h: 60, bg_type: "none" })]));
@@ -665,6 +677,10 @@ const TILTED_POLYGON = [
     Mt._sanitizeRenderRotationDeg(90, 200, 20) === 0);
   check("|90°| on a tall box is kept",
     Mt._sanitizeRenderRotationDeg(90, 20, 200) === 90);
+  check("explicit vertical ignores |90°| rotation for the text",
+    Mt._sanitizeRenderRotationDeg(-82.6, 10, 60, true) === 0);
+  check("non-vertical tall box still keeps |90°| rotation",
+    Mt._sanitizeRenderRotationDeg(-82.6, 10, 60, false) === -82.6);
 })();
 
 // ---------------------------------------------------------------------------
@@ -790,6 +806,44 @@ const TILTED_POLYGON = [
   check("removeScenes clears the overlay registry", page.Mt._overlays.size === 0);
   check("removeScenes detaches the root from the DOM",
     page.document.querySelector(".__mt_scene_root") === null);
+})();
+
+// ---------------------------------------------------------------------------
+// §10 定向摘除单个场景（截图覆盖层收起；2026-10-16 重设计，Todolist §56）
+//
+// 为什么单独立一节：截图覆盖层与活翻译层共用同一套 imageId 通道。收起截图时若误用
+// removeScenes（整体摘除），屏上活翻译的译文会一起消失，而 Kotlin 侧的 placedIds 还
+// 记着"已贴过" —— 那些译文就再也不会回来（用户 2026-10-16 报「点球无法翻译」的现场）。
+// ---------------------------------------------------------------------------
+(function removeSingleScene() {
+  const page = freshPage();
+  // 第二张目标：截图覆盖层的视口锚点（真实链路由 anchorJs 建，这里造一个同样的宿主）。
+  const anchor = page.document.createElement("div");
+  anchor.setAttribute("data-mt-id", "mt-shot");
+  anchor._setRect({ left: 0, top: 0, width: 400, height: 800 });
+  page.host.appendChild(anchor);
+
+  check("live scene applies", apply(page, scene(page, [bubble({})])).ok === true);
+  const shotScene = JSON.stringify({
+    v: 1, image_id: "mt-shot", cleaned_url: null, bubbles: [bubble({})]
+  });
+  check("screenshot scene applies", apply(page, shotScene).ok === true);
+  check("two scene roots mounted",
+    page.document.querySelectorAll(".__mt_scene_root").length === 2,
+    page.document.querySelectorAll(".__mt_scene_root").length);
+
+  const removed = page.Mt.removeScene("mt-shot");
+  check("removeScene removes only the requested scene", removed === 1, removed);
+  const remaining = page.document.querySelectorAll(".__mt_scene_root");
+  check("live scene survives a screenshot teardown",
+    page.Mt._overlays.has("mt1") && remaining.length === 1 &&
+    String(remaining[0].dataset.imageId) === "mt1",
+    remaining.map((node) => node.dataset.imageId));
+  check("screenshot scene root is gone",
+    remaining.every((node) => String(node.dataset.imageId) !== "mt-shot"));
+  check("screenshot entry dropped from the registry", !page.Mt._overlays.has("mt-shot"));
+  check("second removeScene is a no-op", page.Mt.removeScene("mt-shot") === 0);
+  check("removeScene tolerates an empty id", page.Mt.removeScene("") === 0);
 })();
 
 // ---------------------------------------------------------------------------

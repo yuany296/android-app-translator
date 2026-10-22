@@ -19,6 +19,18 @@ package com.manga.translator.app
  *   `clampAdjusted ? null : …` 同口径），避免用被污染的轮廓再裁出怪形状；
  * - 未超上限时**原样返回 null**（不做任何加工）。
  *
+ * ## 2026-10-18 竖排/字形底修正（用户真机：竖排和 3 行韩文盖板下面露原文）
+ *
+ * 35%/60% 是参考项目给**横排**气泡的口径（`lineCount` = 横排行数）；直接套到竖排上
+ * 会误伤：竖排天然很高，而且本项目竖排固定 `sourceLineCount = 1` → 35% 上限，
+ * 一列稍长就被从下面截断。另一个真机现场（`mt185`）是 3 行韩文被检测器报成 1 行，
+ * 35% 钳制把最后一行切掉 —— 盖板 = 35%，文字 = 39.79%。
+ *
+ * 现在的口径：
+ * - **竖排不做高度钳制**（高度上限 100%），竖排的「宽度」才是异常尺寸的判据；
+ * - 横排仍然钳，但**不得低于字形底 + 下沿外扩**：正常盖板 = 字形框 + 外扩，钳到
+ *   这个下限以下一定是误伤；只有「盖板明显高于字形底」时才允许钳。
+ *
  * 纯逻辑、可 JVM 单测。
  */
 internal object BubblePlausibility {
@@ -29,6 +41,9 @@ internal object BubblePlausibility {
     /** 多行气泡的盖板高度上限（占原图高比例）。 */
     const val MAX_COVER_HEIGHT_RATIO_MULTILINE = 0.60f
 
+    /** 竖排的「高度」不按横排行数钳制：上限就是整张图（100%）。 */
+    const val MAX_COVER_HEIGHT_PERCENT_VERTICAL = 100f
+
     /** 该行数下盖板高度的上限（百分比 0..100）。 */
     fun maxCoverHeightPercent(lineCount: Int): Float =
         if (lineCount > 1) MAX_COVER_HEIGHT_RATIO_MULTILINE * 100f
@@ -37,12 +52,29 @@ internal object BubblePlausibility {
     /**
      * 盖板框高度超过合理性上限时，返回**钳高后的框**（`x, y, w, h`，保持上沿）；
      * 未超上限（或输入非法）返回 null —— 调用方原样使用，不做任何加工。
+     *
+     * @param vertical 竖排（OCR `layout=vertical`）：不做横排的 35%/60% 高度钳制。
+     * @param glyphBottomPercent 字形框下沿 + 下沿外扩（原图百分比 0..100）。传入时
+     *   作为钳制下限，保证任何情况下都不会把已经识别到的字形切掉；缺省（NaN）时
+     *   退回旧行为（只有行数比例上限）。
      */
-    fun clampCoverHeight(coverBoxPercent: FloatArray, lineCount: Int): FloatArray? {
+    fun clampCoverHeight(
+        coverBoxPercent: FloatArray,
+        lineCount: Int,
+        vertical: Boolean = false,
+        glyphBottomPercent: Float = Float.NaN
+    ): FloatArray? {
         if (coverBoxPercent.size != 4) return null
         val height = coverBoxPercent[3]
         if (!height.isFinite()) return null
-        val maxHeight = maxCoverHeightPercent(lineCount)
+        val ratioCap = if (vertical) MAX_COVER_HEIGHT_PERCENT_VERTICAL else maxCoverHeightPercent(lineCount)
+        val glyphFloor = if (glyphBottomPercent.isFinite()) {
+            // 盖板上沿可能为负（跨图气泡），floor 仍是「到字形底需要的高度」。
+            (glyphBottomPercent - coverBoxPercent[1]).coerceIn(0f, 100f)
+        } else {
+            0f
+        }
+        val maxHeight = maxOf(ratioCap, glyphFloor)
         if (height <= maxHeight) return null
         return floatArrayOf(coverBoxPercent[0], coverBoxPercent[1], coverBoxPercent[2], maxHeight)
     }
