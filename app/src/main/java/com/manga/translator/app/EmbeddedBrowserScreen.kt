@@ -368,6 +368,8 @@ private data class ScanResult(
     val adapterId: String = "",
     /** 顶层视口高度（CSS px，扫描脚本给）；<=0 时「阅读位置优先」退化为文档序。 */
     val viewportHeight: Int = 0,
+    /** 扫描时的页面滚动位置（CSS px）；<0 表示旧脚本没给，批处理中不做滚动重排。 */
+    val scrollY: Int = -1,
     /**
      * 候选被扫描脚本的安全阀截断（2026-10-15）。
      *
@@ -1024,6 +1026,7 @@ private fun parseScannedImages(raw: String?): ScanResult {
                 frameCount = meta.optInt("frames", 0),
                 adapterId = meta.optString("cfg"),
                 viewportHeight = meta.optInt("vh", 0),
+                scrollY = if (meta.has("sy")) meta.optInt("sy", 0) else -1,
                 truncated = meta.optBoolean("truncated", false)
             )
         } else {
@@ -1090,6 +1093,31 @@ private const val IDLE_POLL_INTERVAL_MS = 1200L
  * 长条漫通常上下各露出半张，35% 线穿过的是用户视线的落点。
  */
 private const val VIEWPORT_ANCHOR_RATIO = 0.35f
+
+/**
+ * 批处理期间允许的滚动容差；超过就**放弃本轮旧快照**，立即重扫并重新按阅读锚点排序
+ * （2026-10-23，用户报「翻到下一页时没提前翻，先停很久才开始」）。
+ *
+ * 为什么要重新扫描：一次扫描拿到的 `images` 是快照，外层循环会把它整批判完才重扫。
+ * 懒加载站点在用户往下翻时才挂出新图 —— 这些图不在旧快照里，只能等前面所有图
+ * 处理完才进队列，表现就是「眼前这页已经加载出来了，却很久没人翻」。
+ * 160px ≈ 视口高度的 5%~8%：能区分「连续翻页」与地址栏/回弹的轻微抖动。
+ */
+private const val SCROLL_REANCHOR_PX = 160
+
+/**
+ * 读当前页面滚动位置（与 `BrowserScanScript.SCAN_JS` 的 `sy` 同一口径）。
+ *
+ * 除了文档滚动，还要把扫描时打过 `data-mt-host` 的**可滚动容器**算进来：
+ * 部分阅读器（overflow:auto 的宿主）滚动时 `window.scrollY` 恒为 0，只读文档会
+ * 永远检测不到翻页。多个宿主求和即可 —— 正常页面只有一个真正在滚。
+ */
+private const val SCROLL_POSITION_JS =
+    "(function(){var y=window.scrollY||window.pageYOffset||" +
+        "document.documentElement.scrollTop||document.body.scrollTop||0;" +
+        "var h=document.querySelectorAll('[data-mt-host]');" +
+        "for(var i=0;i<h.length;i++){y+=h[i].scrollTop||0;}" +
+        "return Math.round(y)})()"
 
 /**
  * 「当前扫到的最后一张」等下一页出现的**单轮**等待时长（懒加载阅读器，2026-10-03）。
@@ -2918,6 +2946,10 @@ private suspend fun runTranslationSession(
     // 会话内事务性使用（登记 → 上屏后消费），所以留在会话局部；
     // 而「贴回要重发的场景」[seamBySrc] 必须跨会话存活，由调用方持有。
     val seamSuppress = HashMap<String, MutableList<String>>()
+    /** 阶段 3：相邻页接缝状态（key = 两页内容指纹 + 邻接 token），换图后旧证据 stale。 */
+    val seamPairStates = HashMap<String, SeamPairState.Snapshot>()
+    /** src → 内容指纹；几何回退的 SeamPairState key 用它，而不是易变的 blob src。 */
+    val contentFingerprints = HashMap<String, String>()
     // attemptKey -> 尝试次数：无文字的图不反复重翻；下载失败的图有限重试（网络抖动可恢复）。
     val attempts = HashMap<String, Int>()
     // 「处理过但没产出译文」的图（src）：图里确实没文字，或 OCR 有检测但分组没产出气泡。
@@ -3112,7 +3144,9 @@ private suspend fun runTranslationSession(
             w = w,
             h = h,
             originalText = originalText,
-            coverBox = coverBox
+            coverBox = coverBox,
+            translatedText = translatedText,
+            role = if (bgType.equals("solid", ignoreCase = true)) "speech_bubble" else "plain_text"
         )
 
     /**
@@ -3139,16 +3173,76 @@ private suspend fun runTranslationSession(
             Log.d(TAG, "seam_race_skip reason=no_prev_scene own=${prevImage.id}")
             return false
         }
-        val match = SeamRaceBand.findMatch(
-            previous = prevScene.bubbles.map { it.toRaceCandidate() },
-            current = scene.bubbles.map { it.toRaceCandidate() },
+        val prevCandidates = prevScene.bubbles.map { it.toRaceCandidate() }
+        val curCandidates = scene.bubbles.map { it.toRaceCandidate() }
+        val reasons = SeamRaceBand.edgeReasons(prevCandidates, curCandidates)
+        // 阶段 3：按「两页内容指纹 + 邻接 token」维护状态；同一对页面 revision 变了
+        // 就把旧状态标 stale，几何回退不再消费旧证据。
+        val previousRevision = contentFingerprints[prevImage.src] ?: prevImage.src
+        val currentRevision = contentFingerprints[image.src] ?: image.src
+        val adjacencyToken = "${prevImage.id}|${image.id}"
+        val now = System.currentTimeMillis()
+        seamPairStates.values
+            .filter { state ->
+                state.adjacencyToken == adjacencyToken &&
+                    (state.previousRevision != previousRevision ||
+                        state.currentRevision != currentRevision)
+            }
+            .forEach { stale ->
+                seamPairStates[stale.key] = SeamPairState.markStale(
+                    stale, previousRevision, currentRevision, now
+                )
+                Log.d(
+                    TAG,
+                    "seam_pair_state status=stale own=${prevImage.id} next=${image.id} " +
+                        "old=${stale.previousRevision}/${stale.currentRevision} " +
+                        "new=$previousRevision/$currentRevision"
+                )
+            }
+        val stateKey = SeamPairState.buildKey(previousRevision, currentRevision, adjacencyToken)
+        if (seamPairStates[stateKey]?.status != SeamPairState.Status.COMPLETED) {
+            seamPairStates[stateKey] = SeamPairState.start(
+                previousRevision, currentRevision, adjacencyToken, now
+            )
+        }
+        val textMatch = SeamRaceBand.findMatch(
+            previous = prevCandidates,
+            current = curCandidates,
             previousWidthPx = prevImage.width,
             previousHeightPx = prevImage.height,
             currentWidthPx = image.width,
             currentHeightPx = image.height,
             // 同图其它气泡 = 盖板要避让的对象（认领框比真实气泡高时不许盖住它们的文字）。
-            blockers = scene.bubbles.map { it.toRaceCandidate() }
-        ) ?: run {
+            blockers = curCandidates
+        )
+        // 短句（응? / 뭐?）以前被 <4 字文本门槛直接放弃；有双页贴边证据时改用几何回退。
+        val edgeTexts = (
+            prevCandidates.filter { it.y + it.h >= 100f - SeamRaceBand.EDGE_PERCENT } +
+                curCandidates.filter { it.y <= SeamRaceBand.EDGE_PERCENT }
+            ).map { HandoffTextMatch.normalize(it.originalText) }
+        val shortEdgeText = edgeTexts.any { it.isNotEmpty() && it.length < SeamRaceBand.MIN_TEXT_CHARS }
+        val geometricMatch = if (textMatch == null || shortEdgeText) {
+            SeamRaceBand.findGeometricMatch(
+                previous = prevCandidates,
+                current = curCandidates,
+                previousWidthPx = prevImage.width,
+                previousHeightPx = prevImage.height,
+                currentWidthPx = image.width,
+                currentHeightPx = image.height,
+                blockers = curCandidates
+            )
+        } else {
+            null
+        }
+        val match = geometricMatch ?: textMatch ?: run {
+            seamPairStates[stateKey] = SeamPairState.fail(
+                previousRevision, currentRevision, adjacencyToken, reasons, now, "no_match"
+            )
+            Log.d(
+                TAG,
+                "seam_pair_state status=failed own=${prevImage.id} next=${image.id} " +
+                    "reasons=${reasons.joinToString(",")} error=no_match"
+            )
             // 诊断（用户报「三个覆盖层」时按这一行定位：几何不贴边还是文本不匹配）。
             val prevDigest = prevScene.bubbles.take(3).joinToString(" ") { b ->
                 "y+h=${"%.1f".format(b.y + b.h)}"
@@ -3171,7 +3265,12 @@ private suspend fun runTranslationSession(
             )
             return false
         }
-        val bubble = scene.bubbles.firstOrNull { it.id == match.currentId } ?: return false
+        val bubbleId = if (match.structuralFallback) {
+            match.currentIds.firstOrNull()
+        } else {
+            match.currentId
+        }
+        val bubble = scene.bubbles.firstOrNull { it.id == bubbleId } ?: return false
         if (!bubble.bgType.equals("solid", ignoreCase = true)) {
             // 非实底（旁白/插画底）：接缝带必须带清理图纹理才不会糊画面，竞态时拿不到（A 的清理图已回收）。
             Log.d(TAG, "seam_race_skip reason=not_solid own=${prevImage.id} id=${bubble.id}")
@@ -3184,6 +3283,7 @@ private suspend fun runTranslationSession(
         } else {
             0f
         }
+        val fallback = match.structuralFallback
         val bandBubble = bubble.copy(
             id = "race0",
             x = match.layoutBoxPercent[0],
@@ -3191,6 +3291,16 @@ private suspend fun runTranslationSession(
             w = match.layoutBoxPercent[2],
             h = match.layoutBoxPercent[3],
             coverBox = match.coverBoxPercent,
+            originalText = if (fallback && match.originalText.isNotBlank()) {
+                match.originalText
+            } else {
+                bubble.originalText
+            },
+            translatedText = if (fallback) {
+                match.translatedText.ifBlank { match.originalText }.ifBlank { bubble.translatedText }
+            } else {
+                bubble.translatedText
+            },
             // 轮廓/四边形/清理图补丁都按「上一张图的坐标系」重算不了 → 全部退回矩形盖板
             // （带本身只覆盖这一句，矩形不越出多少；宁可不裁也不能用错坐标裁）。
             regionPolygon = null,
@@ -3214,14 +3324,35 @@ private suspend fun runTranslationSession(
             sourceHeightPx = prevImage.height,
             // 实底泡不需要纹理（与正常路径同口径：纯色带 cleanedUrl=null）。
             cleanedUrl = null,
-            ownBubbleIds = listOf(match.previousId),
-            nextBubbleIds = listOf(match.currentId)
+            ownBubbleIds = match.previousIds,
+            nextBubbleIds = match.currentIds
         )
         val ok = dispatchSeamScene(prevImage.id, image.id, bandScene)
+        val completedReasons = reasons + if (fallback) {
+            setOf(SeamPairState.REASON_STRUCTURAL_FALLBACK)
+        } else {
+            emptySet()
+        }
+        seamPairStates[stateKey] = if (ok) {
+            SeamPairState.complete(
+                previousRevision, currentRevision, adjacencyToken, completedReasons, System.currentTimeMillis()
+            )
+        } else {
+            SeamPairState.fail(
+                previousRevision, currentRevision, adjacencyToken, completedReasons,
+                System.currentTimeMillis(), "dispatch_failed"
+            )
+        }
+        Log.d(
+            TAG,
+            "seam_pair_state status=${if (ok) "completed" else "failed"} " +
+                "own=${prevImage.id} next=${image.id} " +
+                "reasons=${completedReasons.joinToString(",")}"
+        )
         Log.d(
             TAG,
             "seam_race_band own=${prevImage.id} next=${image.id} ok=$ok " +
-                "prev=${match.previousId} cur=${match.currentId} " +
+                "prev=${match.previousIds} cur=${match.currentIds} fallback=$fallback " +
                 "score=${"%.2f".format(match.textScore)} " +
                 "band=${match.bandWidthPx}x${match.bandHeightPx}@${match.bandLeftPx},${match.bandTopPx}"
         )
@@ -3230,8 +3361,8 @@ private suspend fun runTranslationSession(
         while (seamBySrc.size > MAX_RENDERED_SCENES) {
             seamBySrc.remove(seamBySrc.keys.first())
         }
-        seamSuppress.getOrPut(prevImage.id) { mutableListOf() } += match.previousId
-        seamSuppress.getOrPut(image.id) { mutableListOf() } += match.currentId
+        seamSuppress.getOrPut(prevImage.id) { mutableListOf() } += match.previousIds
+        seamSuppress.getOrPut(image.id) { mutableListOf() } += match.currentIds
         // 两边的场景都已经上屏：补带成功后**立刻**摘掉重复块（与正常路径的时序一致）。
         suppressSeamHalves(prevImage.id)
         suppressSeamHalves(image.id)
@@ -3344,6 +3475,9 @@ private suspend fun runTranslationSession(
             val viewVisible = isViewVisible()
             val pendingTotal = images.count { isPending(it) }
             val reShowTotal = if (viewVisible) images.count { needsReShow(it) } else 0
+            // 本批快照对应的滚动位置：处理每张图之后比对一次，用户翻页了就提前结束本批
+            // （否则新挂出来的图要等旧快照整批判完才进队列）。
+            val batchScrollY = scan.scrollY
             if (pendingTotal == 0 && reShowTotal == 0) {
                 // 一次性贴回会话：这一轮就是它的全部工作，贴完即退（不轮询、不翻译）。
                 if (sessionMode == BrowserSessionMode.RE_SHOW_ONLY) {
@@ -3373,6 +3507,7 @@ private suspend fun runTranslationSession(
                     "frames=${scan.frameCount} lazy=${images.count { it.lazy }} " +
                     "hosted=${images.count { it.hostId.isNotBlank() }} " +
                     "anchor=${(scan.viewportHeight * VIEWPORT_ANCHOR_RATIO).toInt()} " +
+                    "scroll=${scan.scrollY} " +
                     "first_vy=${orderedImages.firstOrNull()?.viewportTop ?: -1} " +
                     "capped=${scan.truncated} " +
                     "done=$doneCount shown=${placedIds.size}"
@@ -3632,6 +3767,9 @@ private suspend fun runTranslationSession(
                     // 指纹命中 → 直接复用已渲染场景（含接缝带），几何是百分比坐标，换 image id
                     // 照样成立；移交（crossOut）不重建——下一张早就拿着第一次的移交翻好了。
                     val contentKey = contentFingerprint(current)
+                    if (contentKey.isNotEmpty()) {
+                        contentFingerprints[image.src] = contentKey
+                    }
                     val cachedRender = if (contentKey.isNotEmpty()) scenesByContent[contentKey] else null
                     if (cachedRender != null) {
                         Log.d(
@@ -3913,6 +4051,31 @@ private suspend fun runTranslationSession(
                 // 这张图处理完了（上屏 / 图里没文字 / 失败都一样）：把 loading 框摘掉。
                 // 漏掉任何一条出口，页面上就会永久留一个"正在翻译"的胶囊。
                 webView.evaluateJavascript(hideLoadingJs(image.id), null)
+                // 处理完一张就检查用户有没有往下翻（2026-10-23，用户报「下一页没提前翻」）：
+                // 懒加载的新图只在扫描时才进 `images`，而旧实现要等本批快照**全部**处理完
+                // 才重扫 —— 用户翻到下一页时，那页可能还没进队列，只能干等前面几张。
+                // 这里一检测到滚动就结束本批，外层 while 立即重扫 + 按新阅读锚点排序，
+                // 把「眼前这张」提到最前；没滚动时行为与旧版完全一致（不增加额外扫描）。
+                if (sessionMode != BrowserSessionMode.RE_SHOW_ONLY &&
+                    batchScrollY >= 0 &&
+                    batchIndex < pendingTotal
+                ) {
+                    val scrollNow = webView
+                        // 非关键探针：页面主线程偶尔忙，最多等 1s 就放弃，别把单张图拖慢。
+                        .evaluateJavascriptSuspend(SCROLL_POSITION_JS, timeoutMs = 1_000L, what = "scroll_probe")
+                        ?.trim()?.toIntOrNull()
+                    if (scrollNow != null &&
+                        BrowserImageOrder.shouldReanchor(batchScrollY, scrollNow, SCROLL_REANCHOR_PX)
+                    ) {
+                        Log.d(
+                            TAG,
+                            "batch_reanchor reason=scroll from=$batchScrollY to=$scrollNow " +
+                                "delta=${kotlin.math.abs(scrollNow - batchScrollY)} " +
+                                "processed=$batchIndex/$pendingTotal"
+                        )
+                        break
+                    }
+                }
             }
             // 一次性贴回（「译文」视图开关）：这一轮就是全部工作，不做轮询。
             if (sessionMode == BrowserSessionMode.RE_SHOW_ONLY) {

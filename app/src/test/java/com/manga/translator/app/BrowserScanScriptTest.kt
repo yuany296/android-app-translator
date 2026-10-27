@@ -224,6 +224,18 @@ class BrowserScanScriptTest {
     }
 
     @Test
+    fun scanScriptReportsScrollPositionForBatchReanchor() {
+        // 会话侧处理每张图后要与扫描时的滚动位置比对；缺了 sy 就只能等整批处理完才重扫，
+        // 懒加载新图会一直排在旧快照后面（2026-10-23 用户报「下一页没提前翻」）。
+        val js = BrowserScanScript.SCAN_JS
+        assertTrue("payload 必须带 sy（扫描时的滚动位置）", js.contains("sy:"))
+        assertTrue(js.contains("window.scrollY"))
+        assertTrue(js.contains("document.documentElement.scrollTop"))
+        // overflow:auto 阅读器滚动时 window.scrollY 恒为 0，必须把宿主 scrollTop 也算进来。
+        assertTrue(js.contains("data-mt-host"))
+    }
+
+    @Test
     fun scanScriptLimitIsSafetyValveNotScheduler() {
         val js = BrowserScanScript.SCAN_JS
         // 旧版 `limit = 80` 在 174 切的长章节上把第 81 切之后**静默**截掉了：那些图

@@ -59,7 +59,9 @@ android-app/
 │     ├─ AndroidManifest.xml
 │     └─ java/com/manga/translator/store/
 │        ├─ SettingsRepository.kt          # 配置/渠道档案加密持久化
-│        ├─ GlossaryRepository.kt          # 术语表 CRUD + JSON 导入导出 + revision
+│        ├─ GlossaryRepository.kt          # 术语表 CRUD + JSON/CSV/Markdown 导入导出 + revision
+│        ├─ GlossaryTextImport.kt          # 导入格式识别/解析（JSON / Markdown / CSV）
+│        ├─ GlossaryTextDecoding.kt        # 术语文件字节解码（UTF-8/BOM → GBK）
 │        ├─ OcrCacheRepository.kt          # OCR 结果短期缓存（2h TTL）
 │        ├─ TranslationHistoryRepository.kt# 翻译历史库（永久，JSON 文件，上限 500 条）
 │        ├─ BrowserHistoryRepository.kt    # 内嵌浏览器访问历史（JSON 文件，同 URL 去重置顶，上限 300 条）

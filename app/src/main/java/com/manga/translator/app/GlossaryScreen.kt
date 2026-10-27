@@ -1,5 +1,6 @@
 ﻿package com.manga.translator.app
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -60,8 +61,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -91,7 +95,8 @@ fun GlossaryCollectionsScreen(
     onToggleActive: (String, Boolean) -> Unit,
     onMoveActive: (String, Int) -> Unit,
     onCreateCollection: (String) -> Unit,
-    onImport: () -> Unit,
+    onImportFile: () -> Unit,
+    onImportText: (String) -> Unit,
     onDeleteCollection: (String) -> Unit,
     onDuplicateCollection: (String, String) -> Boolean,
     onMergeCollection: (String, String) -> Boolean,
@@ -99,6 +104,7 @@ fun GlossaryCollectionsScreen(
     onRefresh: () -> Unit
 ) {
     var creating by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
     var deletingName by remember { mutableStateOf<String?>(null) }
     var renamingName by remember { mutableStateOf<String?>(null) }
     var duplicatingName by remember { mutableStateOf<String?>(null) }
@@ -170,7 +176,7 @@ fun GlossaryCollectionsScreen(
                     Text(text = "新建术语表", style = MaterialTheme.typography.labelLarge)
                 }
                 OutlinedButton(
-                    onClick = onImport,
+                    onClick = { showImport = true },
                     modifier = Modifier
                         .width(96.dp)
                         .height(44.dp),
@@ -211,7 +217,7 @@ fun GlossaryCollectionsScreen(
                             color = MtColors.TextPrimary
                         )
                         Text(
-                            text = "新建一个术语表，或从 JSON 导入已有的术语表。",
+                            text = "新建一个术语表，或导入 JSON / CSV / Markdown 表格。",
                             fontSize = 12.sp,
                             color = MtColors.TextTertiary
                         )
@@ -304,6 +310,20 @@ fun GlossaryCollectionsScreen(
                 creating = false
             },
             onDismiss = { creating = false }
+        )
+    }
+
+    if (showImport) {
+        GlossaryImportDialog(
+            onPickFile = {
+                showImport = false
+                onImportFile()
+            },
+            onImportText = { raw ->
+                showImport = false
+                onImportText(raw)
+            },
+            onDismiss = { showImport = false }
         )
     }
 
@@ -1103,6 +1123,8 @@ fun GlossaryCollectionScreen(
     var adding by remember { mutableStateOf(false) }
     var addSourceDraft by remember { mutableStateOf("") }
     var addTargetDraft by remember { mutableStateOf("") }
+    var addError by remember { mutableStateOf<String?>(null) }
+    val addSourceFocus = remember { FocusRequester() }
     var batchMode by remember { mutableStateOf(false) }
     var selectedSources by remember { mutableStateOf(setOf<String>()) }
     var confirmDeleteSelected by remember { mutableStateOf(false) }
@@ -1148,21 +1170,52 @@ fun GlossaryCollectionScreen(
         editingTargetKey = null
     }
 
-    fun commitAdd() {
+    val existingSources = remember(entries) { entries.map { it.source }.toSet() }
+    // 只有表单显示错误时才需要判定高亮哪一格；仓库写入失败（如达到上限）不会命中这里。
+    val addFieldBlock = if (addError == null) {
+        GlossaryAddPolicy.Block.NONE
+    } else {
+        GlossaryAddPolicy.block(addSourceDraft, addTargetDraft, existingSources)
+    }
+
+    fun openAddForm() {
+        adding = true
+        addSourceDraft = ""
+        addTargetDraft = ""
+        addError = null
+    }
+
+    fun closeAddForm() {
+        adding = false
+        addSourceDraft = ""
+        addTargetDraft = ""
+        addError = null
+        focusManager.clearFocus()
+        keyboardController?.hide()
+    }
+
+    fun submitAdd(): Boolean {
         val source = addSourceDraft.trim()
         val target = addTargetDraft.trim()
-        if (source.isNotEmpty() && target.isNotEmpty()) {
-            if (onAdd(source, target)) {
-                adding = false
-                addSourceDraft = ""
-                addTargetDraft = ""
-            }
+        val block = GlossaryAddPolicy.block(source, target, existingSources)
+        val blockMessage = GlossaryAddPolicy.message(block)
+        if (blockMessage != null) {
+            addError = blockMessage
+            return false
+        }
+        return if (onAdd(source, target)) {
+            closeAddForm()
+            // 搜索过滤还没清时，新条目可能直接被滤掉（看起来像没加上），所以成功后回到全量列表。
+            if (query.isNotBlank()) query = ""
+            true
         } else {
-            adding = false
-            addSourceDraft = ""
-            addTargetDraft = ""
+            addError = "添加失败：可能已达上限或写入失败"
+            false
         }
     }
+
+    // 弹窗展开时系统返回键先收起弹窗，不直接退出术语表详情。
+    BackHandler(enabled = adding) { closeAddForm() }
 
     Column(
         modifier = Modifier
@@ -1244,7 +1297,7 @@ fun GlossaryCollectionScreen(
                 Column(modifier = Modifier.fillMaxSize().padding(top = 16.dp)) {
                     Text(
                         text = if (query.isBlank()) {
-                            "暂无术语。点击下方「添加」新增条目；点击条目可直接修改。"
+                            "暂无术语。点击下方「添加术语」新增条目；点击条目可直接修改。"
                         } else {
                             "没有匹配「$query」的术语"
                         },
@@ -1430,50 +1483,33 @@ fun GlossaryCollectionScreen(
                 modifier = Modifier.align(Alignment.TopCenter)
             )
         }
-        if (adding) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = addSourceDraft,
-                    onValueChange = { addSourceDraft = it },
-                    label = { Text("原文") },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true,
-                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Next)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                OutlinedTextField(
-                    value = addTargetDraft,
-                    onValueChange = { addTargetDraft = it },
-                    label = { Text("译文") },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true,
-                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Done),
-                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                        onDone = {
-                            commitAdd()
-                            focusManager.clearFocus()
-                            keyboardController?.hide()
-                        }
-                    )
-                )
-            }
-        }
         Spacer(modifier = Modifier.height(8.dp))
         Button(
-            onClick = {
-                adding = true
-                addSourceDraft = ""
-                addTargetDraft = ""
-            },
+            onClick = { openAddForm() },
             modifier = Modifier.fillMaxWidth()
         ) { Text("添加术语") }
+    }
+
+    if (adding) {
+        AddGlossaryEntryDialog(
+            source = addSourceDraft,
+            target = addTargetDraft,
+            error = addError,
+            isSourceError = addFieldBlock == GlossaryAddPolicy.Block.BLANK_SOURCE ||
+                addFieldBlock == GlossaryAddPolicy.Block.DUPLICATE,
+            isTargetError = addFieldBlock == GlossaryAddPolicy.Block.BLANK_TARGET,
+            sourceFocus = addSourceFocus,
+            onSourceChange = {
+                addSourceDraft = it
+                addError = null
+            },
+            onTargetChange = {
+                addTargetDraft = it
+                addError = null
+            },
+            onSubmit = { submitAdd() },
+            onDismiss = { closeAddForm() }
+        )
     }
 
     if (confirmDeleteSelected) {
@@ -1497,6 +1533,93 @@ fun GlossaryCollectionScreen(
             }
         )
     }
+}
+
+/**
+ * 居中「添加术语」弹窗（2026-10-27 用户要求从底部内嵌行改为弹窗）。
+ *
+ * 为什么用弹窗：底部内嵌行和主按钮贴在一起，用户填完后最显眼的是「添加术语」，
+ * 一点就把草稿重置了（原 bug）。弹窗把「原文 / 译文 / 保存 / 取消」收进同一个
+ * 视觉单元，保存动作不再和"新增入口"混在一起。
+ */
+@Composable
+private fun AddGlossaryEntryDialog(
+    source: String,
+    target: String,
+    error: String?,
+    isSourceError: Boolean,
+    isTargetError: Boolean,
+    sourceFocus: FocusRequester,
+    onSourceChange: (String) -> Unit,
+    onTargetChange: (String) -> Unit,
+    onSubmit: () -> Boolean,
+    onDismiss: () -> Unit
+) {
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    // 弹窗出现后把光标放进「原文」，键盘直接弹出来。
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { sourceFocus.requestFocus() }
+        keyboardController?.show()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加术语") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = source,
+                    onValueChange = onSourceChange,
+                    label = { Text("原文") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(sourceFocus),
+                    singleLine = true,
+                    isError = isSourceError,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Next)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = target,
+                    onValueChange = onTargetChange,
+                    label = { Text("译文") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    isError = isTargetError,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                        onDone = { onSubmit() }
+                    )
+                )
+                if (error != null) {
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MtColors.DangerText,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    // 保存成功 = 弹窗马上被移除，顺手把键盘收掉；校验失败则保持键盘便于继续改。
+                    if (onSubmit()) keyboardController?.hide()
+                }
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    keyboardController?.hide()
+                    onDismiss()
+                }
+            ) { Text("取消") }
+        }
+    )
 }
 
 @Composable
@@ -1565,6 +1688,7 @@ private fun RenameCollectionDialog(
 @Composable
 fun ImportCollectionDialog(
     defaultName: String,
+    preview: String? = null,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1578,14 +1702,23 @@ fun ImportCollectionDialog(
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text("术语表名称（默认取文件名）") },
+                    label = { Text("术语表名称") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
                 Spacer(modifier = Modifier.height(8.dp))
+                if (preview != null) {
+                    Text(
+                        text = preview,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MtColors.BrandInk
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
                 Text(
-                    text = "导入的 JSON 会创建为新术语表。",
-                    style = MaterialTheme.typography.bodySmall
+                    text = "会创建为一张新术语表；重复的原文会跳过。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MtColors.TextTertiary
                 )
             }
         },
@@ -1593,7 +1726,7 @@ fun ImportCollectionDialog(
             TextButton(
                 onClick = { onConfirm(name) },
                 enabled = name.isNotBlank()
-            ) { Text("导入") }
+            ) { Text("创建并导入") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("取消") }

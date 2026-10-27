@@ -92,7 +92,14 @@ data class CrossBubblePart(
      * 轴对齐时是外扩几像素的矩形四角 —— 两种情形都有值。
      * 换算到下一张图坐标系只需 y 减 100（两图紧邻），x 不变。
      */
-    val sourcePolygon: List<Float>? = null
+    val sourcePolygon: List<Float>? = null,
+    /**
+     * 接收页（下一张图）是否真的有文字像素（2026-10-27，三态）。
+     *
+     * `true` 有可见文字；`false` 只有外框/容器跨过缝、文字全在上一张；`null` 老数据/拿不准。
+     * 接收侧对 `false` 不擦字、不进清理图 mask、不生成空壳盖板/贴片/译文。
+     */
+    val hasTextPixels: Boolean? = null
 )
 
 /**
@@ -126,7 +133,14 @@ data class SeamBandScene(
     /** 本图场景里这些气泡的层 id（渲染层据此摘掉「上半块」）。 */
     val ownBubbleIds: List<String>,
     /** 下一张图场景里这些气泡的层 id（摘掉「下半块」）。 */
-    val nextBubbleIds: List<String>
+    val nextBubbleIds: List<String>,
+    /**
+     * 接缝带接收侧是否有文字像素（三态汇总）。
+     *
+     * `true` = 带内条目都明确有文字；`null` = 含老数据/未知；不会出现 `false`
+     * （全 false 的带在构建时就被过滤掉了）。
+     */
+    val hasTextPixels: Boolean? = null
 )
 
 /** 内嵌浏览器渲染模式：DOM 覆盖层（场景下发）或整图替换（回退/兼容）。 */
@@ -346,6 +360,24 @@ class WebtoonImageTranslator(
         // 真机 `[32317270]`：移交框只覆盖本图那份检出的 34%，白框中文于是糊在本图另一个气泡上，
         // 同时本图那半行又被当成「上一张已画过」丢掉（既不擦也不翻）。
         // 必须在 `planSeamOwnership` **之前**判：归属判定正是用这批框做「上一张画过没有」的依据。
+        // 收到侧三态（2026-10-27，对齐参考项目 `hasTextPixels`）：
+        // 上一张移交的块如果明确声明「本页没有文字像素」（只有容器/外框跨缝），
+        // 后续擦字、清理图 mask、场景/整图渲染一律跳过；但不能从列表里删掉它 ——
+        // 列表下标就是接缝带/场景里的 cN id，删掉会让后面的 id 全部错位。
+        // `null`（老数据/拿不准）按 true 处理，行为不变。
+        val incomingNoTextCount = incomingRaw.count { part ->
+            !SeamTextPixels.contributesText(part.hasTextPixels)
+        }
+        if (incomingNoTextCount > 0) {
+            timer.mark(
+                "incoming_no_text",
+                "dropped=$incomingNoTextCount kept=${incomingRaw.size - incomingNoTextCount} texts=" +
+                    incomingRaw.filterNot { part -> SeamTextPixels.contributesText(part.hasTextPixels) }
+                        .joinToString(" ") { part ->
+                            "[${part.originalText.replace('\n', '⏎').take(16)}]"
+                        }
+            )
+        }
         val incomingCross = filterContestedIncoming(
             parts = incomingRaw,
             localBubbles = ocrResult.bubbles,
@@ -355,6 +387,9 @@ class WebtoonImageTranslator(
             lineHeightPx = medianLineHeight,
             timer = timer
         )
+        val incomingTextCount = incomingCross.count { part ->
+            SeamTextPixels.contributesText(part.hasTextPixels)
+        }
 
         val maxCrossHeight = SeamTuning.maxCrossHeight(topBand, bottomBand, medianLineHeight)
         val edgeWindow = SeamTuning.resolveEdgeWindow(medianLineHeight)
@@ -492,6 +527,7 @@ class WebtoonImageTranslator(
         // 翻译请求在下面统一发出：`owned` 的原文在前、合并原文追加在后，结果按下标切回。
         data class MergedIncomingRequest(val partIndex: Int, val mergedOriginal: String, val union: RectF)
         val mergedRequests = incomingCross.mapIndexed { partIndex, part ->
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) return@mapIndexed null
             val fragments = absorption.adjacentByPart[partIndex].orEmpty()
             if (fragments.isEmpty()) return@mapIndexed null
             val union = RectF(part.contentRect)
@@ -511,7 +547,10 @@ class WebtoonImageTranslator(
                 union = union
             )
         }.filterNotNull()
-        if (owned.isEmpty() && incomingCross.isEmpty()) {
+        if (owned.isEmpty() && incomingTextCount == 0) {
+            // 只有「本页没有文字像素」的移交块时不会渲染：贴片必须在这里回收，
+            // 否则早退路径会漏掉它们。
+            incomingCross.forEach { part -> runCatching { part.patchBitmap.recycle() } }
             timer.mark("render_done", "bubbles=0 detected=${seamPlan.detected}")
             return Outcome(0, 0, 0, null, null)
         }
@@ -522,7 +561,10 @@ class WebtoonImageTranslator(
                 "dropped_neighbor=${seamPlan.droppedNeighbor} suppressed_incoming=${seamPlan.suppressedByIncoming} " +
                 "orphan_adopted=${seamPlan.orphanAdopted} handed_tail=${seamPlan.handedTail} " +
                 "capped_cross=${seamPlan.cappedCross} " +
-                "incoming=${incomingCross.size} edge_window=${edgeWindow.toInt()} " +
+                "grouped_region=${seamPlan.groupedRegion} grouped_body=${seamPlan.groupedBody} " +
+                "grouped_fragments=${seamPlan.groupedFragments} container_cross=${seamPlan.containerCross} " +
+                "incoming=${incomingTextCount} incoming_no_text=${incomingCross.size - incomingTextCount} " +
+                "edge_window=${edgeWindow.toInt()} " +
                 "max_cross_h=${maxCrossHeight.toInt()} cut_allow=${cutAllowance.toInt()}"
         )
         // 缝归属诊断（2026-09-30）：每条 `outerT~outerB/contentT~contentB`，用来核对
@@ -634,7 +676,7 @@ class WebtoonImageTranslator(
                 val bottom = ((b.contentY + b.contentH) / 100f * stitched.height) - topH
                 "[${left.toInt()},${top.toInt()}~${right.toInt()},${bottom.toInt()}]"
             }
-            timer.mark("cross_prep", "incoming=${incomingCross.size} added=${crossPrepBubbles.size} px=$detail")
+            timer.mark("cross_prep", "incoming=$incomingTextCount added=${crossPrepBubbles.size} px=$detail")
         }
         coroutineScope {
             // 擦字/颜色/内容框与翻译请求并行（与悬浮球链路同策略，减少总等待）。
@@ -802,7 +844,7 @@ class WebtoonImageTranslator(
                 if (scene != null) {
                     // cleaned = 场景带整页清理图；patches = 跨图续排的贴片盖板数；
                     // flat = 用**不透明实底**盖住原文的气泡数（关闭「精细擦字」时旁白走这条）。
-                    "owned=${finalBubbles.size} incoming=${incomingFinal.size} " +
+                    "owned=${finalBubbles.size} incoming=${incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) }} " +
                         "cleaned=${scene.cleanedUrl != null} " +
                         "patches=${scene.bubbles.count { it.patchUrl != null }} " +
                         "flat=${scene.bubbles.count { it.flatCover }}"
@@ -891,6 +933,18 @@ class WebtoonImageTranslator(
                 crossProbe.append("i$index:ok ")
                 // 框 / 四边形 / 字号全部取**最终几何**（本图场景用的就是它，两图因此严格一致）。
                 val contentFull = geometry.layoutRect
+                // 接收页（下一张）坐标 = 拼接图坐标整体下移 bottomLimit。
+                // 只根据**文字排版框**判断，不看容器/贴片：容器跨缝但文字全在上一张时，
+                // 下一张不该生成空壳盖板/贴片，也不该擦字或翻译。
+                val hasTextPixels = SeamTextPixels.resolveOnPage(
+                    contentLeft = contentFull.left,
+                    contentTop = contentFull.top - bottomLimit,
+                    contentRight = contentFull.right,
+                    contentBottom = contentFull.bottom - bottomLimit,
+                    pageWidth = source.width.toFloat(),
+                    pageHeight = source.height.toFloat()
+                )
+                crossProbe.append("i$index:text=${hasTextPixels ?: "null"} ")
                 // 接缝覆盖层的 id 对应关系（必须在追加之前取 crossOut.size —— 它就是本项
                 // 在下一张图场景里的 incoming 下标）。
                 seamEntries += SeamBubbleGeometry(
@@ -924,7 +978,8 @@ class WebtoonImageTranslator(
                         topH.toFloat()
                     ),
                     lineHeightPx = geometry.lineHeightPx,
-                    fixedFontPx = geometry.fixedFontPx
+                    fixedFontPx = geometry.fixedFontPx,
+                    hasTextPixels = hasTextPixels
                 )
                 crossOut += CrossBubblePart(
                     translatedText = bubble.translatedText.ifBlank { bubble.originalText },
@@ -993,7 +1048,8 @@ class WebtoonImageTranslator(
                         } else {
                             flat
                         }
-                    }
+                    },
+                    hasTextPixels = hasTextPixels
                 )
             }
         }
@@ -1026,6 +1082,7 @@ class WebtoonImageTranslator(
                 "mode=band bubbles=${seam.bubbles.size} " +
                     "band=${seam.bandWidthPx}x${seam.bandHeightPx}@${seam.bandLeftPx},${seam.bandTopPx} " +
                     "bg=${if (seam.cleanedUrl != null) "cleaned" else "solid"} " +
+                    "text=${seam.hasTextPixels ?: "null"} " +
                     "own=${seam.ownBubbleIds} next=${seam.nextBubbleIds}"
             }
         )
@@ -1039,11 +1096,11 @@ class WebtoonImageTranslator(
         finalPrep.cleanedImage?.let { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() }
         timer.mark(
             "render_done",
-            "bubbles=${finalBubbles.size} incoming=${incomingFinal.size} crossOut=${crossOut.size} " +
+            "bubbles=${finalBubbles.size} incoming=${incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) }} crossOut=${crossOut.size} " +
                 "seam=${seam?.bubbles?.size ?: 0} mode=$renderMode png=${png?.size ?: 0}B"
         )
         return Outcome(
-            bubbleCount = finalBubbles.size + incomingFinal.size,
+            bubbleCount = finalBubbles.size + incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) },
             cacheHitCount = cacheStats.hitCount,
             cacheTotalCount = cacheStats.total,
             warningMessage = warning,
@@ -1073,7 +1130,9 @@ class WebtoonImageTranslator(
         val maskPolygon: List<Float>?,
         val regionPolygon: List<Float>?,
         val lineHeightPx: Float,
-        val fixedFontPx: Float?
+        val fixedFontPx: Float?,
+        /** 接收页是否有文字像素（三态）；`false` 的条目不应进入接缝带。 */
+        val hasTextPixels: Boolean? = null
     ) {
         /**
          * 带必须覆盖的全部框（遮罩 + 轮廓 + 排版框：译文排版可能比字形框大一圈）。
@@ -1111,22 +1170,28 @@ class WebtoonImageTranslator(
         srcH: Int
     ): SeamBandScene? {
         if (entries.isEmpty() || stitchedWidth <= 0 || stitchedHeight <= 0 || srcW <= 0 || srcH <= 0) return null
+        // 明确声明接收页没有文字像素的条目不进接缝带：带只服务「跨缝的那份文字」，
+        // 空壳条目会把带撑大，并在下一张留下无字盖板/贴片。
+        val textEntries = entries.filter { entry ->
+            SeamTextPixels.contributesText(entry.hasTextPixels)
+        }
+        if (textEntries.isEmpty()) return null
         val band = SeamBandGeometry.bandOf(
-            boxes = entries.flatMap { it.boxes },
+            boxes = textEntries.flatMap { it.boxes },
             padPx = SEAM_BAND_PAD_PX,
             stitchedWidth = stitchedWidth.toFloat(),
             limitTop = topH.toFloat(),
             stitchedHeight = stitchedHeight.toFloat()
         ) ?: return null
-        val needsBackground = entries.any { !it.bubble.bgType.equals("solid", ignoreCase = true) }
+        val needsBackground = textEntries.any { !it.bubble.bgType.equals("solid", ignoreCase = true) }
         if (needsBackground && (cleanedImage == null || cleanedImage.isRecycled)) return null
         val cleanedUrl = if (needsBackground) {
             exportSeamBandImage(cleanedImage, band) ?: return null
         } else {
             null
         }
-        val bubbles = entries.mapNotNull { entry -> buildSeamBubble(entry, band, cleanedImage) }
-        if (bubbles.size != entries.size) return null
+        val bubbles = textEntries.mapNotNull { entry -> buildSeamBubble(entry, band, cleanedImage) }
+        if (bubbles.size != textEntries.size) return null
         return SeamBandScene(
             bubbles = bubbles,
             bandLeftPx = band.left.roundToInt(),
@@ -1137,8 +1202,9 @@ class WebtoonImageTranslator(
             sourceWidthPx = srcW,
             sourceHeightPx = srcH,
             cleanedUrl = cleanedUrl,
-            ownBubbleIds = entries.map { it.ownBubbleId },
-            nextBubbleIds = entries.map { it.nextBubbleId }
+            ownBubbleIds = textEntries.map { it.ownBubbleId },
+            nextBubbleIds = textEntries.map { it.nextBubbleId },
+            hasTextPixels = if (textEntries.any { it.hasTextPixels == null }) null else true
         )
     }
 
@@ -1302,7 +1368,9 @@ class WebtoonImageTranslator(
                 flatCover = flatCover
             )
         }
-        val crossBubbles = incomingCross.mapIndexed { index, part ->
+        val crossBubbles = incomingCross.mapIndexedNotNull { index, part ->
+            // 防御：没有文字像素的移交块不生成任何 scene 节点（无空壳盖板/贴片/译文）。
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) return@mapIndexedNotNull null
             // 续排框：优先用上一张图**算好的百分比框**原样换算。
             // 上一张图的百分比框 (x%,y%,w%,h%) × 它的像素尺寸 = 上一张图里的像素框；
             // 再按本图尺寸折成百分比 —— 两图尺寸不一致也不会错位。
@@ -1391,7 +1459,8 @@ class WebtoonImageTranslator(
         // 下半那段没有翻译」）。render_done 的 bubbles 是 owned+cross 的和，分不清
         // 「没进来」还是「进来了没画」，所以把四个数一起带出去，在会话日志里对照。
         sceneDiag = "owned=${ownedBubbles.size} cross=${crossBubbles.size} " +
-            "incoming=${incomingCross.size} final=${ownedBubbles.size + crossBubbles.size}"
+            "incoming=${incomingCross.count { SeamTextPixels.contributesText(it.hasTextPixels) }} " +
+            "final=${ownedBubbles.size + crossBubbles.size}"
         return BrowserSceneBuilder.Scene(cleanedUrl, ownedBubbles + crossBubbles)
     }
 
@@ -1898,6 +1967,12 @@ class WebtoonImageTranslator(
         val kept = mutableListOf<CrossBubblePart>()
         val rejected = mutableListOf<String>()
         parts.forEachIndexed { index, part ->
+            // `hasTextPixels=false` 是「这一页没有文字」的明确声明：不参与冲突判定，
+            // 也不在这里回收贴片（保留占位以稳定 cN 下标，统一由收尾回收）。
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) {
+                kept += part
+                return@forEachIndexed
+            }
             val left = part.contentRect.left
             val right = part.contentRect.right
             val top = maxOf(0f, part.contentRect.top)
@@ -2068,12 +2143,18 @@ class WebtoonImageTranslator(
             )
         }
         val partBoxes = parts.map { part ->
-            SeamIncomingGeometry.Box(
-                left = part.contentRect.left,
-                top = maxOf(0f, part.contentRect.top),
-                right = part.contentRect.right,
-                bottom = minOf(heightF, part.contentRect.bottom)
-            )
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) {
+                // 没有文字像素的移交块不参与「吸收本图碎片」——零框会被所有判据拒绝，
+                // 同时保留列表下标（与 crossPrepare / 场景 cN 对齐）。
+                SeamIncomingGeometry.Box(0f, 0f, 0f, 0f)
+            } else {
+                SeamIncomingGeometry.Box(
+                    left = part.contentRect.left,
+                    top = maxOf(0f, part.contentRect.top),
+                    right = part.contentRect.right,
+                    bottom = minOf(heightF, part.contentRect.bottom)
+                )
+            }
         }
         val fragments = HashMap<Int, MutableList<SeamIncomingGeometry.Box>>()
         val adjacentBoxes = HashMap<Int, MutableList<SeamIncomingGeometry.Box>>()
@@ -2171,6 +2252,8 @@ class WebtoonImageTranslator(
         val stitchedW = stitched.width.toFloat()
         val heightF = sourceHeight.toFloat()
         return incomingCross.mapIndexedNotNull { index, part ->
+            // 防御：接收页明确没有文字像素的块不擦字、不进清理图 mask、不取色。
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) return@mapIndexedNotNull null
             var topPx = maxOf(0f, part.contentRect.top).coerceAtMost(heightF)
             var bottomPx = minOf(heightF, part.contentRect.bottom)
             var leftPx = part.contentRect.left.coerceIn(0f, stitchedW)
@@ -2502,6 +2585,7 @@ class WebtoonImageTranslator(
 
         // 上一张图移交的跨图气泡：贴片 + 续排文字（contentRect 顶边可能为负）。
         incomingCross.forEach { part ->
+            if (!SeamTextPixels.contributesText(part.hasTextPixels)) return@forEach
             if (!part.patchBitmap.isRecycled) {
                 canvas.drawBitmap(part.patchBitmap, null, part.patchDest, patchPaint)
             }

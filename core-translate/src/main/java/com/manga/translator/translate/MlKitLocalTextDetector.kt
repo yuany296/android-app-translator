@@ -10,6 +10,8 @@ import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.min
@@ -35,6 +37,11 @@ class MlKitLocalTextDetector : LocalTextDetector {
     /**
      * 长条图分块：沿长边切 2~3 块，逐块缩放检测后把框映射回整图坐标并按 IoU 去重。
      * 块的长边 ≈ 检测上限 → 块内文字按**接近原分辨率**检测（整图单趟时只有 ~25%）。
+     *
+     * 分块检测并行化（2026-10-22 用户反馈「分块后翻译明显变慢」）：块与块相互独立，
+     * 串行跑 3 块 = 检测耗时 ×3。ML Kit 的 `process()` 是 Task 异步接口、同一 client
+     * 支持并发提交，这里每块一个线程各自裁图/缩放/await；结果**按块序**收齐后再做
+     * 映射 + IoU 去重 —— 与串行版输出逐位一致。
      */
     private fun detectTiled(recognizer: TextRecognizer, bitmap: Bitmap): List<TextBlock> {
         val horizontal = bitmap.width > bitmap.height
@@ -43,24 +50,44 @@ class MlKitLocalTextDetector : LocalTextDetector {
         if (ranges.size <= 1) {
             return detectScaled(recognizer, bitmap, offsetX = 0f, offsetY = 0f)
         }
-        val candidates = mutableListOf<MlKitTiledBlockMerger.Candidate>()
-        var added = 0
-        for ((index, range) in ranges.withIndex()) {
+        val tileStartedAt = System.currentTimeMillis()
+        val pool = Executors.newFixedThreadPool(min(ranges.size, MAX_TILE_THREADS)) { runnable ->
+            Thread(runnable, "mlkit-det-tile").apply { isDaemon = true }
+        }
+        val tileFutures = ranges.mapIndexed { _, range ->
             val tile = if (horizontal) {
                 Bitmap.createBitmap(bitmap, range.start, 0, range.length, bitmap.height)
             } else {
                 Bitmap.createBitmap(bitmap, 0, range.start, bitmap.width, range.length)
             }
-            val blocks = try {
-                detectScaled(
-                    recognizer,
-                    tile,
-                    offsetX = if (horizontal) range.start.toFloat() else 0f,
-                    offsetY = if (horizontal) 0f else range.start.toFloat()
-                )
-            } finally {
-                tile.recycle()
-            }
+            pool.submit(
+                Callable<Pair<List<TextBlock>, Long>> {
+                    val passStart = System.currentTimeMillis()
+                    try {
+                        detectScaled(
+                            recognizer,
+                            tile,
+                            offsetX = if (horizontal) range.start.toFloat() else 0f,
+                            offsetY = if (horizontal) 0f else range.start.toFloat()
+                        ) to (System.currentTimeMillis() - passStart)
+                    } finally {
+                        tile.recycle()
+                    }
+                }
+            )
+        }
+        val tileResults = tileFutures.mapIndexed { index, future ->
+            runCatching { future.get(TILE_AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
+                .getOrElse { err ->
+                    Log.w(TAG, "mlkit_det_tile_fail tile=$index reason=${err.message?.take(80)}")
+                    emptyList<TextBlock>() to 0L
+                }
+        }
+        pool.shutdown()
+        val candidates = mutableListOf<MlKitTiledBlockMerger.Candidate>()
+        var added = 0
+        for ((index, range) in ranges.withIndex()) {
+            val blocks = tileResults[index].first
             for (block in blocks) {
                 val candidate = MlKitTiledBlockMerger.Candidate(
                     text = block.text,
@@ -85,7 +112,9 @@ class MlKitLocalTextDetector : LocalTextDetector {
             TAG,
             "mlkit_det_tiled tiles=${ranges.size} axis=${if (horizontal) "x" else "y"} " +
                 "ranges=${ranges.joinToString(",") { "${it.start}-${it.endExclusive}" }} " +
-                "blocks=$added img=${bitmap.width}x${bitmap.height}"
+                "blocks=$added img=${bitmap.width}x${bitmap.height} " +
+                "totalMs=${System.currentTimeMillis() - tileStartedAt} " +
+                "tileMs=${tileResults.joinToString("/") { it.second.toString() }}"
         )
         return candidates.mapIndexed { index, candidate ->
             TextBlock(
@@ -126,7 +155,9 @@ class MlKitLocalTextDetector : LocalTextDetector {
         return try {
             runCatching {
                 val image = InputImage.fromBitmap(work, 0)
-                val result = Tasks.await(recognizer.process(image), 8, TimeUnit.SECONDS)
+                // 15s：分块并行后多块共享 CPU，单块可能比串行慢几倍；8s 在低端机上会把
+                // 本来能出的结果误判超时（超时 = 该块整块丢字，比慢更伤）。
+                val result = Tasks.await(recognizer.process(image), 15, TimeUnit.SECONDS)
                 result.textBlocks.mapIndexedNotNull { index, block ->
                     val box = block.boundingBox ?: return@mapIndexedNotNull null
                     val text = block.text.trim()
@@ -182,5 +213,11 @@ class MlKitLocalTextDetector : LocalTextDetector {
     private companion object {
         const val TAG = "MlKitLocalDetector"
         const val MAX_EDGE = 1280
+
+        /** 分块检测的最大并行线程数（块数上限即 3，线程数不超过它）。 */
+        const val MAX_TILE_THREADS = 3
+
+        /** 单个分块等待上限：并行时多块共享 CPU，单块比串行长；超时只丢该块、不阻塞整页。 */
+        const val TILE_AWAIT_TIMEOUT_MS = 30_000L
     }
 }

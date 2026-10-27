@@ -72,4 +72,32 @@ class BrowserImageOrderTest {
         )
         assertEquals(listOf(0), order)
     }
+
+    // ------------------------------------------------------------------
+    // 批处理中滚动 → 提前重扫（2026-10-23，用户报「下一页没提前翻」）
+    // ------------------------------------------------------------------
+
+    @Test
+    fun reanchor_onlyWhenScrolledBeyondThreshold() {
+        // 没动 / 轻微回弹（< 160px）→ 继续按旧快照处理，不额外扫描。
+        assertEquals(false, BrowserImageOrder.shouldReanchor(1000, 1000, 160))
+        assertEquals(false, BrowserImageOrder.shouldReanchor(1000, 1159, 160))
+        // 达到阈值 → 重扫；向下翻和向上翻都算。
+        assertEquals(true, BrowserImageOrder.shouldReanchor(1000, 1160, 160))
+        assertEquals(true, BrowserImageOrder.shouldReanchor(1000, 840, 160))
+    }
+
+    @Test
+    fun reanchor_isDisabledWhenScanDidNotReportScroll() {
+        // 旧扫描脚本（payload 没有 sy）或读取失败时保持旧行为，避免每张图都误重扫。
+        assertEquals(false, BrowserImageOrder.shouldReanchor(-1, 2000, 160))
+        assertEquals(false, BrowserImageOrder.shouldReanchor(1000, -1, 160))
+    }
+
+    @Test
+    fun reanchor_thresholdIsAtLeastOnePixel() {
+        // 防御非法配置：阈值 0/负数不能退化成「每次处理完都重扫」。
+        assertEquals(false, BrowserImageOrder.shouldReanchor(1000, 1000, 0))
+        assertEquals(true, BrowserImageOrder.shouldReanchor(1000, 1001, 0))
+    }
 }

@@ -55,6 +55,9 @@ import com.manga.translator.app.ui.MtListIcon
 import com.manga.translator.app.ui.theme.MangaTranslatorTheme
 import com.manga.translator.app.ui.theme.MtColors
 import com.manga.translator.store.GlossaryEntry
+import com.manga.translator.store.GlossaryImportFormat
+import com.manga.translator.store.GlossaryTextDecoding
+import com.manga.translator.store.GlossaryTextImport
 import com.manga.translator.store.SentenceCacheKey
 import com.manga.translator.store.TranslationHistoryEntry
 import kotlinx.coroutines.Dispatchers
@@ -137,6 +140,36 @@ internal fun MainBottomBar(
     }
 }
 
+/** 术语表导入 SAF 只展示这些类型，避免文件列表里全是图片/安装包。 */
+private val GLOSSARY_IMPORT_MIME_TYPES = arrayOf(
+    "application/json",
+    "application/x-json",
+    "text/plain",
+    "text/csv",
+    "text/comma-separated-values",
+    "text/markdown",
+    "text/x-markdown"
+)
+
+/** 去掉术语文件的已知扩展名，作为新术语表的默认名称。 */
+private fun glossaryImportBaseName(displayName: String): String {
+    val suffixes = listOf(".json", ".csv", ".md", ".markdown", ".txt")
+    val lower = displayName.lowercase()
+    val suffix = suffixes.firstOrNull { lower.endsWith(it) } ?: return displayName
+    return displayName.dropLast(suffix.length)
+}
+
+/** 文件选择器在部分机型上不遵守 MIME 过滤，这里再按扩展名兜一道。 */
+private fun isAllowedGlossaryFileName(displayName: String): Boolean {
+    val extension = displayName.substringAfterLast('.', "").lowercase()
+    return extension.isEmpty() ||
+        extension == "json" ||
+        extension == "csv" ||
+        extension == "md" ||
+        extension == "markdown" ||
+        extension == "txt"
+}
+
 class MainActivity : ComponentActivity() {
     private val settingsRepository by lazy { ServiceLocator.settingsRepository }
     private val captureSessionStateStore by lazy { ServiceLocator.captureSessionStateStore }
@@ -175,22 +208,31 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri == null) return@registerForActivityResult
+        val displayName = queryDisplayName(uri) ?: "导入术语"
+        if (!isAllowedGlossaryFileName(displayName)) {
+            Log.w(TAG, "glossary_import_file rejected reason=extension name=$displayName")
+            toast("只支持 .json / .csv / .md / .txt 文件")
+            return@registerForActivityResult
+        }
         val raw = runCatching {
-            contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+            contentResolver.openInputStream(uri)?.use {
+                GlossaryTextDecoding.decode(it.readBytes())
+            }
         }.getOrNull()
         if (raw.isNullOrBlank()) {
             toast("读取文件失败")
             return@registerForActivityResult
         }
-        val displayName = queryDisplayName(uri) ?: "导入术语"
-        val lower = displayName.lowercase()
-        val isCsv = lower.endsWith(".csv")
-        val baseName = when {
-            isCsv -> displayName.removeSuffix(".csv").removeSuffix(".CSV")
-            lower.endsWith(".json") -> displayName.removeSuffix(".json").removeSuffix(".JSON")
-            else -> displayName
-        }.ifBlank { "导入术语" }
-        importPending = ImportPending(raw = raw, defaultName = baseName, isCsv = isCsv)
+        val preview = GlossaryTextImport.previewCount(raw)
+        if (preview <= 0) {
+            Log.w(TAG, "glossary_import_file rejected reason=no_terms bytes=${raw.length}")
+            toast("文件里没有识别到术语，支持 JSON / CSV / Markdown 表格")
+            return@registerForActivityResult
+        }
+        val baseName = glossaryImportBaseName(displayName).ifBlank { "导入术语" }
+        val format = GlossaryTextImport.detect(raw)
+        Log.i(TAG, "glossary_import_file name=$displayName format=$format terms=$preview")
+        importPending = ImportPending(raw = raw, defaultName = baseName)
     }
 
     private val exportJsonLauncher = registerForActivityResult(
@@ -238,8 +280,7 @@ class MainActivity : ComponentActivity() {
 
     private data class ImportPending(
         val raw: String,
-        val defaultName: String,
-        val isCsv: Boolean
+        val defaultName: String
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -261,6 +302,8 @@ class MainActivity : ComponentActivity() {
                 var glossaryEntries by remember { mutableStateOf(emptyList<GlossaryEntry>()) }
                 var glossaryDetailCollection by remember { mutableStateOf<String?>(null) }
                 var historyEntries by remember { mutableStateOf(emptyList<TranslationHistoryEntry>()) }
+                // 首次读盘完成前为 true，历史页据此显示「加载中」而不是空态（2026-10-22 用户反馈）。
+                var historyLoading by remember { mutableStateOf(true) }
                 val scope = rememberCoroutineScope()
 
                 fun refreshGlossaryList() {
@@ -288,9 +331,11 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(pageIndex) {
                     if (pageIndex == MainTab.HISTORY.ordinal) {
+                        historyLoading = true
                         historyEntries = withContext(Dispatchers.IO) {
                             ServiceLocator.translationHistoryRepository.all()
                         }
+                        historyLoading = false
                     }
                 }
 
@@ -379,8 +424,22 @@ class MainActivity : ComponentActivity() {
                                                 toast("创建失败：名称已存在或已达上限")
                                             }
                                         },
-                                        onImport = {
-                                            importDocumentLauncher.launch(arrayOf("*/*"))
+                                        onImportFile = {
+                                            importDocumentLauncher.launch(GLOSSARY_IMPORT_MIME_TYPES)
+                                        },
+                                        onImportText = { raw ->
+                                            val preview = GlossaryTextImport.previewCount(raw)
+                                            if (preview <= 0) {
+                                                Log.w(TAG, "glossary_import_text rejected reason=no_terms chars=${raw.length}")
+                                                toast("没有识别到术语，请检查粘贴内容的格式")
+                                            } else {
+                                                val format = GlossaryTextImport.detect(raw)
+                                                Log.i(TAG, "glossary_import_text format=$format terms=$preview")
+                                                importPending = ImportPending(
+                                                    raw = raw,
+                                                    defaultName = "粘贴的术语"
+                                                )
+                                            }
                                         },
                                         onDeleteCollection = { name ->
                                             if (ServiceLocator.glossaryRepository.deleteCollection(name)) {
@@ -484,25 +543,40 @@ class MainActivity : ComponentActivity() {
                                             glossaryInfos.map { it.name }, pending.defaultName
                                         )
                                     }
+                                    val preview = remember(pending) {
+                                        val format = GlossaryTextImport.detect(pending.raw)
+                                        val count = GlossaryTextImport.previewCount(pending.raw)
+                                        "已识别：${format.label()} · $count 条术语"
+                                    }
                                     ImportCollectionDialog(
                                         defaultName = defaultName,
+                                        preview = preview,
                                         onConfirm = { name ->
                                             val created = ServiceLocator.glossaryRepository.createCollection(name)
                                             if (!created) {
                                                 toast("创建失败：名称已存在")
                                                 return@ImportCollectionDialog
                                             }
-                                            val import = if (pending.isCsv) {
-                                                ServiceLocator.glossaryRepository.importCsv(name, pending.raw)
-                                            } else {
-                                                ServiceLocator.glossaryRepository.importJson(name, pending.raw)
+                                            val import = ServiceLocator.glossaryRepository.importAuto(name, pending.raw)
+                                            if (import.total == 0) {
+                                                // 预检已经拦过大部分情况；这里兜底，避免留下一张空表。
+                                                ServiceLocator.glossaryRepository.deleteCollection(name)
+                                                Log.w(TAG, "glossary_import aborted reason=no_terms name=$name")
+                                                toast("没有识别到术语，请检查格式")
+                                                return@ImportCollectionDialog
                                             }
                                             importPending = null
                                             refreshGlossaryList()
                                             glossaryCollectionForIo = name
                                             glossaryDetailCollection = name
+                                            Log.i(
+                                                TAG,
+                                                "glossary_import done name=$name format=${import.format} " +
+                                                    "terms=${import.total} added=${import.added} skipped=${import.skipped}"
+                                            )
                                             toast(
-                                                "导入完成：新增 ${import.added} 条，跳过 ${import.skipped} 条" +
+                                                "导入完成（${import.format.label()}）：新增 ${import.added} 条，" +
+                                                    "跳过 ${import.skipped} 条" +
                                                     if (import.truncated) "（已达上限，部分未导入）" else ""
                                             )
                                         },
@@ -514,6 +588,7 @@ class MainActivity : ComponentActivity() {
                             MainTab.HISTORY.ordinal -> {
                                 HistoryScreen(
                                     entries = historyEntries,
+                                    isLoading = historyLoading,
                                     onRefresh = { refreshHistory() },
                                     onDelete = { id ->
                                         scope.launch {

@@ -701,6 +701,17 @@ object BrowserScanScript {
     cfg: CFG.id || "generic",
     // 顶层视口高度（CSS px）：会话侧「阅读位置优先」的锚点基准（视口高度 35%）。
     vh: (window.innerHeight || 0),
+    // 扫描时的滚动位置（CSS px）：会话侧处理每张图后与它比对，用户翻页就提前结束
+    // 旧快照、立刻重扫（新挂出的懒加载图不必等整批处理完才进队列，2026-10-23）。
+    // 文档滚动 + 可滚动宿主（data-mt-host）的 scrollTop 求和：后者在
+    // overflow:auto 阅读器里滚动时 window.scrollY 恒为 0，只读文档会漏掉翻页。
+    sy: (function () {
+      var y = window.scrollY || window.pageYOffset ||
+        document.documentElement.scrollTop || document.body.scrollTop || 0;
+      var hosts = document.querySelectorAll("[data-mt-host]");
+      for (var i = 0; i < hosts.length; i++) y += hosts[i].scrollTop || 0;
+      return Math.round(y);
+    })(),
     // 候选被安全阀截断（极端页面）时置位：会话侧打 `scan_capped` 警告，别静默。
     truncated: truncatedTotal,
     candidates: candidateTotal,

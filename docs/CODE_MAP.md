@@ -4,7 +4,7 @@
 > 与 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) 的分工：那份讲**模块职责与主链路入口**（宏观），
 > 这份讲**逐个文件一句话职责 + 对应日志**（微观）。改架构时更新那份，加/改文件时更新这份。
 >
-> 最近更新：2026-10-15（窗口内改动：**删除盖板「容器轮廓裁剪」机制**（用户裁定；盖板=合并文字区域+少量外扩，§50）；扫描安全阀 80→600 + 长章节 `renderedSrcs`（§48）；「阅读位置优先」`BrowserImageOrder`）
+> 最近更新：2026-10-27（窗口内改动：接缝阶段 1-3 —— 多碎片成组 / `hasTextPixels` 三态 / `SeamPairState` + 双页贴边几何回退；此前：**删除盖板「容器轮廓裁剪」机制**（用户裁定；盖板=合并文字区域+少量外扩，§50）；扫描安全阀 80→600 + 长章节 `renderedSrcs`（§48）；「阅读位置优先」`BrowserImageOrder`）
 
 ---
 
@@ -122,14 +122,17 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
 | `MainActivity.kt` | Compose 外壳（底栏 tab：首页/浏览器/术语表/翻译历史）、权限引导、服务启停 | `MainTab` | 浏览器 tab → `EmbeddedBrowserScreen`（不再传截图入口，见下行） |
-| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=… capped=…`、`scan_capped`（扫描安全阀命中警告）、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42）；场景缓存上限 600 + `renderedSrcs`（已产出结果不随缓存淘汰，防长章节无限重翻，§48） |
-| `SeamRaceBand.kt` | 晚邻接竞态「接缝带补建」的纯逻辑：文本+几何匹配跨缝明的两半、给出带几何与待摘 id、盖板避让同图其它气泡 | `findMatch` | 纯逻辑 + 单测 `SeamRaceBandTest`；日志 `seam_race_band`（会话侧） |
-| `BrowserImageOrder.kt` | 「阅读位置优先」调度：把扫描列表**旋转**到视口锚点（视口高 35%）那张图起、已读部分轮转到末尾（只旋转、不重排） | `rotateToReadingAnchor` | 纯逻辑 + 单测 `BrowserImageOrderTest`；会话日志 `scan … anchor= first_vy=`（2026-10-15） |
+| `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=… capped=…`、`scan_capped`（扫描安全阀命中警告）、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42）、`batch_reanchor`（批处理中检测到翻页 → 立即重扫重排，§60）；场景缓存上限 600 + `renderedSrcs`（已产出结果不随缓存淘汰，防长章节无限重翻，§48） |
+| `SeamRaceBand.kt` | 晚邻接竞态「接缝带补建」的纯逻辑：文本+几何匹配跨缝明的两半、给出带几何与待摘 id、盖板避让同图其它气泡 | `findMatch` / `findGeometricMatch` | 纯逻辑 + 单测 `SeamRaceBandTest` / `SeamEdgeFallbackTest`；日志 `seam_race_band`（会话侧）、`seam_pair_state` |
+| `SeamPairState.kt` | 接缝配对状态机：两页内容指纹 + 邻接 token、revision 变化标 stale；几何回退只消费 completed 状态 | `buildKey` / `complete` / `markStale` / `isUsable` | 纯逻辑 + 单测 `SeamPairStateTest`；日志 `seam_pair_state status=…` |
+| `BrowserImageOrder.kt` | 「阅读位置优先」调度：把扫描列表**旋转**到视口锚点（视口高 35%）那张图起、已读部分轮转到末尾（只旋转、不重排）；批处理中判定是否因翻页提前重扫 | `rotateToReadingAnchor` / `shouldReanchor` | 纯逻辑 + 单测 `BrowserImageOrderTest`；会话日志 `scan … anchor= first_vy=`（2026-10-15）、`batch_reanchor`（§60） |
 | `BrowserScanScript.kt` | 注入网页的扫描脚本：找图、坐标契约、宿主标记、像素提取 | `SCAN_JS` / `EXTRACTOR_JS` | `site_adapter`、`scan`；**候选上限 600 是安全阀不是调度**（旧版 80 会在 174 切的长章节上把第 81 切之后静默截掉，2026-10-15），命中时 payload 带 `truncated` → 会话打 `scan_capped` |
 | `BrowserSceneBuilder.kt` | 场景 JSON 生产者（普通场景 + 接缝带场景）= Kotlin↔JS 契约 | `buildSceneJson` / `buildSeamSceneJson` | 渲染层字段以它为准 |
 | `WebtoonImageTranslator.kt` | **浏览器链路核心管线**：拼接→OCR→归属→翻译→擦字→场景/贴片 | `translateImage` / `translateStitched` | `slice_classify`、`seam_verdict`、`cross_prep`、`incoming_absorbed`、`render_done` |
 | `SeamNeighbourPolicy.kt` | 跨切片**配对闸**：上一张/下一张是否几何紧邻 | `predecessor` / `successor` / `decide` | `band_pair`、`incoming_dropped`；纯逻辑 |
 | `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
+| `SeamFragmentGroups.kt` | 接缝**多碎片成组**：同容器 ≥2 / 匿名正文 ≥3 先合成一个候选，再走 1:1 配对 | `buildGroups` / `groupFitsSeamWindow` / `containerContribution` | 纯几何 + 单测 `SeamFragmentGroupsTest`；日志 `grouped_region/grouped_body/grouped_fragments/container_cross`（`slice_classify`） |
+| `SeamTextPixels.kt` | 接缝接收页 `hasTextPixels` 三态：内容框与接收页求交；只有显式 false 才跳过文字/擦字/盖板 | `resolveOnPage` / `contributesText` | 纯几何 + 单测 `SeamTextPixelsTest`；日志 `incoming_no_text`、`cross_out_probe text=` |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
 | `BubblePlausibility.kt` | 盖板/文字高度的合理性：盖板高上限（单行 35%/多行 60% × 图高）+ 「按行数估文字高度」用的行高口径（优先气泡自身，中位做上限） | `clampCoverHeight` / `effectiveLineHeightPx` | 纯逻辑 + 单测 `BubblePlausibilityTest`；2026-10-15（§52/§53） |
@@ -185,7 +188,9 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `OcrSpeedMode.kt` | Paddle 速度/质量模式 | `fromId` | 体现在 `paddle_total_ms` 的 `speed_mode=` |
 | `OcrMode.kt` | OCR 模式枚举（远程 OCR / 本地+LLM 分组） | `fromId` | ⚠️ 随远程 OCR 下线而闲置（见 §7） |
 | `BaiduOcrLanguage.kt` | 百度 OCR 语言码枚举 | `JAP` / `KOR` / … | ⚠️ 同上下线（见 §7） |
-| `GlossaryRepository.kt` | 多术语表增删改、生效优先级、导入导出、冲突检测 | `activeGlossaryEntries` / `activeRevision` / `importCsv` | 5 个单测（ActiveMerge/Csv/Merge/Management/UniqueName） |
+| `GlossaryRepository.kt` | 多术语表增删改、生效优先级、导入导出、冲突检测 | `activeGlossaryEntries` / `activeRevision` / `importAuto` | 单测（ActiveMerge/Csv/Merge/Management/UniqueName + TextImport/TextDecoding） |
+| `GlossaryTextImport.kt` | 导入文本的格式识别与解析（JSON / Markdown / CSV） | `detect` / `previewCount` / `parseJson` / `parseMarkdown` | 2026-10-27 导入弹窗与文件导入共用；JSON 支持 glossary/entries/裸数组/键值对，Markdown 支持分隔行/表头/围栏/转义；CSV 识别要求表头或 ≥2 行同列 |
+| `GlossaryTextDecoding.kt` | 术语文件字节解码（UTF-8/BOM → GBK 回退） | `decode` | 中文 Excel 导出的 CSV 常为 GBK；单测 `GlossaryTextDecodingTest` |
 | `TranslationHistoryRepository.kt` | 翻译历史落盘、按页/指纹查询与淘汰 | `all` / `findByPageHash` / `add` | 单测 `HistoryCodecTest` |
 | `SentenceTranslationRepository.kt` | 句子级翻译缓存（精确/紧凑/模糊三级匹配） | `lookup` / `put` | 日志 TAG `SentenceCache`、`lookup miss`、`put skip_noop` |
 | `PageOverlayAdjustmentRepository.kt` | 逐页逐气泡的覆盖层微调持久化 | `get` / `save` | 悬浮球链路调参数 |
@@ -252,7 +257,9 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | 文件 | 一句话职责 | 关键入口 | 备注 |
 |---|---|---|---|
 | `HomeScreen.kt` | 首页：语言对、OCR/翻译服务配置、启停入口 | `LauncherScreen` / `ProfileSheet` / `ProfileFormScreen` | 设置改动经 `onSettingsChange` 落盘；`ProfileSheet/ProfileFormScreen/BaiduConfigSheet` 管多套 provider 配置（含百度凭据） |
-| `GlossaryScreen.kt` | 术语表集合列表与集合内词条增删改查 | `GlossaryCollectionsScreen` / `GlossaryCollectionScreen` | 写操作回 `MainActivity` → `GlossaryRepository`；复制/合并/重命名/冲突对话框都在这里 |
+| `GlossaryScreen.kt` | 术语表集合列表与集合内词条增删改查 | `GlossaryCollectionsScreen` / `GlossaryCollectionScreen` | 写操作回 `MainActivity` → `GlossaryRepository`；复制/合并/重命名/冲突对话框都在这里；新增术语 2026-10-27 改为居中弹窗（原文/译文 + 保存/取消），提交前走 `GlossaryAddPolicy` |
+| `GlossaryAddPolicy.kt` | 新增术语表单的提交判定（空原文/空译文/重复原文） | `GlossaryAddPolicy.block` / `message` | 纯函数 + `GlossaryAddPolicyTest`；口径与 `GlossaryRepository.add` 一致（trim 后比较、区分大小写） |
+| `GlossaryImportDialog.kt` | 导入入口弹窗：选文件 + 粘贴文本 + 实时识别 + 格式示例 | `GlossaryImportDialog` | 示例覆盖 Markdown / JSON / CSV；粘贴时即时显示「已识别：格式 · N 条术语」 |
 | `HistoryScreen.kt` | 翻译历史列表：展开看气泡、下拉刷新、清空 | `HistoryScreen` / `parseHistoryBubbles` | 清空历史 = 失去该页复用能力（会重新调 API） |
 | `ui/MtUi.kt` | 全应用共用按钮/卡片/列表行/自绘图标 | `MtCard` / `MtPrimaryButton` / `MtListRow` | 规格取设计稿「14-配色与组件规范」；⚠️ `MtOutlineButton`/`MtTextButton` **无调用方 = 死代码** |
 | `ui/theme/Color.kt` | 全应用色板常量 | `MtColors` | 改配色只改这里 |
@@ -323,6 +330,10 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/.../BubbleFirstRegionPlannerTest.kt` | 分组/归属：无区域时两气泡不合并、区域内两段拆开、上边界合并屏障、缝感知 |
 | `app/.../SeamNeighbourPolicyTest.kt` | 配对闸：相邻/间隙/重叠/错位/宽度不符/远处 banner |
 | `app/.../SeamBubbleMergerTest.kt` | 归属规则：cross/handed_tail/orphan_adopted/dropped_*，含真机数字回归 |
+| `app/.../SeamFragmentGroupsTest.kt` | 多碎片成组（region ≥2 / body ≥3）、同容器句末例外、高字单行 SFX、容器跨缝 cover-only |
+| `app/.../SeamTextPixelsTest.kt` | `hasTextPixels` 三态：跨页有文字、整块在页外、缺内容框=null、null 不塌成 false |
+| `app/.../SeamPairStateTest.kt` | 接缝状态机：completed 才可用、换图 revision 变 stale、failed/skipped 不参与回退 |
+| `app/.../SeamEdgeFallbackTest.kt` | 双页贴边几何回退：≥3 块、短句、错位/角色不符不合并、译文合并 |
 | `app/.../SeamIncomingGeometryTest.kt` | 收到侧并框与最小高度（含真机 `box=42x0` 退化框） |
 | `app/.../HandoffTextMatchTest.kt` | 移交文本证据（真机两形态 0.83 / 0.54） |
 | `app/.../SeamBandGeometryTest.kt` | 接缝带几何与盖板外扩 |
@@ -330,9 +341,9 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/.../BrowserScreenshotTranslateTest.kt` | 截图翻译的几何采集/锚点/贴图 JS 契约（免授权链路）+ 收起覆盖层的定向摘除与"解除一次性点屏监听"契约（§56） |
 | `app/.../EraseTargetsTest.kt` | 「读不出就别动」判据 |
 | `app/.../BubbleFontRulesTest.kt` | 译文字号规则 |
-| `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` / `BrowserLayerPolicyTest.kt` | 会话/无障碍/球与开关状态表/显示来源切换判据 |
+| `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` / `BrowserLayerPolicyTest.kt` / `GlossaryAddPolicyTest.kt` | 会话/无障碍/球与开关状态表/显示来源切换/新增术语提交判定 |
 | `app/src/test/js/mt-overlay-acceptance.test.js` | 渲染层验收（node + `dom-stub.js`，含接缝/恢复/加载卡 + 字号自适应缩放/MTGEOM 重叠诊断） |
-| `core-store/...`（术语表/历史/浏览器数据） | 持久化与归一化 |
+| `core-store/...`（术语表/历史/浏览器数据） | 持久化与归一化（术语导入格式识别/解码见 `GlossaryTextImport` / `GlossaryTextDecoding`） |
 | `core-overlay/...`（背景描边/取色/写出区域/清理图墨迹） | 擦字与配色判据 |
 | `app/src/androidTest/**`（探针） | 真机：ML Kit 置信度/语言混排、Paddle 复杂背景/斜排竖排/性能 |
 

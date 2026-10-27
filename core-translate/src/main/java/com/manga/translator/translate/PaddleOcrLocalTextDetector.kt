@@ -20,6 +20,7 @@ import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.nio.FloatBuffer
+import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
@@ -318,26 +319,46 @@ class PaddleOcrLocalTextDetector(
                 tag = "primary"
             )
         }
-        val merged = mutableListOf<Array<PointF>>()
-        var added = 0
-        for ((index, range) in ranges.withIndex()) {
+        // 分块检测并行化（2026-10-22 用户反馈「分块后翻译明显变慢」）：块与块相互独立，
+        // 串行跑 3 块 = 检测耗时 ×3，是长条页变慢的主因。复用 rec 池并发跑各块
+        // （OrtSession.run 官方线程安全，与 2026-09-15 框级识别并行同一依据）；
+        // 结果**按块序**收齐后再做映射 + IoU 去重 —— 与串行版输出逐位一致。
+        val tileStartedAt = System.currentTimeMillis()
+        val tileFutures = ranges.mapIndexed { index, range ->
             val tile = if (horizontal) {
                 Bitmap.createBitmap(bitmap, range.start, 0, range.length, bitmap.height)
             } else {
                 Bitmap.createBitmap(bitmap, 0, range.start, bitmap.width, range.length)
             }
-            val quads = try {
-                runDetPass(
-                    bitmap = tile,
-                    resizeLong = config.detResizeLong,
-                    thresh = DET_THRESH,
-                    boxThresh = DET_BOX_THRESH,
-                    unclipRatio = DET_UNCLIP_RATIO,
-                    tag = "primary_tile$index"
-                )
-            } finally {
-                if (tile !== bitmap) tile.recycle()
-            }
+            recPool.submit(
+                Callable<Pair<List<Array<PointF>>, Long>> {
+                    val passStart = System.currentTimeMillis()
+                    try {
+                        runDetPass(
+                            bitmap = tile,
+                            resizeLong = config.detResizeLong,
+                            thresh = DET_THRESH,
+                            boxThresh = DET_BOX_THRESH,
+                            unclipRatio = DET_UNCLIP_RATIO,
+                            tag = "primary_tile$index"
+                        ) to (System.currentTimeMillis() - passStart)
+                    } finally {
+                        if (tile !== bitmap) tile.recycle()
+                    }
+                }
+            )
+        }
+        val tileResults = tileFutures.mapIndexed { index, future ->
+            runCatching { future.get(DET_TILE_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
+                .getOrElse { err ->
+                    Log.w(TAG, "paddle_det_tile_fail tile=$index reason=${err.message?.take(80)}")
+                    emptyList<Array<PointF>>() to 0L
+                }
+        }
+        val merged = mutableListOf<Array<PointF>>()
+        var added = 0
+        for ((index, range) in ranges.withIndex()) {
+            val quads = tileResults[index].first
             for (quad in quads) {
                 val moved = Array(quad.size) { i ->
                     PointF(
@@ -357,7 +378,9 @@ class PaddleOcrLocalTextDetector(
             TAG,
             "det_tiled tiles=${ranges.size} axis=${if (horizontal) "x" else "y"} " +
                 "ranges=${ranges.joinToString(",") { "${it.start}-${it.endExclusive}" }} " +
-                "quads=$added img=${bitmap.width}x${bitmap.height}"
+                "quads=$added img=${bitmap.width}x${bitmap.height} " +
+                "totalMs=${System.currentTimeMillis() - tileStartedAt} " +
+                "tileMs=${tileResults.joinToString("/") { it.second.toString() }}"
         )
         return merged
     }
@@ -1417,6 +1440,14 @@ class PaddleOcrLocalTextDetector(
 
         /** 单个文字框识别任务的超时上限，超时只丢该框结果、不阻塞整页。 */
         const val REC_TASK_TIMEOUT_MS = 20_000L
+
+        /**
+         * 单个分块检测任务的超时上限（2026-10-22 块级并行化）。
+         *
+         * 并行时多块共享 CPU，单块耗时比串行长；给足余量，超时只丢该块结果、不阻塞整页
+         * （与 [REC_TASK_TIMEOUT_MS] 同一口径）。
+         */
+        const val DET_TILE_TIMEOUT_MS = 60_000L
 
         /** `paddle_lines_all`（合并前行级清单）最多打印几条：够看清边界行，又不把 logcat 撑爆。 */
         private const val MAX_LINE_PROBE = 14

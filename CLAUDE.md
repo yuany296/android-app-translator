@@ -94,3 +94,13 @@ Declared in `app/src/main/AndroidManifest.xml`:
 - OpenCV 4.10.0 (text erasure via inpaint)
 - `androidx.security:security-crypto-ktx` (AES-256-GCM encrypted prefs)
 - Min SDK 29 (Android 10), Target SDK 34, Java 17
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root and ADRs in `docs/adr/`. See `docs/agents/domain.md`.

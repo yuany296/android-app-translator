@@ -64,7 +64,27 @@ data class Bubble(
      * 拿不到时为 null —— 字号/遮罩退回「块框 ÷ 行数 + 墨迹收紧」老路径
      * （跨缝合并泡等合成 Bubble 即如此，行为不变）。
      */
-    val lineBoxes: List<FloatArray>? = null
+    val lineBoxes: List<FloatArray>? = null,
+    /**
+     * OCR 容器（气泡区域）id；拿不到容器时为 null。
+     *
+     * 接缝「多碎片成组」用它判断多个检测框是否来自**同一个气泡容器**
+     * （参考项目 `region_id`）。刻意用 String：容器 id 只在单次 OCR 结果内有意义，
+     * 跨图/持久化不参与相等判断以外的事情。
+     */
+    val regionId: String? = null,
+    /**
+     * 容器类型：`speech_bubble` / `plain_text`（参考项目同名口径）。
+     *
+     * `caption_panel` 不参与接缝容器轮廓贡献（它会沿页面背景扩到另一侧）。
+     */
+    val regionType: String? = null,
+    /**
+     * OCR 置信度（0..1）。没有逐块置信度的引擎（ML Kit 固定 0）由构泡方回填 1。
+     *
+     * 匿名正文行成组要求 ≥0.8（参考项目 `isAnonymousSeamBodyCandidate`）。
+     */
+    val confidence: Float = 1f
 )
 
 data class TranslationResult(val bubbles: List<Bubble>)
@@ -82,7 +102,14 @@ data class BubbleRegion(
     val bottom: Float,
     val regionType: BubbleRegionType,
     val confidence: Float = 0f,
-    val source: String = ""
+    val source: String = "",
+    /**
+     * 拆分后的子区域指向**原容器** id（未拆分的区域为 null）。
+     *
+     * 接缝多碎片成组按容器归组：一个气泡被拆成多段时，各段仍是同一个
+     * `region_id`（参考项目语义），否则同一容器的碎片永远无法成组。
+     */
+    val parentId: Int? = null
 )
 
 data class RegionOcrResult(

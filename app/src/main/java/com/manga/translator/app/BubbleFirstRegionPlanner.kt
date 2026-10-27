@@ -199,7 +199,18 @@ class BubbleFirstRegionPlanner {
             rotationDeg = quad.second,
             // 逐行框（2026-10-14）：供译文字号基线（行高中位数）与字形区（行框并集），
             // 见 [TextBlock.lineBoxes]。
-            lineBoxes = lineBoxesPercent
+            lineBoxes = lineBoxesPercent,
+            // 容器身份（接缝多碎片成组 / 同容器句子连续性）：拆分出的子区域指回**原容器**，
+            // 否则同一个气泡被切成多段时各段 region_id 不同，成组与句末例外都用不上。
+            regionId = if (region.regionType == BubbleRegionType.BUBBLE) {
+                (region.parentId ?: region.id).toString()
+            } else {
+                null
+            },
+            regionType = if (region.regionType == BubbleRegionType.BUBBLE) "speech_bubble" else "plain_text",
+            // ML Kit 的逐块 confidence 恒为 0（未知）→ 回填 1，避免匿名正文组在 ML Kit 上失效；
+            // Paddle 有真实分数时取整组最小值。
+            confidence = blocks.mapNotNull { block -> block.confidence.takeIf { it > 0f } }.minOrNull() ?: 1f
         )
     }
 
@@ -450,7 +461,9 @@ class BubbleFirstRegionPlanner {
             bottom = (rawBottom + padY).coerceIn(parentRegion.top, parentRegion.bottom),
             regionType = BubbleRegionType.BUBBLE,
             confidence = parentRegion.confidence,
-            source = "${parentRegion.source}_split"
+            source = "${parentRegion.source}_split",
+            // 拆分只是分组内部再分段，容器身份仍是原气泡 —— 接缝成组按它归并。
+            parentId = parentRegion.parentId ?: parentRegion.id
         )
     }
 

@@ -33,3 +33,13 @@
 - 遇到异常、超时、错位或行为不符合预期时，先补充最小必要日志，再进行修复。
 - 日志应覆盖关键时序与关键参数（如输入、输出、坐标换算、状态切换、错误类型），并使用稳定 Tag 便于过滤。
 - 完成修复前必须基于日志做一次检错闭环：复现 -> 采集日志 -> 定位 -> 修复 -> 复测 -> 清理临时日志（保留必要诊断日志）。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root and ADRs in `docs/adr/`. See `docs/agents/domain.md`.

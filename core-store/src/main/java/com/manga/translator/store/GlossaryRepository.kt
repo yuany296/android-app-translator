@@ -13,7 +13,8 @@ data class GlossaryImportResult(
     val added: Int,
     val skipped: Int,
     val total: Int,
-    val truncated: Boolean
+    val truncated: Boolean,
+    val format: GlossaryImportFormat = GlossaryImportFormat.UNKNOWN
 )
 
 /** 术语表概览信息（用于管理列表一次性渲染，避免每行单独查库）。 */
@@ -466,26 +467,43 @@ class GlossaryRepository(context: Context) {
         }
     }
 
-    fun importJson(collection: String, raw: String): GlossaryImportResult {
-        val payload = runCatching { JSONObject(raw) }.getOrElse {
-            runCatching { JSONArray(raw) }.getOrNull() ?: return GlossaryImportResult(0, 0, 0, truncated = false)
+    /**
+     * 自动识别格式并导入（JSON / Markdown / CSV）。
+     *
+     * 文件导入与「粘贴文本」共用这一条入口：调用方先 [GlossaryTextImport.previewCount]
+     * 预检，再把原文交进来，避免为解析失败的内容创建空术语表。
+     */
+    fun importAuto(collection: String, raw: String): GlossaryImportResult {
+        return when (GlossaryTextImport.detect(raw)) {
+            GlossaryImportFormat.JSON -> importJson(collection, raw)
+            GlossaryImportFormat.MARKDOWN -> importMarkdown(collection, raw)
+            GlossaryImportFormat.CSV -> importCsv(collection, raw)
+            GlossaryImportFormat.UNKNOWN -> emptyImportResult(GlossaryImportFormat.UNKNOWN)
         }
-        val arr = when (payload) {
-            is JSONObject -> payload.optJSONArray("glossary") ?: payload.optJSONArray("entries")
-            is JSONArray -> payload
-            else -> null
-        } ?: return GlossaryImportResult(0, 0, 0, truncated = false)
+    }
 
-        val incoming = mutableListOf<Pair<String, String>>()
-        for (index in 0 until arr.length()) {
-            val item = arr.optJSONObject(index) ?: continue
-            val source = item.optString("source", "").trim()
-            val target = item.optString("target", "").trim()
-            if (source.isNotEmpty() && target.isNotEmpty()) {
-                incoming += source to target
-            }
-        }
-        if (incoming.isEmpty()) return GlossaryImportResult(0, 0, 0, truncated = false)
+    fun importJson(collection: String, raw: String): GlossaryImportResult {
+        val incoming = GlossaryTextImport.parseJson(raw)
+            ?: return emptyImportResult(GlossaryImportFormat.JSON)
+        return importPairs(collection, incoming, GlossaryImportFormat.JSON)
+    }
+
+    fun importMarkdown(collection: String, raw: String): GlossaryImportResult {
+        val incoming = GlossaryTextImport.parseMarkdown(raw)
+        return importPairs(collection, incoming, GlossaryImportFormat.MARKDOWN)
+    }
+
+    fun importCsv(collection: String, raw: String): GlossaryImportResult {
+        val incoming = GlossaryCsv.parse(raw)
+        return importPairs(collection, incoming, GlossaryImportFormat.CSV)
+    }
+
+    private fun importPairs(
+        collection: String,
+        incoming: List<Pair<String, String>>,
+        format: GlossaryImportFormat
+    ): GlossaryImportResult {
+        if (incoming.isEmpty()) return emptyImportResult(format)
 
         synchronized(lock) {
             val root = loadJson()
@@ -516,9 +534,20 @@ class GlossaryRepository(context: Context) {
                 added = merge.added,
                 skipped = merge.skipped,
                 total = incoming.size,
-                truncated = merge.truncated
+                truncated = merge.truncated,
+                format = format
             )
         }
+    }
+
+    private fun emptyImportResult(format: GlossaryImportFormat): GlossaryImportResult {
+        return GlossaryImportResult(
+            added = 0,
+            skipped = 0,
+            total = 0,
+            truncated = false,
+            format = format
+        )
     }
 
     fun exportJson(collection: String = DEFAULT_COLLECTION): String {
@@ -529,44 +558,6 @@ class GlossaryRepository(context: Context) {
         }
         root.put("glossary", arr)
         return root.toString()
-    }
-
-    fun importCsv(collection: String, raw: String): GlossaryImportResult {
-        val incoming = GlossaryCsv.parse(raw)
-        if (incoming.isEmpty()) return GlossaryImportResult(0, 0, 0, truncated = false)
-
-        synchronized(lock) {
-            val root = loadJson()
-            val collections = root.optJSONObject(KEY_COLLECTIONS) ?: JSONObject()
-            val targetPayload = collections.optJSONObject(collection) ?: freshCollection().also {
-                collections.put(collection, it)
-            }
-            val existing = mutableMapOf<String, String>()
-            val entries = targetPayload.optJSONArray(KEY_ENTRIES) ?: JSONArray()
-            for (index in 0 until entries.length()) {
-                val item = entries.optJSONObject(index) ?: continue
-                val src = item.optString("source", "").trim()
-                if (src.isNotEmpty()) existing[src] = item.optString("target", "").trim()
-            }
-            val merge = mergeIncoming(existing = existing, incoming = incoming, maxEntries = MAX_ENTRIES)
-            val next = JSONArray()
-            merge.merged.forEach { (source, target) ->
-                next.put(JSONObject().put("source", source).put("target", target))
-            }
-            targetPayload.put(KEY_ENTRIES, next)
-            if (merge.added > 0) {
-                bumpRevision(targetPayload)
-            }
-            collections.put(collection, targetPayload)
-            root.put(KEY_COLLECTIONS, collections)
-            save(root)
-            return GlossaryImportResult(
-                added = merge.added,
-                skipped = merge.skipped,
-                total = incoming.size,
-                truncated = merge.truncated
-            )
-        }
     }
 
     fun exportCsv(collection: String = DEFAULT_COLLECTION): String {
@@ -630,6 +621,26 @@ class GlossaryRepository(context: Context) {
     }
 
     internal object GlossaryCsv {
+        /**
+         * 是否像一份术语 CSV（用于格式识别，不等同于解析）。
+         *
+         * 2026-10-27 事故：`notes.txt` 里只有一句 "just a plain note, no glossary here"，
+         * 单行带逗号被 CSV 解析成 1 条术语。这里要求「有表头」或「至少两行且列数一致」，
+         * 把自然语言说明挡在导入之外；显式调用 [parse] 的路径不受影响。
+         */
+        fun looksLikeGlossaryCsv(raw: String): Boolean {
+            val rows = parseRows(raw).filter { row -> row.any { it.isNotBlank() } }
+            if (rows.isEmpty()) return false
+            val hasHeader = looksLikeHeader(rows[0])
+            val dataRows = if (hasHeader) rows.drop(1) else rows
+            if (dataRows.isEmpty()) return false
+            if (hasHeader) return true
+            if (dataRows.size < 2) return false
+            val width = dataRows.first().size
+            if (width < 2) return false
+            return dataRows.all { it.size == width }
+        }
+
         fun parse(raw: String): List<Pair<String, String>> {
             val rows = parseRows(raw)
             val dataRows = if (rows.isNotEmpty() && looksLikeHeader(rows[0])) rows.drop(1) else rows

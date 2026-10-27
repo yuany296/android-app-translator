@@ -1,5 +1,154 @@
 # Todolist
 
+## 63. 用户 2026-10-27：术语导入「不知道放什么 + 文件列表全是不相关文件」—— 粘贴/示例/格式识别（2026-10-27）
+
+用户三条诉求：①选文件时排除不符合的文件；②允许直接粘贴 JSON / Markdown；③给出格式示例。
+
+改动：
+- **文件选择**：`OpenDocument` 的 MIME 过滤收窄到 JSON / CSV / Markdown / TXT 文本类型；选后仍按扩展名 + 内容双重校验。
+  部分机型/模拟器的文件管理器不遵守 MIME 过滤（Downloads 根目录仍显示图片/PDF），应用侧至少保证不会把非术语文件导进来。
+- **导入入口** `GlossaryImportDialog`（app）：同一个居中弹窗里提供「选择文件」+ 多行粘贴框 + 实时识别状态
+  （已识别：Markdown · 2 条术语）+ Markdown / JSON / CSV 三份示例 + 「填入 Markdown 示例」。
+- **格式识别** `GlossaryTextImport`（core-store 纯函数）：
+  - JSON：`{"glossary":[...]}` / `{"entries":[...]}` / `{"terms":[...]}` / 裸数组 / 数组套数组 /
+    `{"Eren":"艾伦"}` 键值对 / 单条对象；字段别名 source/src/term/原文 + target/tgt/translation/译文。
+  - Markdown：`| 原文 | 译文 |` + 分隔行；无分隔行时按表头关键字识别；支持代码围栏、`\|` 转义、多余列。
+  - CSV：沿用现有解析，但识别时要求「有表头」或「至少两行且列数一致」——
+    事故：`notes.txt` 里一句 `just a plain note, no glossary here` 曾被当成 1 条 CSV 术语。
+- **文件解码** `GlossaryTextDecoding`：UTF-8（含 BOM）优先，失败回退 GBK（中文 Excel 导出的 CSV）。
+- **导入确认框**：显示「已识别：格式 · N 条术语」，按钮改「创建并导入」；导入结果为 0 条时删掉刚建的空表并提示。
+- 日志（TAG `MainActivityMT`）：`glossary_import_file/text`（format/terms）、`glossary_import done`（added/skipped）、
+  `rejected reason=extension/no_terms`。
+
+验证：
+- `:core-store:testDebugUnitTest` 新增 `GlossaryTextImportTest`（30+ 条）与 `GlossaryTextDecodingTest` 4 条；`:app:testDebugUnitTest` 全绿。
+- emulator-5554 实测：
+  - 粘贴 Markdown 示例 → 2 条 → 新表「粘贴的术语」；
+  - 文件 `glossary-test.json` → JSON 2 条；`glossary-test.csv` → CSV 2 条；
+  - GBK 编码 `glossary-gbk.csv` → 1 条「测试 → 测试值」（中文不乱码）；
+  - `notes.txt`（一句带逗号说明）→ 拒绝 `reason=no_terms`；
+  - 图片等非文本文件在系统选择器里不可选（MIME 过滤），选后也有扩展名兜底。
+真机复测清单见 `HumanTODO.md` 2026-10-27「术语表导入增强」。
+
+## 62. 用户 2026-10-27：「无法添加术语」—— 填完点「添加术语」反而清空草稿（2026-10-27）
+
+用户反馈术语表详情页加不了术语。模拟器（emulator-5554）按原路径复现：
+术语表 → 打开 `jj` → 「添加术语」→ 输入 `Mikasa` → 点最显眼的「添加术语」。
+
+根因：表单展开后底部按钮**仍然叫「添加术语」**，点击逻辑是「重置草稿并保持展开」，
+真正保存只有键盘完成键；用户按这个按钮 = 输入被清空，表现就是“加不进去”。
+
+改动：
+- `GlossaryScreen.kt`：新增术语改为**居中弹窗**（原文 / 译文 + 保存 / 取消），保存动作与「添加术语」入口分开；
+  提交统一走 `submitAdd()`；空原文 / 空译文 / 重复原文就地红字提示，弹窗不再静默关闭。
+- 弹窗展开时自动聚焦「原文」并弹出键盘；系统返回键先收起弹窗（不退出详情）。
+- 成功后清空搜索词，避免新条目被当前过滤条件藏起来（看起来像没加上）。
+- 纯判定抽到 `GlossaryAddPolicy`（`app/.../GlossaryAddPolicy.kt`），口径与仓库 `add()` 一致：
+  trim 后比较、区分大小写。
+
+验证：`./gradlew :app:testDebugUnitTest` 通过（新增 `GlossaryAddPolicyTest` 6 条）；
+`installDebug` 到 emulator-5554 实测：
+1. 填 `Mikasa` / `MikasaCN` 后点弹窗「保存」→ 落库 `revision=2`、列表立即出现；
+2. 空表单点保存 → 红字「请填写原文」、弹窗保持展开；
+3. 重复原文 → 红字提示、仓库未被改写；
+4. 「取消」收起弹窗，不产生条目。
+真机复测清单见 `HumanTODO.md` 2026-10-27。
+
+## 61. 接缝处理参考插件：分阶段实施清单（2026-10-27）
+
+把 Android 接缝处理和 `C:\homework\translator` 的 canonical/seam 实现对比后，确定分 5 阶段移植；
+完整 prompt、公共上下文与验收清单见 `docs/SEAM_IMPROVEMENT_PROMPTS.md`。
+
+- 阶段 1（已整理成可直接粘贴的 prompt）：多碎片成组 / 同容器例外 / 高字例外 / 容器轮廓跨缝；
+  纯几何，不新增 OCR，识别速度不变，整体速度不变或略快。
+- 阶段 2：每页 span 的 `hasTextPixels` 三态 + text/cover 分离，解决空壳盖板/多擦。
+- 阶段 3：`SeamPairState` + 双页边缘证据回退，补强短句/OCR 变体的晚邻接。
+- 阶段 4：接缝清理图从复合带单独生成，解决接缝纹理不一致；会多一次 inpaint，需缓存。
+- 阶段 5：独立接缝 OCR + primary/standby；**会增加识别耗时**，必须按需、默认关闭、先 A/B。
+
+注意：工作区当前已有其他未提交修改；本条目只新增文档与索引，不要顺手提交。
+
+## 60. 用户 2026-10-23：「不知道最新的修改有没有改过来」—— 分块并行已装机 + 翻页立即重排（2026-10-23）
+
+用户追问上一轮「翻译变慢 / 下一页没提前翻」的修复是否生效。先核对运行态，再补掉
+§59 没覆盖到的那一半根因。
+
+### 一、核对「最新修改」是否已经在手机上
+
+- 代码：§59 的块级并行在工作区里（`PaddleOcrLocalTextDetector` / `MlKitLocalTextDetector`），
+  不是只写在文档里。
+- 安装：`app-debug.apk` 构建于 **2026-10-22 23:21**（晚于源码 23:14/23:15），
+  真机 `lastUpdateTime=2026-10-23 00:17` —— **最新包已经装上**。
+- 但真机日志被 HONOR 限制/滚动很快，无法从 logcat 回放上一次会话的耗时；只能由用户复测。
+
+### 二、§59 没覆盖到的根因：旧扫描快照把新图挡在队列外
+
+§59 只降低了**单页检测耗时**，没有改变「一张一张、按扫描快照顺序处理」的调度：
+
+- 外层 `while` 每轮扫一次页面，拿到 `images` 快照后，**整批**处理完才重扫；
+- 懒加载阅读器的新图是用户往下翻时才挂出来的 —— 它们不在旧快照里；
+- 于是用户已经看到第 N+1 页加载完成，程序还在按旧顺序翻前面的图，
+  必须等整批结束才把第 N+1 页排进来。
+
+这正是「并没有提前翻译下面已经加载完成的页，先停留挺久才开始」的另一半原因。
+
+### 三、修复：处理每张图后检测滚动，变了就立即重扫重排
+
+- `BrowserScanScript.SCAN_JS` payload 新增 `sy`（扫描时的 `window.scrollY`）；
+  `ScanResult.scrollY` 解析它（旧脚本没有 `sy` → -1，保持旧行为）。
+- 会话每处理完一张图（loading 摘掉后）读一次当前滚动位置：
+  与 `sy` 相差 **≥160px** 就 `batch_reanchor` 结束本批，`continue` 回外层
+  → 立即重扫 → `BrowserImageOrder.rotateToReadingAnchor` 按新阅读锚点重排。
+- 判据抽成纯逻辑 `BrowserImageOrder.shouldReanchor`：上下翻都算；旧脚本/读取失败
+  一律不重排；阈值至少 1px，防退化成每张图都重扫。
+- 日志：`batch_reanchor reason=scroll from=… to=… delta=… processed=N/M`。
+- 无滚动时**不增加任何额外扫描**，行为与旧版一致。
+
+### 四、验证
+
+- 新增 `BrowserImageOrderTest` 3 条（阈值边界/旧脚本禁用/非法阈值）；
+  `BrowserScanScriptTest` 1 条（payload 必须带 `sy`）。
+- `:core-translate:testDebugUnitTest` + `:app:testDebugUnitTest` 全绿；
+  `:app:assembleDebug` 通过并安装真机（见 HumanTODO 2026-10-23 轮）。
+- 真机效果待用户复测：往下翻页时 `batch_reanchor` 应紧跟在上一张 `scene_ok` 后出现，
+  随后先处理眼前的图；长条页 `det_tiled totalMs` 应小于 `tileMs` 之和。
+
+## 59. 用户 2026-10-22：「不知道改了什么，翻译速度变慢了」—— 分块检测串行 ×3 → 块级并行（2026-10-22）
+
+用户报：翻译变慢；具体是「翻到某一页时并没有提前翻译下一页，先停留挺久后才开始翻译」，
+并指出是**之前针对截页问题的修改**引入的、且「并没有修改好」。
+
+### 一、定位
+
+- 逐条排除本轮改动（历史页加载态 / 上限文案 / 常量可见性）——都不在翻译主链路。
+- 锁定 §54/§55 的「长条图分块检测」（`a3e5839` Paddle / `ba636c5` ML Kit）：
+  长宽比 ≥ 2 的长条几乎每页命中闸门，沿长边切 2~3 块、**串行**逐块跑检测 →
+  检测耗时最多 ×3。管线又是串行逐张处理，循环追不上阅读速度 →
+  表现正是「到下一页时还没提前翻完、干等几秒才开始」。
+- 次要因素（老设计，未动）：当前页是扫到的最后一张时轮询等待下一张图出现
+  （最多 ~4.2s，`NEXT_PAGE_WAIT_ROUNDS=6 × 700ms`）；识别前串行预取下一张图
+  （下载+解码在关键路径上）。日志盲区：等待轮数无打点。
+
+### 二、修复（两全：保留分块精度 + 找回速度）
+
+分块本身不动（单字防漏检仍生效），把「块间串行」改成「块间并行」：
+
+- `PaddleOcrLocalTextDetector.runDetTiled`：裁块后按块提交 `recPool` 并发跑
+  `runDetPass`（`OrtSession.run` 官方线程安全，与 2026-09-15 框级识别并行同一依据）；
+  **按块序**收齐后再做坐标映射 + IoU 去重 —— 输出与串行版逐位一致。
+  超时 `DET_TILE_TIMEOUT_MS=60s`，超时只丢该块（`paddle_det_tile_fail`）。
+- `MlKitLocalTextDetector.detectTiled`：同样并行化（ML Kit `process()` 为 Task 异步接口、
+  同一 client 支持并发提交）；按块序收齐合并。超时 `TILE_AWAIT_TIMEOUT_MS=30s`
+  （`mlkit_det_tile_fail`）；`Tasks.await` 8s→15s（并行共享 CPU 后避免低端机误判超时丢字）。
+- 两条日志补 `totalMs=` / `tileMs=`（`det_tiled` / `mlkit_det_tiled`），真机上可直接量化收益。
+
+### 三、验证
+
+- `:core-translate:testDebugUnitTest` 全绿（含 `PaddleDetectionTilingTest` / `MlKitTiledBlockMergerTest`），
+  `:app:compileDebugKotlin` 通过；合并逻辑未改（顺序保持块序），预期输出与串行一致。
+- 真机收益待测（HumanTODO §59）：长条页应恢复接近单趟检测的速度；
+  若 `tileMs` 显示三块明显互相拖慢，再考虑给 det 会话降 intra-op 线程数。
+
 ## 58. 用户 2026-10-19：三行韩文被读成 3→1→2 / 下面一句分成两块 —— Paddle 多行框逐行重排（2026-10-19）
 
 用户报：①「下面那一句没有完全合并，它是分为了两块；交界处的有一块文字被合并到上面和下面都有了」；

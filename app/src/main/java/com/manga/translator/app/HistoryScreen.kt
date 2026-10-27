@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -59,6 +60,7 @@ import com.manga.translator.app.ui.theme.MtColors
 import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.HistoryBubble
 import com.manga.translator.store.TranslationHistoryEntry
+import com.manga.translator.store.TranslationHistoryRepository
 import com.manga.translator.store.parseHistoryBubbles
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -93,6 +95,21 @@ private fun matchesQuery(entry: TranslationHistoryEntry, query: String): Boolean
     return parseHistoryBubbles(entry.bubblesJson).any {
         it.originalText.contains(q, ignoreCase = true) ||
             it.translatedText.contains(q, ignoreCase = true)
+    }
+}
+
+/**
+ * 标题下的副标题：明示「滚动窗口最多 500 条」，不再写「永久保存」（2026-10-22 用户要求）。
+ *
+ * 满了之后要说明后果 —— 不然最旧记录无声消失，用户会以为丢了数据（上限来自
+ * [TranslationHistoryRepository.MAX_ENTRIES]，改上限只动 core-store 一处）。
+ */
+private fun subtitle(count: Int): String {
+    val max = TranslationHistoryRepository.MAX_ENTRIES
+    return if (count < max) {
+        "共 $count 条 · 最多保留 $max 条"
+    } else {
+        "已满 $max 条 · 新记录会替换最旧的"
     }
 }
 
@@ -135,6 +152,7 @@ private fun highlightQuery(text: String, query: String): AnnotatedString {
 @Composable
 fun HistoryScreen(
     entries: List<TranslationHistoryEntry>,
+    isLoading: Boolean,
     onRefresh: () -> Unit,
     onDelete: (String) -> Unit,
     onClear: () -> Unit,
@@ -173,7 +191,8 @@ fun HistoryScreen(
                     color = MtColors.TextPrimary
                 )
                 Text(
-                    text = "永久保存 · 共 ${entries.size} 条",
+                    // 历史是滚动窗口不是永久保存，上限要明示（2026-10-22 用户要求）。
+                    text = if (isLoading) "加载中…" else subtitle(entries.size),
                     fontSize = 12.sp,
                     color = MtColors.TextTertiary
                 )
@@ -213,7 +232,10 @@ fun HistoryScreen(
                 .fillMaxSize()
                 .nestedScroll(pullState.nestedScrollConnection)
         ) {
-            if (filtered.isEmpty()) {
+            if (isLoading) {
+                // 首次读盘完成前不能显示空态，否则有历史的用户一进页面会先闪一下「还没有翻译记录」。
+                HistoryLoadingState()
+            } else if (filtered.isEmpty()) {
                 if (entries.isEmpty()) {
                     HistoryEmptyState()
                 } else {
@@ -714,6 +736,25 @@ private fun EditTranslationSheet(
     }
 }
 
+/** 加载中：布局与空态同构，只是把空箱插画换成转圈（2026-10-22 用户反馈）。 */
+@Composable
+private fun HistoryLoadingState() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        CircularProgressIndicator()
+        Text(
+            text = "正在加载翻译记录…",
+            fontSize = 12.sp,
+            color = MtColors.TextTertiary
+        )
+    }
+}
+
 /** 空状态：空箱插画 + 居中标题与说明（与术语表共用同一张图）。 */
 @Composable
 private fun HistoryEmptyState() {
@@ -736,7 +777,8 @@ private fun HistoryEmptyState() {
             color = MtColors.TextPrimary
         )
         Text(
-            text = "翻译成功后会永久保存，翻回同一原文不会重复调用 AI。",
+            text = "翻译成功后会自动保存（最多 ${TranslationHistoryRepository.MAX_ENTRIES} 条），" +
+                "翻回同一原文不会重复调用 AI。",
             fontSize = 12.sp,
             color = MtColors.TextTertiary
         )

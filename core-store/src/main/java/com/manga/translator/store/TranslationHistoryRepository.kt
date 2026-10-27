@@ -235,7 +235,12 @@ class TranslationHistoryRepository(context: Context) {
         file.writeText(toStoreJson(entries))
     }
 
-    internal companion object {
+    /**
+     * 历史最多保留的整页记录数（滚动窗口，超出后移除最旧的）。
+     *
+     * 公开给界面用：历史页要在标题下显示这个上限，不能让 UI 硬编码数字（2026-10-22 用户要求）。
+     */
+    companion object {
         const val FILE_NAME = "mt_translation_history.json"
         const val MAX_ENTRIES = 500
 

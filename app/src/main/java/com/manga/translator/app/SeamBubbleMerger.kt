@@ -67,7 +67,14 @@ internal data class SeamBox(
 internal data class SeamDetection(
     val bubble: Bubble,
     val outer: SeamBox,
-    val content: SeamBox
+    val content: SeamBox,
+    /**
+     * 可选的容器轮廓（气泡区域框，拼接图像素）。
+     *
+     * 子区域只会带来「文字附近的一小块区域框」，跨缝容器证据必须指回原容器；
+     * 没有时为 null，[SeamFragmentGroups.containerContribution] 退回归用 [outer]。
+     */
+    val container: SeamBox? = null
 )
 
 /**
@@ -109,13 +116,21 @@ internal data class SeamPlan(
     val handedTail: Int = 0,
     /** 跨下边界但深入条带超过「切开余量」而被裁短的块数（诊断用）。 */
     val cappedCross: Int = 0,
+    /** 由「同容器多碎片成组」合成的 region 组数（成员 verdict = `grouped_region`）。 */
+    val groupedRegion: Int = 0,
+    /** 由「匿名正文多行成组」合成的 body 组数（成员 verdict = `grouped_body`）。 */
+    val groupedBody: Int = 0,
+    /** 被成组吸收的原始碎片总数（含组内所有成员）。 */
+    val groupedFragments: Int = 0,
+    /** 仅靠 solid speech_bubble 容器轮廓跨缝、文字只在当前图一侧的 cover-only 数。 */
+    val containerCross: Int = 0,
     /**
      * 与 [detections] 下标一一对应的判决文本（诊断用，`seam_verdict` 日志直接打它）。
      *
-     * 取值：`cross` / `cross_capped` / `paired_bottom` / `paired_top` / `orphan_adopted` /
-     * `handed_tail` / `dropped_top_handed` / `dropped_tail` / `dropped_fragment` /
-     * `dropped_glyph_outside`（字形整体在可见区之外，本图没有可画的内容）/ `suppressed` /
-     * `unknown`。
+     * 取值：`cross` / `cross_capped` / `cross_container` / `paired_bottom` / `paired_top` /
+     * `orphan_adopted` / `handed_tail` / `dropped_top_handed` / `dropped_tail` /
+     * `dropped_fragment` / `dropped_glyph_outside` / `grouped_region` / `grouped_body` /
+     * `suppressed` / `unknown`。
      */
     val verdicts: List<String> = emptyList()
 )
@@ -333,6 +348,8 @@ internal object SeamTuning {
 
 /**
  * 归属主流程：
+ * 0. 多碎片成组（[SeamFragmentGroups]）：同容器 ≥2 / 匿名正文 ≥3 先合成一个候选，
+ *    已用碎片不再参与 1:1 配对；
  * 1. 整块跨下边界 → 本图（cross，最多伸进下条带 [SeamConfig.cutAllowancePx] 否则裁短）；
  * 2. 整块跨上边界 → 上一张（**只有 `incomingCross` 真的覆盖它时**才丢弃；否则本图认领并裁进可见区）；
  * 3. 半截字配对（先下边界，再上边界）；
@@ -353,7 +370,32 @@ internal fun planSeamOwnership(
     suppressOverlap: Float = SeamTuning.SUPPRESS_INCOMING_OVERLAP
 ): SeamPlan {
     if (detections.isEmpty()) return SeamPlan(owned = emptyList())
-    val used = BooleanArray(detections.size)
+
+    // 「多碎片成组」必须在 1:1 配对之前（2026-10-27，参考 seam-grouping.js）：
+    // 同一容器 / 匿名正文的 ≥N 个碎片先合成一个候选，已用碎片不再参与配对；
+    // 剩余碎片继续走现有 buildHalfPairs（阈值不动）。
+    val fragmentGroups = SeamFragmentGroups.buildGroups(detections, config, canvasWidth, canvasHeight)
+    val groupByFirst = fragmentGroups.associateBy { it.indices.first() }
+    val groupedOriginal = BooleanArray(detections.size)
+    fragmentGroups.forEach { group -> group.indices.forEach { groupedOriginal[it] = true } }
+    val working = ArrayList<SeamDetection>(detections.size)
+    val originalIndices = ArrayList<IntArray>(detections.size)
+    val groupKinds = ArrayList<SeamFragmentGroups.Kind?>(detections.size)
+    detections.forEachIndexed { index, detection ->
+        if (!groupedOriginal[index]) {
+            working += detection
+            originalIndices += intArrayOf(index)
+            groupKinds += null
+        } else {
+            val group = groupByFirst[index] ?: return@forEachIndexed
+            working += group.detection
+            originalIndices += group.indices.toIntArray()
+            groupKinds += group.kind
+        }
+    }
+    val groupedWorking = BooleanArray(working.size) { groupKinds[it] != null }
+
+    val used = BooleanArray(working.size)
     val owned = mutableListOf<SeamOwnership>()
     var pairedTop = 0
     var pairedBottom = 0
@@ -362,7 +404,8 @@ internal fun planSeamOwnership(
     var orphanAdopted = 0
     var handedTail = 0
     var cappedCross = 0
-    val verdicts = MutableList(detections.size) { "unknown" }
+    var containerCross = 0
+    val verdicts = MutableList(working.size) { "unknown" }
 
     val top = config.topLimitPx
     val bottom = config.bottomLimitPx
@@ -381,9 +424,69 @@ internal fun planSeamOwnership(
     val fragmentHeight = config.fragmentHeightPx
     fun isFragment(height: Float): Boolean = fragmentHeight > 0f && height < fragmentHeight
 
+    // 0) 容器轮廓跨缝 cover-only（2026-10-27，参考 getSeamCandidateVisualContributionBox）：
+    // solid + speech_bubble 的容器跨过缝、但文字框完全在当前图一侧时，旧逻辑会让文字框
+    // 走普通 owned / dropped_tail —— 容器被拆成两半或直接丢掉。这里按容器贡献认领**当前
+    // 图可见的那一侧**（cross=false，不移交、不重复），下一张自己会看到另一侧文字。
+    // caption_panel 不参与（它会沿页面背景扩到另一侧，不能证明文字跨缝）。
+    working.forEachIndexed { index, detection ->
+        if (used[index] || groupedWorking[index]) return@forEachIndexed
+        val visual = SeamFragmentGroups.containerContribution(
+            detection = detection,
+            config = config,
+            canvasWidth = canvasWidth,
+            canvasHeight = canvasHeight
+        ) ?: return@forEachIndexed
+        val content = detection.content
+        val textCrosses = (config.hasTopBand && content.top < top && content.bottom > top) ||
+            (config.hasBottomBand && content.top < bottom && content.bottom > bottom)
+        if (textCrosses) return@forEachIndexed
+        val visualCrossesTop = config.hasTopBand && visual.top < top && visual.bottom > top
+        val visualCrossesBottom = config.hasBottomBand && visual.top < bottom && visual.bottom > bottom
+        if (!visualCrossesTop && !visualCrossesBottom) return@forEachIndexed
+
+        // 文字完全在邻居页一侧：交给邻居图自己的 owned 链路（这里不移交，避免坐标系错位）。
+        if (visualCrossesBottom && content.top >= bottom - 0.5f) {
+            used[index] = true
+            dropped += 1
+            verdicts[index] = "dropped_tail"
+            return@forEachIndexed
+        }
+        if (visualCrossesTop && content.bottom <= top + 0.5f) {
+            used[index] = true
+            dropped += 1
+            verdicts[index] = "dropped_glyph_outside"
+            return@forEachIndexed
+        }
+        val currentSide = (visualCrossesBottom && content.bottom <= bottom + 0.5f) ||
+            (visualCrossesTop && content.top >= top - 0.5f)
+        if (!currentSide) return@forEachIndexed
+
+        used[index] = true
+        val clipped = clipDetection(detection, top, bottom, canvasWidth, canvasHeight)
+        if (clipped == null) {
+            dropped += 1
+            verdicts[index] = "dropped_glyph_outside"
+            return@forEachIndexed
+        }
+        if (isFragment(clipped.outer.height)) {
+            dropped += 1
+            verdicts[index] = "dropped_fragment"
+            return@forEachIndexed
+        }
+        if (suppress(boxOf(clipped.bubble, canvasWidth, canvasHeight))) {
+            suppressed += 1
+            verdicts[index] = "suppressed"
+        } else {
+            owned += SeamOwnership(clipped.bubble, cross = false)
+            containerCross += 1
+            verdicts[index] = "cross_container"
+        }
+    }
+
     // 1) 整块跨下边界：拼接后 OCR 看到完整一行 → 归本图，剩余部分交给下一张
     if (config.hasBottomBand) {
-        detections.forEachIndexed { index, detection ->
+        working.forEachIndexed { index, detection ->
             if (!used[index] && detection.outer.top < bottom && detection.outer.bottom > bottom) {
                 used[index] = true
                 // 伸进下条带太深 = 把下一张图正文也圈进来了：裁到「切开余量」为止，
@@ -414,7 +517,7 @@ internal fun planSeamOwnership(
     // 2) 整块跨上边界：上半在上一张图里 → 归上一张（它已经渲染并移交给 incomingCross）。
     //    但**上一张没移交**时本图必须认领，否则这块永远没有译文。
     if (config.hasTopBand) {
-        detections.forEachIndexed { index, detection ->
+        working.forEachIndexed { index, detection ->
             if (!used[index] && detection.outer.top < top && detection.outer.bottom > top) {
                 used[index] = true
                 if (handedOver(detection.outer)) {
@@ -451,13 +554,13 @@ internal fun planSeamOwnership(
 
     // 3a) 下边界配对：本图内贴上边界的「上半」+ 下条带内贴下边界的「下半」
     if (config.hasBottomBand) {
-        val uppers = halfCandidates(detections, used) { box ->
+        val uppers = halfCandidates(working, used, groupedWorking) { box ->
             box.bottom <= bottom + 0.5f && box.bottom >= bottom - window
         }
-        val lowers = halfCandidates(detections, used) { box ->
+        val lowers = halfCandidates(working, used, groupedWorking) { box ->
             box.top >= bottom - 0.5f && box.top <= bottom + window
         }
-        buildHalfPairs(uppers, lowers, used, config).forEach { pair ->
+        buildHalfPairs(uppers, lowers, used, config, canvasHeight).forEach { pair ->
             used[pair.upper.index] = true
             used[pair.lower.index] = true
             // 合并框同样受「切开余量」约束：配对出来的框曾经可以一路盖到下一张图正文上。
@@ -483,13 +586,13 @@ internal fun planSeamOwnership(
     }
     // 3b) 上边界配对：上条带内贴上边界的「上半」+ 本图内贴上边界的「下半」
     if (config.hasTopBand) {
-        val uppers = halfCandidates(detections, used) { box ->
+        val uppers = halfCandidates(working, used, groupedWorking) { box ->
             box.bottom <= top + 0.5f && box.bottom >= top - window
         }
-        val lowers = halfCandidates(detections, used) { box ->
+        val lowers = halfCandidates(working, used, groupedWorking) { box ->
             box.top >= top - 0.5f && box.top <= top + window
         }
-        buildHalfPairs(uppers, lowers, used, config).forEach { pair ->
+        buildHalfPairs(uppers, lowers, used, config, canvasHeight).forEach { pair ->
             used[pair.upper.index] = true
             used[pair.lower.index] = true
             // 上半在上一张图里，本图只负责把整句译文放进本图可见区域（裁到分界内），
@@ -510,7 +613,7 @@ internal fun planSeamOwnership(
     }
 
     // 4) 其余按归属分类
-    detections.forEachIndexed { index, detection ->
+    working.forEachIndexed { index, detection ->
         if (used[index]) return@forEachIndexed
         val box = detection.outer
         if (suppress(box)) {
@@ -576,6 +679,31 @@ internal fun planSeamOwnership(
         )
     }
 
+    // 把 working 下标（成组后）还原成原始 detections 下标：
+    // 组成员统一给 grouped_region / grouped_body（被丢弃/抑制的组保留真实原因，便于排障）。
+    val finalVerdicts = MutableList(detections.size) { "unknown" }
+    var groupedRegion = 0
+    var groupedBody = 0
+    var groupedFragments = 0
+    working.indices.forEach { index ->
+        val verdict = verdicts[index]
+        val kind = groupKinds[index]
+        val members = originalIndices[index]
+        when {
+            kind == null -> finalVerdicts[members[0]] = verdict
+            verdict == "suppressed" || verdict.startsWith("dropped_") ->
+                members.forEach { finalVerdicts[it] = verdict }
+            else -> {
+                members.forEach { finalVerdicts[it] = kind.verdict }
+                groupedFragments += members.size
+                when (kind) {
+                    SeamFragmentGroups.Kind.REGION -> groupedRegion += 1
+                    SeamFragmentGroups.Kind.BODY -> groupedBody += 1
+                }
+            }
+        }
+    }
+
     return SeamPlan(
         owned = owned,
         detected = detections.size,
@@ -586,7 +714,11 @@ internal fun planSeamOwnership(
         orphanAdopted = orphanAdopted,
         handedTail = handedTail,
         cappedCross = cappedCross,
-        verdicts = verdicts
+        groupedRegion = groupedRegion,
+        groupedBody = groupedBody,
+        groupedFragments = groupedFragments,
+        containerCross = containerCross,
+        verdicts = finalVerdicts
     )
 }
 
@@ -645,7 +777,7 @@ private fun clipDetection(
         // 行数按可见比例折算：裁掉一半还留 3 行 → 「原文字高 = 框高 ÷ 3」会把字高估小一半。
         sourceLineCount = maxOf(1, (detection.bubble.sourceLineCount * visibleRatio).roundToInt())
     )
-    return SeamDetection(bubble, outer, content)
+    return SeamDetection(bubble, outer, content, detection.container)
 }
 
 private data class HalfCandidate(val index: Int, val detection: SeamDetection)
@@ -655,10 +787,11 @@ private data class HalfPair(val upper: HalfCandidate, val lower: HalfCandidate, 
 private fun halfCandidates(
     detections: List<SeamDetection>,
     used: BooleanArray,
+    excluded: BooleanArray,
     predicate: (SeamBox) -> Boolean
 ): List<HalfCandidate> {
     return detections.indices
-        .filter { index -> !used[index] && predicate(detections[index].outer) }
+        .filter { index -> !used[index] && !excluded[index] && predicate(detections[index].outer) }
         .map { index -> HalfCandidate(index, detections[index]) }
 }
 
@@ -670,13 +803,14 @@ private fun buildHalfPairs(
     uppers: List<HalfCandidate>,
     lowers: List<HalfCandidate>,
     used: BooleanArray,
-    config: SeamConfig
+    config: SeamConfig,
+    canvasHeight: Int
 ): List<HalfPair> {
     val candidates = mutableListOf<HalfPair>()
     uppers.forEach { upper ->
         lowers.forEach { lower ->
             if (upper.index == lower.index) return@forEach
-            val score = pairScore(upper.detection, lower.detection, config) ?: return@forEach
+            val score = pairScore(upper.detection, lower.detection, config, canvasHeight) ?: return@forEach
             candidates += HalfPair(upper, lower, score)
         }
     }
@@ -698,7 +832,12 @@ private fun buildHalfPairs(
 }
 
 /** 返回配对分数；null = 不符合参考项目的配对判据。 */
-private fun pairScore(upper: SeamDetection, lower: SeamDetection, config: SeamConfig): Float? {
+private fun pairScore(
+    upper: SeamDetection,
+    lower: SeamDetection,
+    config: SeamConfig,
+    canvasHeight: Int
+): Float? {
     val upperBox = upper.outer
     val lowerBox = lower.outer
     val upperText = upper.bubble.originalText.trim()
@@ -727,12 +866,36 @@ private fun pairScore(upper: SeamDetection, lower: SeamDetection, config: SeamCo
     val maxGap = SeamTuning.resolveMaxPairGap(upperBox.height, lowerBox.height)
     if (gap > maxGap) return null
 
-    val mergedHeight = max(upperBox.bottom, lowerBox.bottom) - min(upperBox.top, lowerBox.top)
-    if (mergedHeight > config.maxCrossHeightPx) return null
+    val mergedTop = min(upperBox.top, lowerBox.top)
+    val mergedBottom = max(upperBox.bottom, lowerBox.bottom)
+    val mergedHeight = mergedBottom - mergedTop
+    if (mergedHeight > config.maxCrossHeightPx) {
+        // 高字/大字 SFX 例外（参考 seamLineFitsComposite，2026-10-27）：
+        // 框比 maxCrossHeight 高但**严格内缩**（不贴画布上下边、不占满整高）时，
+        // 仍可当作有效单行跨缝行。只对单行块生效，多行气泡/整幅场景框照旧拒绝。
+        val singleLine = SeamTuning.lineCountOf(upper.bubble) <= 1 &&
+            SeamTuning.lineCountOf(lower.bubble) <= 1
+        val mergedBox = SeamBox(
+            left = min(upperBox.left, lowerBox.left),
+            top = mergedTop,
+            right = max(upperBox.right, lowerBox.right),
+            bottom = mergedBottom
+        )
+        if (!singleLine || !SeamFragmentGroups.fitsSingleLineComposite(mergedBox, canvasHeight)) {
+            return null
+        }
+    }
 
     // 上块已经是完整句子收尾、两块之间又有明显间隙 → 是两句话，不是被切开的同一句。
+    // 例外（参考 seamPairTextCanContinue）：两块 region_id 非空且相同 = 同一个容器，
+    // 容器内换行可以以句末标点结束，仍然允许配对。
     val gapThreshold = max(2f, min(upperBox.height, lowerBox.height) * 0.25f)
-    if (SeamTuning.endsSentence(upperText) && gap > gapThreshold) return null
+    if (SeamTuning.endsSentence(upperText) && gap > gapThreshold) {
+        val upperRegion = upper.bubble.regionId?.trim().orEmpty()
+        val lowerRegion = lower.bubble.regionId?.trim().orEmpty()
+        val sameContainer = upperRegion.isNotEmpty() && upperRegion == lowerRegion
+        if (!sameContainer) return null
+    }
 
     val gapScore = 1f - (max(0f, gap) / max(1f, maxGap))
     return overlap * 0.6f + heightRatio * 0.3f + gapScore * 0.1f

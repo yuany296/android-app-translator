@@ -28,4 +28,23 @@ internal object BrowserImageOrder {
         if (start <= 0) return spans.indices.toList()
         return (start until spans.size).toList() + (0 until start).toList()
     }
+
+    /**
+     * 批处理中是否该因滚动**提前结束旧快照**并重新扫描（2026-10-23）。
+     *
+     * 旧实现只在整批 `images` 处理完后才重扫，而懒加载站点的新图是用户翻页时才挂出来的：
+     * 用户在读第 N 张时往下翻，第 N+1 张已经加载，但它不在旧快照里，只能等前面所有待翻图
+     * 处理完才进队列 —— 观感就是「眼前这页没提前翻，先停很久」。
+     *
+     * 判据只看「扫描时与当前滚动位置的距离」：上下翻都算（往回翻同样要重新排）；
+     * 旧脚本没给滚动位置（[scannedScrollY] < 0）时一律不重排，保持旧行为。
+     *
+     * @param scannedScrollY 本轮扫描时的 `window.scrollY`，<0 表示未知。
+     * @param currentScrollY 当前 `window.scrollY`，<0 表示读取失败。
+     * @param thresholdPx 触发重扫的最小位移；冲突容差防止地址栏伸缩/回弹造成抖动。
+     */
+    fun shouldReanchor(scannedScrollY: Int, currentScrollY: Int, thresholdPx: Int): Boolean {
+        if (scannedScrollY < 0 || currentScrollY < 0) return false
+        return kotlin.math.abs(currentScrollY - scannedScrollY) >= thresholdPx.coerceAtLeast(1)
+    }
 }
