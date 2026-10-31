@@ -1,5 +1,267 @@
 # Todolist
 
+## 68. 用户 2026-11-01：零/低延迟质量补强（接缝切线 + 实时底色来源 + 颜色采样诊断）
+
+### 一、背景
+
+用户明确关心的是**从识别到译文出现的端到端时间**，不是开发工时。因此只做：
+不增加 OCR 次数、不增加模型请求、不等待邻页的改动；额外 CPU 控制在每页几毫秒内。
+
+### 二、实施清单
+
+- [x] `PaddleOcrBlockMerger`：段落合并时识别「贴图像上/下边」的行，不把它并进段落，
+      留给接缝配对逻辑单独处理（纯几何，0 额外 OCR）。
+- [x] `PaddleOcrBlockMerger`：拼接图**内部切缝**（`topLimit/bottomLimit`）也作为断点：
+      跨缝两块不并段、贴缝半行单独成组；`LocalTextDetector` 新增带 seam 参数的
+      `detect`，网页漫画链路把两条缝传进 Paddle（纯几何，0 额外 OCR）。
+- [x] `BubbleColorExtractor`：`bgType=solid` 时背景色改为从**气泡容器内边带**采样
+      （容器框内缩 `max(8px, 8%)`、排除文字框、采样上限 2048）；边距/样本不足时
+      回退现有文字框环。墨色仍从文字框采，不改变文字色规则。
+- [x] `BubbleColors` / `BubbleBackground` 带采样数；`sampled_colors` 日志追加 `n=ink/bg`，
+      下次偏色能一眼判断是不是采样太少。
+- [x] OCR 近似变体去重：`MlKitTiledBlockMerger` / `PaddleOcrBlockMerger` 对
+      「文本高相似 + 框强重叠」的同一句两版只保留更可信的一份（现场
+      `pageHash ca9603cd…`：正确两行版 + 错字单行版被拼成一句，译文重复两遍）。
+- [x] 单测、构建、装机；真机复测项写入 `HumanTODO.md`。
+
+### 三、为什么不会拖慢
+
+- 接缝切线：纯几何判断，微秒级。
+- 容器边带底色：只在 `solid` 气泡上多扫一个**有上限**的边带（≤8192 像素），
+  不新增 Bitmap 解码、不新增 OCR/翻译请求；预计 <10ms/页。
+- 采样数字段：复用已有循环，≈0。
+
+### 四、实现细节
+
+- `PaddleOcrBlockMerger.isEdgeCutLine`：容差 `max(2px, min(4px, 6% 行高))`；
+  贴边行单独成组，且已含贴边行的组不再吸收普通行。
+- `PaddleOcrBlockMerger.crossesSeam`：两块中心分处 `seamTopPx/seamBottomPx` 两侧时
+  不并段；`isEdgeCutLine` 同时识别「跨缝/贴缝」的半行。
+- `LocalTextDetector.detect(bitmap, lang, seamTopPx, seamBottomPx)`：默认忽略；
+  `PaddleOcrLocalTextDetector` 透传到 `PaddleOcrBlockMerger`；`WebtoonImageTranslator`
+  传入 `topLimit/bottomLimit`。
+- `BubbleColorExtractor.solidBackgroundBandBoxes`：纯函数计算
+  `[bandL, bandT, bandR, bandB, textL, textT, textR, textB]`；边带可用面积 <64px² 回退。
+- `sampleSolidBackgroundBand`：按边带面积开方取步长，样本上限 2048；仍用 4bit 众数桶 +
+  桶内均值 + 一致率。
+- `sampled_colors` / `bubble_colors` 日志格式：`b0=#文字色/#底色(n=墨色样本/底色样本)`。
+- `OcrTextSimilarity`（新增，core-translate）：归一化 Levenshtein；长度差 >30% 直接跳过，
+  相似度 ≥0.80 才判近似。
+- `MlKitTiledBlockMerger`：跨块/同块都做近似变体去重；要求横纵重叠 ≥0.55/0.50；
+  保留行数更多 > 文本换行结构与 lineCount 更一致 > 面积更大。
+- `MlKitLocalTextDetector`：短图（单趟、无分块）也过同一个合并器，覆盖
+  「完整多行块 + 近似单行块」的单趟重复；带 seam 的 4 参检测用
+  `MlKitSeamSplitter` 按 `lineBoxes` 把跨缝段落拆成缝上/缝下两块（不重新 OCR）。
+- `PaddleOcrBlockMerger`：合并前先做同样的近似变体去重；保留行数更多 >
+  文本换行结构更一致 > 置信度更高 > 文本更长 > 面积更大。两条路径都只动
+  「几乎同框」的块，不碰独立气泡。
+
+### 五、验证
+
+- `PaddleOcrBlockMergerTest`：贴底边/顶边的行不并入相邻段；正常两行段落仍合并；
+  近似重复变体只留正确两行版；不同文本、不重叠的块保留。
+- `MlKitTiledBlockMergerTest`：跨块/同块近似变体去重、不同文本高重叠保留、
+  原有同块同文本低 IoU 行为不变。
+- `MlKitSeamSplitterTest`：跨缝段落按 lineBoxes 拆开；同侧不拆；行数/文本不匹配时原样保留。
+- `BubbleColorRulesTest`：容器边带框计算（正常/文字框几乎填满容器两种）。
+- `:core-overlay:testDebugUnitTest` 64 条、`:core-translate:testDebugUnitTest` 234 条、
+  `:app:testDebugUnitTest` 344 条，0 失败；`:app:assembleDebug` 通过并装机（01:21）。
+- 真机：看接缝处半行是否还重复/漏翻；看纯色气泡文字色/盖板色是否更稳；
+  `sampled_colors` 里应出现 `n=`。
+
+### 六、边界
+
+- 本轮“贴边”同时覆盖**图像上/下边**和**拼接图内部切缝**：
+  - Paddle：`topLimit/bottomLimit` 传进 `LocalTextDetector` → `PaddleOcrBlockMerger`，
+    跨缝两块不并段、贴缝半行单独成组。
+  - ML Kit：`MlKitSeamSplitter` 用 `lineBoxes` 把跨缝段落按行拆成缝上/缝下两块（不重新 OCR）。
+- 拆不了就原样保留：ML Kit 没有 `lineBoxes`，或 `text.lines()` 行数与 `lineBoxes` 不一致时，
+  不猜文本（避免把一句拆坏），这类现场仍依赖 planner + 接缝配对。
+- 容器边带只对 `bgType=solid` 生效；旁白/复杂背景完全走原路径。
+- 采样数只用于诊断，不参与判定。
+
+## 67. 用户 2026-10-31：颜色偶发不准 + 合并不对（同句拆两块 / 气泡旁一行并进台词）
+
+### 一、需求
+
+用户反馈「好像没有文字颜色采样？还是规则比插件弱。总之有的时候颜色会不对」，以及
+「除了采样颜色，还有合并规则」：一是同一句被拆成两块分别翻译；二是气泡框旁边的一行字
+被并进气泡台词。
+
+### 二、颜色：不是没采样，是采样密度问题
+
+`BubbleColorExtractor` 的判定规则与插件 `bubble-colors.js` 逐条对齐（对比度 ≥4.5 或
+色度 ≥40 保留原色；白描边守卫），还多了 `originalHadOutline`。真正的两个实现问题：
+
+1. **墨色步长写错**：`step = 面积 / MAX_INK_SAMPLES`，实际采样数 ≈ `MAX² / 面积`
+   （640×420 的框只剩几十个墨色样本；合成图实测深蓝 `#143C6E` 被采成 `#42628A`）。
+   改为 `step = ceil(sqrt(面积 / 上限))`，小框仍逐像素。
+2. **外圈底色超上限时截断**：旧实现先采上/下边、再采左/右边，超 8192 直接丢弃 →
+   大框只剩上边一条，底色被上边框/相邻画面带偏。改为按固定间隔对整条环均匀抽样。
+
+规则本身未动（避免把正常黑字判成彩字）。`BubbleColorRulesTest` 新增 2 条采样密度锁；
+`:core-overlay:testDebugUnitTest` 62 条通过。
+
+### 三、合并：两条规则（`BubbleFirstRegionPlanner`）
+
+1. **合并少了（气泡内 + 气泡外续行）**：参考项目的行聚类在容器归属之前，且
+   `areLocalPaddleRegionsCompatible` 对「一边没有容器」直接判兼容。新增
+   `mergeOutsideContinuationsIntoBubbles`：气泡内最后一块以逗号/省略号收尾、气泡外
+   下一块在正下方（垂直重叠 ≤0.1 行高、间隙 ≤1 行高）、且 `OcrBlockMergeRules`
+   判对齐 → 收编进气泡并扩区域，再翻译成一句。
+2. **合并多了（气泡旁一行）**：`matchScore` 收严到参考项目
+   `find_best_visual_region` 口径 —— 中心在区域内还要 ≥18% 覆盖率；中心在外必须 ≥55%
+   （旧实现 center inside 不看覆盖率、或 18% 就收编）。OpenCV 区域框带
+   `max(6px, 6%)` 外扩，归属前先收掉一半；续行收编也要求外块真的在下方。
+
+**未做**：两个**实底**气泡之间的同一句（真机 `표시된 차원 속 기존의 존재 중,` +
+`'지오'에 해당하는 대상을 '적합자'라고 명명`）仍分开。插件段落规则在这组几何上
+（中心距大、横向重叠 20% <35%）也会拒绝；强行合并可能把两个角色的台词并掉。
+若确认是两个 caption 容器，再单独加「双实底 caption 续句」类型。
+
+### 四、验证
+
+- `:app:testDebugUnitTest` 344 条、`:core-overlay:testDebugUnitTest` 62 条，0 失败；
+  新增 planner 单测覆盖：气泡外续行收编、气泡旁一行不并、OpenCV 外扩环、续行标点缺失。
+- `:app:assembleDebug` 通过并装机（23:59 左右；装机前设备短暂断开一次）。
+- 新增排障日志 `bubble_continuation_merge merged=N`、`bubble_first_texts 原文@x,y`；
+  颜色问题仍看 `sampled_colors`。
+- 真机复测清单见 `HumanTODO.md`。
+
+## 66. 用户 2026-10-31：翻译历史区分网页文字/漫画图片 + 按页折叠
+
+### 一、需求
+
+网页翻译记录太多，找一条漫画/图片译文要划很久；希望两种来源分开，或把「按页」记录折叠。
+
+### 二、改动
+
+- `core-store/SentenceSource.kt`（新增）：`WEBPAGE_TEXT` = `originPageHash` 为
+  `webpage-text` / `webpage-text:*`；其余（真实页面哈希、截图、旧数据）归 `IMAGE`。
+  纯函数，不新增持久化字段，旧 JSON 直接可分类。
+- `app/SentencesScreen.kt`：
+  - 搜索框下加来源筛选 `全部 N / 网页文字 N / 漫画/图片 N`（带计数、可横向滚动）；
+  - 按句行 meta 显示来源大类 + 站点（「网页文字 · lezhin.com」/「漫画/图片 · …」/「截图」）；
+  - 按页卡片头改成 `来源 · N 句 · 时间`；
+  - 卡片可折叠：点标题收起/展开，左侧小勾只选中本页；>40 句默认收起；
+  - 右上「收起全部 / 展开全部」；切筛选回顶部并清空跨筛选选择。
+- `app/EmbeddedBrowserScreen.kt`：每次网页文字翻译生成 `webpage-text:<时间戳>`，
+  以后每次会话单独成卡，不再把所有网页句子并成一个巨型组。
+- **性能修复（同日追加）**：第一版把整页句子塞进卡片头一个 LazyColumn item 的 `Column`，
+  686 句展开时一次组合 686 个 `SentenceRow`，导致折叠/展开卡顿。现在改成
+  「卡片头 item + 句子行 `itemsIndexed`」，边框用 `drawBehind` 逐项画；
+  展开后只有可视区附近的行被组合，686 句组展开/收起 300ms 内完成；真机 705 句 + 66 句组同样即时。
+
+### 三、验证
+
+- 模拟器 Pixel_8 + 真机 2845 条缓存：全部 2845 / 网页文字 690 / 漫画图片 2155；
+  两个筛选、按句来源、按页卡片头、7 句普通页展开、686 句旧网页组默认收起、
+  「收起全部/展开全部」、选中本页均正常。
+- `core-store` 162 条（新增 `SentenceSourceTest` 5 条）/ `app` 339 条，0 失败；
+  `:app:assembleDebug` 通过并装机（22:52）。
+- 真机复测清单见 `HumanTODO.md`。
+
+### 四、边界
+
+- 旧网页记录没有会话 id，仍是一个 686 句的大组；默认收起 + 筛选可避开，无法按旧会话拆。
+- 该大组点「选中本页」会选中全部 686 句，「作废本页」会一次删掉整组缓存（原有行为）。
+
+## 65. 用户 2026-10-31：最新翻译页原文/译文错位（页面上下文 + 缓存命中导致整批错一位）
+
+### 一、真机数据
+
+最新页（`pageHash=c1e51da30080…`，22:11:17，共 8 句）第 4 句 `으음` 命中句子缓存
+（`으음...` → `嗯……`，COMPACT，`hitCount=1`），本批只送 7 句。模型返回的 7 条译文
+却是整页前 7 句的译文；`normalizeTranslationList` 对无序号纯数组只校验长度，
+7 == 7 就按下标回填，导致第 4 句之后整体错一位：
+
+- `덮어둔 비닐…` 拿到 `嗯……`
+- `동` 拿到 `看来盖着的塑料膜包得有点马虎……`
+- `또 뭐가 문제래요?` 拿到 `咚`
+- `그때도 멀쩡했구만 는` 拿到 `又说什么有问题了？`
+
+### 二、根因（三处叠加）
+
+1. `PageTranslationResolver`：`pageContext` 是整页 8 句，`missing` 跳过了缓存命中句，
+   输入在页面顺序上**不连续**；
+2. `OpenAiVisionClient.buildTranslatePrompt`：上下文用 `[1]..[8]` 编号，
+   `INPUT_TEXTS_JSON` 是裸字符串数组，模型把「上下文前 7 行」当成本批输入；
+3. `normalizeTranslationList`：纯数组无序号时按位置回填，长度相同就静默接受。
+
+### 三、修复
+
+- 输入改为 `[{"i":0,"text":"..."}, ...]`，模型复制 `i`，不再自己数序号；
+- 上下文标号改为 `[C1]..[Cn]`，并写明「C1..Cn 不是输入序号」；
+- 生产链路 `requireExplicitIndex=true`：纯数组、越界序号、重复序号一律 `parseFailed`，
+  交给拆批/重试；宁可显示原文，也不把错位译文写进缓存；
+- 新增 `VisionClient: translate_parse count=… indexed=… failed=… reason=…` 日志。
+
+### 四、验证与残留
+
+- `OpenAiVisionClientTest` 23 条 / `TranslatePromptTest` 8 条全过；
+  `:app:assembleDebug` 通过并装机。
+- **已写坏的 4 条缓存不会自动修复**：需在「翻译历史 → 按页 → 作废本页」后重翻。
+- 复测步骤已写入 `HumanTODO.md`。
+
+## 64. 用户 2026-10-30：适配 OpenCode Go 套餐（2026-10-30）
+
+用户订阅了 [OpenCode Go](https://opencode.ai/console/go)，要求把 Go 作为云端翻译/OCR 厂商接进 App。
+参考文档：`https://opencode.ai/v2/docs/console/api/inference`、`/v2/docs/console/harnesses#base-urls`、`/v2/docs/console/go`。
+
+### 一、Go 与普通 OpenAI 兼容端点的差异
+
+- **Base URL 分两段**：Go 的 OpenAI Chat Completions 是
+  `https://opencode.ai/inference/go/openai/v1/chat/completions`；
+  模型列表却是 `https://opencode.ai/inference/go/v1/models`（少一段 `/openai`）。
+  旧 `https://opencode.ai/zen/go/v1` 仍可用，两份地址都按 `opencode.ai` 主机识别。
+- **客户端身份**：Go 要求自带 User-Agent（不能是 `okhttp/x.y.z` 这类通用库名），
+  并给每个会话带稳定的 `x-opencode-session`；缺会话头会影响路由/提示词缓存。
+- **模型协议不统一**：同一个 Go Key 下，DeepSeek/GLM/Kimi/MiMo 等原生走 Chat Completions，
+  GPT/Grok 走 Responses，Claude/Qwen/MiniMax 走 Anthropic Messages。
+  本 App 只会发 Chat Completions，必须把后两类从模型列表里过滤掉，否则选中即失败。
+- **思考开关**：Go 的 DeepSeek 中继接受 `thinking:{"type":"disabled"}` 关闭思考；
+  反而 `reasoning_effort` 与 `reasoning_content` 回放组合会 400（社区已复现）。
+  因此复用现有 GLM/DeepSeek 的 `thinking.type` 方言，不新增字段。
+
+### 二、改动
+
+- `core-store/AiProvider.kt`：新增 `OPENCODE_GO`（label「OpenCode Go」，
+  base URL `https://opencode.ai/inference/go/openai/v1`，默认模型 `deepseek-v4.1-flash`，
+  `supportsThinking=true`）。选完厂商自动带出地址/模型，用户只需粘 Console API Key。
+  默认模型同时支持文本与图片输入（1M 上下文），翻译与「多模态重读」都能直接用。
+- `core-translate/OpenCodeGoSupport.kt`（新增，纯逻辑 + OkHttp，可 JVM 单测）：
+  - `applyHeaders`：仅对 `opencode.ai` 请求补 `User-Agent: manga-translator/1.0`
+    与进程级稳定 `x-opencode-session: ses_<uuid>`，不把会话头泄漏给其它厂商；
+  - `modelsEndpoint`：Go 的模型列表统一改写到 `/inference/go/v1/models`，
+    其它厂商保持 `<baseUrl>/models`；
+  - `isChatCompletionsModel`：模型元数据带 `api` 字段时只保留 `chat-completions`
+    原生模型（无 `api` 字段的厂商维持全部返回）。
+- `core-translate/OpenAiVisionClient.kt`：`executeRequest` 与 `fetchAvailableModels`
+  接入上述头/地址/过滤；请求体不变。
+- `ThinkingSupport`：`PROVIDER_IDS` / `THINKING_TYPE_PROVIDERS` 加入 `opencode-go`
+  （与 `AiProvider.supportsThinking` 由一致性测试钉住）。
+
+### 三、验证
+
+- 新增 `OpenCodeGoSupportTest` 5 条（主机匹配/防伪域名、models 地址改写、头只发给
+  opencode.ai、会话 ID 稳定且 `ses_` 前缀、协议过滤）；`ThinkingSupportTest` 扩到
+  `opencode-go`；`OpenCodeGoProviderConsistencyTest` 钉住预设 base URL/默认模型。
+- `:core-translate:testDebugUnitTest`、`:core-store:testDebugUnitTest`、
+  `:app:testDebugUnitTest` 全绿；`:app:compileDebugKotlin` 通过。
+- 实测公开端点：`GET https://opencode.ai/zen/go/v1/models` 返回 28 个模型；
+  其中 11 个（Grok/GPT/Claude/Gemini/Muse/Qwen/MiniMax 等）不是 Chat Completions，
+  会被过滤，剩 17 个可选；`deepseek-v4.1-flash` 的 `api` 为 `chat-completions`，且
+  `modalities.input` 含 `image/jpeg`/`image/png`，默认模型可用于视觉 OCR。
+- **待人工**：用真实 Go Key 在 App 里新建配置 → 获取模型列表 → 翻一页 + 跑一次
+  多模态重读，确认计费走 Go、返回 200；真机/模拟器复测清单见 `HumanTODO.md` 2026-10-30。
+
+### 四、注意
+
+- Go 官方写明该订阅面向「coding agents」并会监控异常流量；本 App 已按文档补齐
+  UA/会话头，但漫画翻译不属于典型编码流量，若后续被限流需改用普通 OpenAI 兼容厂商。
+- Go 的免费模型仅限 OpenCode 客户端内使用，外部客户端会 403；默认选的是付费模型，
+  但模型列表里的 `*-free` 仍可能被手动选中而失败（后续如需可再加 `*-free` 过滤）。
+
 ## 63. 用户 2026-10-27：术语导入「不知道放什么 + 文件列表全是不相关文件」—— 粘贴/示例/格式识别（2026-10-27）
 
 用户三条诉求：①选文件时排除不符合的文件；②允许直接粘贴 JSON / Markdown；③给出格式示例。

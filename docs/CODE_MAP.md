@@ -83,7 +83,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 |---|---|---|---|
 | `Models.kt` | 跨模块数据结构：`Bubble` / `TextBlock` / `BubbleRegion` / `TranslationResult` | 数据类 | `TextBlock.lineCount`（行高的来源）在此 |
 | `LocalTextDetector.kt` | 本地 OCR 引擎的统一接口 | `detect` / `isReady` / `prewarm` | 两个实现：ML Kit / Paddle |
-| `MlKitLocalTextDetector.kt` | ML Kit 识别：段落块 → `TextBlock`（带行数） | `detect` | 失败 `mlkit detect failed` |
+| `MlKitLocalTextDetector.kt` | ML Kit 识别：段落块 → `TextBlock`（带行数）；长条图分块 + 跨块同文去重 | `detect` | 失败 `mlkit detect failed`；分块 `mlkit_det_tiled … raw=/blocks=/tileBlocks=` |
 | `PaddleOcrLocalTextDetector.kt` | PaddleOCR(ONNX)：检测 + 多方向识别投票 | `detect` | `paddle_total_ms`、`det_*`、`paddle_quad_reject` |
 | `PaddleOcrBlockMerger.kt` | 把 Paddle 的行碎片合并成段落块，并写入 `lineCount` | `mergeBlocks` | 日志 `raw_blocks=/merged=` |
 | `PaddleQuadGeometry.kt` | 四边形几何：倾角、质量闸、目标文字字符计数 | `rotationDeg` / `isAcceptableResult` | 纯逻辑，可单测 |
@@ -130,8 +130,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `BrowserSceneBuilder.kt` | 场景 JSON 生产者（普通场景 + 接缝带场景）= Kotlin↔JS 契约 | `buildSceneJson` / `buildSeamSceneJson` | 渲染层字段以它为准 |
 | `WebtoonImageTranslator.kt` | **浏览器链路核心管线**：拼接→OCR→归属→翻译→擦字→场景/贴片 | `translateImage` / `translateStitched` | `slice_classify`、`seam_verdict`、`cross_prep`、`incoming_absorbed`、`render_done` |
 | `SeamNeighbourPolicy.kt` | 跨切片**配对闸**：上一张/下一张是否几何紧邻 | `predecessor` / `successor` / `decide` | `band_pair`、`incoming_dropped`；纯逻辑 |
-| `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`slice_classify`；纯逻辑 |
-| `SeamFragmentGroups.kt` | 接缝**多碎片成组**：同容器 ≥2 / 匿名正文 ≥3 先合成一个候选，再走 1:1 配对 | `buildGroups` / `groupFitsSeamWindow` / `containerContribution` | 纯几何 + 单测 `SeamFragmentGroupsTest`；日志 `grouped_region/grouped_body/grouped_fragments/container_cross`（`slice_classify`） |
+| `SeamBubbleMerger.kt` | 接缝**归属**：跨缝块归谁、是否已被上一张画过 | `planSeamOwnership` / `isHandedOverByIncoming` / `SeamTuning` | `seam_verdict`、`seam_group`、`slice_classify`；纯逻辑 |
+| `SeamFragmentGroups.kt` | 接缝**多碎片成组**：同容器 ≥2 / 匿名正文 ≥3 先合成一个候选，再走 1:1 配对 | `buildGroups` / `groupFitsSeamWindow` / `regionGroupCompatible` / `containerContribution` | 纯几何 + 单测 `SeamFragmentGroupsTest`；日志 `grouped_region/grouped_body/grouped_fragments/container_cross`（`slice_classify`）、`seam_group` |
 | `SeamTextPixels.kt` | 接缝接收页 `hasTextPixels` 三态：内容框与接收页求交；只有显式 false 才跳过文字/擦字/盖板 | `resolveOnPage` / `contributesText` | 纯几何 + 单测 `SeamTextPixelsTest`；日志 `incoming_no_text`、`cross_out_probe text=` |
 | `SeamIncomingGeometry.kt` | 收到侧**并框** + 退化框最小高度 | `isSameLineFragment` / `expandForAdjacentFragments` / `enforceMinimumHeight` | 纯逻辑 |
 | `SeamBandGeometry.kt` | 接缝带几何换算与盖板外扩 | `coverPadPx` / `coverPadPxFor` / `sourcePercentToStitched` | 纯逻辑 |
@@ -171,6 +171,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `NonTranslatableText.kt` | 判定语言中立文本（数字/时间/URL/符号）免翻译 | `isNonTranslatable` | 纯逻辑 + 单测 |
 | `BalancedLineBreaker.kt` | 像素感知均衡断行（词边界 + 标点禁则 + 行宽约束） | `breakLines` / `countGreedyLines` / `segmentWithIcu` | 纯逻辑 + 单测 `BalancedLineBreakerTest`；与渲染层 JS `breakBalancedLines` 同权重 |
 | `OpenAiVisionClient.kt` | OpenAI 兼容云端客户端：**翻译** + 模型列表 | `translateTexts` / `fetchAvailableModels` | 日志 TAG `VisionClient`；`request_retry_transient`/`translate_split_retry`/`translate_parse_retry`/`sentence_retry`（2026-10-14 原文回退三件套）；⚠️ OCR 三方法死代码（见 §7） |
+| `OpenCodeGoSupport.kt` | OpenCode Go 订阅接入口径：UA / `x-opencode-session` / 模型列表地址与协议过滤 | `applyHeaders` / `modelsEndpoint` / `isChatCompletionsModel` | 2026-10-30 新增；只对 `opencode.ai` 主机生效；models 路径比 chat base URL 少一段 `/openai` |
 | `BaiduTranslateClient.kt` | 百度翻译专用接口（整页多句一次请求 + 分批限流） | `translate` / `toBaiduLanguage` | 上游日志 `mode=baidu`；TAG `BaiduTranslate` 定义了但未打点 |
 | `LocalTranslator.kt` | 本地离线翻译接口（含模型下载/磁盘探测） | `isSupported` / `translate` / `downloadModel` | 实现方 `MlKitLocalTranslator` |
 | `MlKitLocalTranslator.kt` | ML Kit 端侧翻译：语言对模型下载 + 逐句容错 | `translate` / `prewarm` | 日志 TAG `MlKitLocalTranslator`、`mlkit_translate_*`；上游 `translate_local*` |
@@ -193,6 +194,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `GlossaryTextDecoding.kt` | 术语文件字节解码（UTF-8/BOM → GBK 回退） | `decode` | 中文 Excel 导出的 CSV 常为 GBK；单测 `GlossaryTextDecodingTest` |
 | `TranslationHistoryRepository.kt` | 翻译历史落盘、按页/指纹查询与淘汰 | `all` / `findByPageHash` / `add` | 单测 `HistoryCodecTest` |
 | `SentenceTranslationRepository.kt` | 句子级翻译缓存（精确/紧凑/模糊三级匹配） | `lookup` / `put` | 日志 TAG `SentenceCache`、`lookup miss`、`put skip_noop` |
+| `SentenceSource.kt` | 句子来源分类（网页文字 / 漫画图片），供翻译历史筛选与分组 | `sourceKind` | 网页文字 = `originPageHash` 为 `webpage-text` / `webpage-text:*`；纯函数，旧 JSON 直接可分类 |
 | `PageOverlayAdjustmentRepository.kt` | 逐页逐气泡的覆盖层微调持久化 | `get` / `save` | 悬浮球链路调参数 |
 | `BrowserHistoryRepository.kt` | 浏览历史落盘、同 URL 去重置顶、超限淘汰 | `record` / `recent` / `lastVisited` | 日志 `history_record`；`urlWithoutScheme` 被全仓用于日志脱敏 |
 | `BrowserFavoriteRepository.kt` | 浏览器收藏落盘与增删改 | `all` / `add` / `update` | 新标签页收藏格子 |
@@ -261,6 +263,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `GlossaryAddPolicy.kt` | 新增术语表单的提交判定（空原文/空译文/重复原文） | `GlossaryAddPolicy.block` / `message` | 纯函数 + `GlossaryAddPolicyTest`；口径与 `GlossaryRepository.add` 一致（trim 后比较、区分大小写） |
 | `GlossaryImportDialog.kt` | 导入入口弹窗：选文件 + 粘贴文本 + 实时识别 + 格式示例 | `GlossaryImportDialog` | 示例覆盖 Markdown / JSON / CSV；粘贴时即时显示「已识别：格式 · N 条术语」 |
 | `HistoryScreen.kt` | 翻译历史列表：展开看气泡、下拉刷新、清空 | `HistoryScreen` / `parseHistoryBubbles` | 清空历史 = 失去该页复用能力（会重新调 API） |
+| `SentencesScreen.kt` | 句子级翻译历史（底栏「翻译历史」）：按句/按页、来源筛选、折叠页卡片、勾选作废/提取术语 | `SentencesScreen` | 2026-10-31 增加「全部 / 网页文字 / 漫画图片」筛选与按页折叠；>40 句的页默认收起；句子行是独立 LazyColumn item（大页展开不卡） |
 | `ui/MtUi.kt` | 全应用共用按钮/卡片/列表行/自绘图标 | `MtCard` / `MtPrimaryButton` / `MtListRow` | 规格取设计稿「14-配色与组件规范」；⚠️ `MtOutlineButton`/`MtTextButton` **无调用方 = 死代码** |
 | `ui/theme/Color.kt` | 全应用色板常量 | `MtColors` | 改配色只改这里 |
 | `app/ui/theme/Theme.kt` | 把色板、字号阶梯与圆角组装成 MaterialTheme（App 自己界面的设计令牌总闸） | `MangaTranslatorTheme` / `MtTypography` / `MtShapes` | 只在 [MainActivity:250](app/src/main/java/com/manga/translator/app/MainActivity.kt#L250) `setContent` 里用一次，包住全部 Compose 界面；只做**浅色**（`lightColorScheme`）；`surfaceTint = Surface` 刻意**关掉 M3 高程染色**（设计稿弹窗是纯白）；字号全 `letterSpacing = 0`（中文排版）⚠️ `MtShapes` 无消费方（见 §7） |

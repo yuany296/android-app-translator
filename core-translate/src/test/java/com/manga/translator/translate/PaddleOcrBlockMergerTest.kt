@@ -39,6 +39,102 @@ class PaddleOcrBlockMergerTest {
     }
 
     @Test
+    fun dedupesNearDuplicateOcrVariantsBeforeParagraphMerge() {
+        // 真机 pageHash ca9603cd…：同一句被识别成「正确两行」和「错字单行」两版，
+        // 旧逻辑把两版并进同一段 → 译文重复两遍。这里只保留更可信的两行版本。
+        val correct = tb(0, "지금 물어야겠어?\n조용히 따라오기나 해.", 100f, 100f, 600f, 220f)
+        val garbled = tb(1, "지금 물어아겼어? 조용히 따리오기나 해.", 100f, 100f, 600f, 160f)
+        val merged = PaddleOcrBlockMerger.mergeBlocks(listOf(correct, garbled), 1080, 2400)
+        assertEquals(1, merged.size)
+        assertTrue(merged[0].text.contains("\n"))
+        assertEquals("지금 물어야겠어?\n조용히 따라오기나 해.", merged[0].text)
+    }
+
+    @Test
+    fun keepsDifferentTextBlocksWhenGeometryDoesNotOverlap() {
+        val upper = tb(0, "오늘은 날씨가 좋네요", 100f, 100f, 600f, 160f)
+        val lower = tb(1, "내일은 비가 온대요", 100f, 200f, 600f, 260f)
+        val merged = PaddleOcrBlockMerger.mergeBlocks(listOf(upper, lower), 1080, 2400)
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun doesNotMergeAcrossInternalStitchSeam() {
+        // 拼接图内部切缝（seamBottomPx=170）两侧的两行：几何上很近，但不能并成一段。
+        val upper = tb(0, "上半句台词", 100f, 100f, 600f, 160f)
+        val lower = tb(1, "下半句台词", 100f, 180f, 600f, 240f)
+        val merged = PaddleOcrBlockMerger.mergeBlocks(
+            blocks = listOf(upper, lower),
+            imageWidth = 1080,
+            imageHeight = 1000,
+            seamBottomPx = 170
+        )
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun mergesTwoLinesOnSameSideOfInternalSeam() {
+        val upper = tb(0, "上半句台词", 100f, 100f, 600f, 160f)
+        val lower = tb(1, "下半句台词", 100f, 180f, 600f, 240f)
+        val merged = PaddleOcrBlockMerger.mergeBlocks(
+            blocks = listOf(upper, lower),
+            imageWidth = 1080,
+            imageHeight = 1000,
+            seamBottomPx = 500
+        )
+        assertEquals(1, merged.size)
+    }
+
+    @Test
+    fun isolatesLineTouchingInternalSeam() {
+        // 下块顶边贴缝（168 vs 170，容差 3.6）：是被切开的半行，不能并进上一段。
+        val upper = tb(0, "上半句台词", 100f, 100f, 600f, 160f)
+        val lower = tb(1, "贴缝半行", 100f, 168f, 600f, 228f)
+        val merged = PaddleOcrBlockMerger.mergeBlocks(
+            blocks = listOf(upper, lower),
+            imageWidth = 1080,
+            imageHeight = 1000,
+            seamBottomPx = 170
+        )
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun doesNotMergeLineCutByPageEdge() {
+        // 第二行贴着图像底边（bottom == imageHeight），是被切片切开的半行：
+        // 即使行距/对齐都满足，也不能并进上一段（留给接缝配对）。
+        val blocks = listOf(
+            tb(0, "上半句台词", 100f, 100f, 600f, 160f),
+            tb(1, "被切开的半行", 300f, 180f, 520f, 240f)
+        )
+        val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 240)
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun doesNotMergeLineCutByTopEdge() {
+        // 第一行贴着图像顶边（top == 0）：同样是被上一张图切开的下半行，不能并进下一段。
+        val blocks = listOf(
+            tb(0, "被切开的半行", 300f, 0f, 520f, 60f),
+            tb(1, "下半句台词", 300f, 80f, 520f, 140f)
+        )
+        val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 2400)
+        assertEquals(2, merged.size)
+    }
+
+    @Test
+    fun normalParagraphStillMergesWhenFarFromPageEdge() {
+        val blocks = listOf(
+            tb(0, "上半句台词", 100f, 100f, 600f, 160f),
+            tb(1, "下半句台词", 300f, 180f, 520f, 240f)
+        )
+        val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 2400)
+        assertEquals(1, merged.size)
+        assertTrue(merged[0].text.contains("上半句"))
+        assertTrue(merged[0].text.contains("下半句"))
+    }
+
+    @Test
     fun keepsFarApartBlocksSeparate() {
         // 三个不相关的文本块不应被合并
         val blocks = listOf(
@@ -66,11 +162,11 @@ class PaddleOcrBlockMergerTest {
     fun mergedGroupDropsPolygonToAvoidWrongTilt() {
         // 多框合并出来的段落只在**倾角一致**时才保留四边形（2026-10-14）；只要有一框角度不同，
         // 硬带其中一个框的倾角就会让遮罩歪掉 —— 这种情况必须丢掉四边形。
-        val tilted = listOf(QuadPoint(0f, 0f), QuadPoint(100f, 10f), QuadPoint(100f, 60f), QuadPoint(0f, 50f))
-        val flat = listOf(QuadPoint(0f, 80f), QuadPoint(100f, 80f), QuadPoint(100f, 140f), QuadPoint(0f, 140f))
+        val tilted = listOf(QuadPoint(0f, 10f), QuadPoint(100f, 20f), QuadPoint(100f, 70f), QuadPoint(0f, 60f))
+        val flat = listOf(QuadPoint(0f, 90f), QuadPoint(100f, 90f), QuadPoint(100f, 150f), QuadPoint(0f, 150f))
         val blocks = listOf(
-            tb(0, " first ", 0f, 0f, 100f, 60f).copy(polygon = tilted),
-            tb(1, " second ", 0f, 80f, 100f, 140f).copy(polygon = flat)
+            tb(0, " first ", 0f, 10f, 100f, 70f).copy(polygon = tilted),
+            tb(1, " second ", 0f, 90f, 100f, 150f).copy(polygon = flat)
         )
         val merged = PaddleOcrBlockMerger.mergeBlocks(blocks, 1080, 2400)
         assertEquals(1, merged.size)

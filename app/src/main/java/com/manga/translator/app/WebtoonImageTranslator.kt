@@ -582,6 +582,19 @@ class WebtoonImageTranslator(
         // 历史实现只有汇总计数（`owned=N dropped=M`），分不清是哪个框被丢。
         // 下标与 `seam_boxes` 的 dN 一一对应。
         timer.mark("seam_verdict", seamPlan.verdicts.mapIndexed { index, v -> "d$index=$v" }.joinToString(" "))
+        // 成组明细（2026-10-30）：ML Kit 分块/接缝重叠区重复检测时，光看 grouped_region
+        // 计数不知道合并了哪些文本；这里把成员原文与框打出来，用于核对「越合越长」。
+        val groupedDetails = seamPlan.verdicts.withIndex()
+            .filter { (_, verdict) -> verdict == "grouped_region" || verdict == "grouped_body" }
+            .take(8)
+            .map { (index, verdict) ->
+                val detection = detections[index]
+                "$verdict:d$index=[${detection.bubble.originalText.replace('\n', '⏎').take(18)}]" +
+                    "@${detection.outer.top.toInt()}~${detection.outer.bottom.toInt()}"
+            }
+        if (groupedDetails.isNotEmpty()) {
+            timer.mark("seam_group", groupedDetails.joinToString(" "))
+        }
         // 条带是否够长（2026-10-03）：跨缝框的底边一旦**顶到拼接图底边**，说明下条带里的
         // 内容被切在条带边界上 —— OCR 拿到的是被截断的半句（真机实测 `…접속게이트로 돌`，
         // 译文因此串味），而且移交深度不够 → 下一张图又会认领一次（缝上两层译文）。
@@ -2738,7 +2751,12 @@ class WebtoonImageTranslator(
                 ServiceLocator.bubbleRegionDetector.detect(bitmap)
             }
             val blocks = async(ioDispatcher) {
-                ServiceLocator.localTextDetector.detect(bitmap, settings.sourceLanguage)
+                ServiceLocator.localTextDetector.detect(
+                    bitmap = bitmap,
+                    sourceLanguageId = settings.sourceLanguage,
+                    seamTopPx = topLimit.roundToInt().coerceIn(0, bitmap.height),
+                    seamBottomPx = bottomLimit.roundToInt().coerceIn(0, bitmap.height)
+                )
             }
             regions.await() to blocks.await()
         }
@@ -2820,6 +2838,21 @@ class WebtoonImageTranslator(
         timer.mark(
             "bubble_first_result_stats",
             "regions=${bubbleRegions.size} assignments=${assignments.size} final=${bubbles.size}"
+        )
+        // 合并诊断（2026-10-31）：`merged=N` = 本轮把「气泡外紧接的续行」收编进气泡的个数。
+        // 用户反馈「同一句被拆成两块」时，先看这里是不是 0；是 0 说明没命中续行判据
+        // （收尾标点/垂直间隙/对齐），再看 `ocr_blocks_all` 两块的实际框。
+        timer.mark(
+            "bubble_continuation_merge",
+            "merged=${routing.bubbleAssignments.count { it.region.source.contains("+continuation") }}"
+        )
+        // 最终分组文本（排障用）：`原文@x,y` —— 直接对照「两句话是不是被并成一句」。
+        timer.mark(
+            "bubble_first_texts",
+            bubbles.joinToString(" ˌ ") { bubble ->
+                bubble.originalText.replace('\n', '⏎').take(18) +
+                    "@${bubble.x.toInt()},${bubble.y.toInt()}"
+            }
         )
         // 竖排判定原因（2026-09-30 用户反馈「横排三行韩文被排成竖排」）。
         //
@@ -3153,7 +3186,12 @@ class WebtoonImageTranslator(
         timer.mark(
             "sampled_colors",
             colors.entries.sortedBy { it.key }.joinToString(" ") { (index, color) ->
-                "b$index=#%06X/#%06X".format(color.textColor and 0xFFFFFF, color.bgColor and 0xFFFFFF)
+                "b$index=#%06X/#%06X(n=%d/%d)".format(
+                    color.textColor and 0xFFFFFF,
+                    color.bgColor and 0xFFFFFF,
+                    color.inkSamples,
+                    color.bgSamples
+                )
             }
         )
         timer.mark("erase_patch_count", "count=${patches.size}")

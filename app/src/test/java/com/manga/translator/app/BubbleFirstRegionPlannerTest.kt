@@ -42,6 +42,142 @@ class BubbleFirstRegionPlannerTest {
     }
 
     @Test
+    fun route_keepsSideLineOutsideWhenItOnlyPartiallyCoversBubble() {
+        val region = BubbleRegion(
+            id = 8,
+            left = 100f,
+            top = 100f,
+            right = 220f,
+            bottom = 280f,
+            regionType = BubbleRegionType.BUBBLE,
+            confidence = 0.9f,
+            source = "test"
+        )
+        val blocks = listOf(
+            block(1, "bubble line", 120f, 120f, 200f, 240f),
+            // 气泡旁边的一行：中心 x=230 落在区域外，覆盖率 1200/2800=43%（<55%）。
+            // 旧判据只看 overlapRatio>=18%，会把这行并进气泡台词。
+            block(2, "side note", 160f, 150f, 300f, 170f)
+        )
+
+        val routing = planner.route(listOf(region), blocks, 1080, 1920)
+
+        assertEquals(listOf("bubble line"), routing.bubbleAssignments.first().blocks.map { it.text })
+        assertEquals(
+            listOf("side note"),
+            routing.outsideAssignments.flatMap { it.blocks }.map { it.text }
+        )
+        assertTrue(routing.outsideBlocks.any { it.text == "side note" })
+    }
+
+    @Test
+    fun route_mergesOutsideContinuationLineBelowSolidBubble() {
+        val region = BubbleRegion(
+            id = 9,
+            left = 100f,
+            top = 100f,
+            right = 260f,
+            bottom = 155f,
+            regionType = BubbleRegionType.BUBBLE,
+            confidence = 0.9f,
+            source = "test"
+        )
+        val upper = block(1, "시스템이 나의 작명 솜씨를 알았는지,", 110f, 110f, 250f, 150f)
+        val lower = block(2, "작품명 지을 기회를 샘쳐 갔구나.", 170f, 160f, 300f, 200f)
+
+        val routing = planner.route(listOf(region), listOf(upper, lower), 1080, 1920)
+
+        assertEquals(1, routing.bubbleAssignments.size)
+        assertEquals(2, routing.bubbleAssignments.first().blocks.size)
+        assertTrue(routing.outsideAssignments.isEmpty())
+
+        val bubbles = planner.buildBubblesFromAssignment(
+            assignment = routing.bubbleAssignments.first(),
+            imageWidth = 1080,
+            imageHeight = 1920
+        )
+        assertEquals(1, bubbles.size)
+        assertEquals(
+            "시스템이 나의 작명 솜씨를 알았는지, 작품명 지을 기회를 샘쳐 갔구나.",
+            bubbles.first().originalText
+        )
+        assertEquals("solid", bubbles.first().bgType)
+        assertTrue(bubbles.first().regionId == "9")
+    }
+
+    @Test
+    fun route_keepsSideLineOutsideTheOpencvPaddingRing() {
+        val region = BubbleRegion(
+            id = 16,
+            left = 100f,
+            top = 100f,
+            right = 220f,
+            bottom = 280f,
+            regionType = BubbleRegionType.BUBBLE,
+            confidence = 0.9f,
+            source = "opencv_contour"
+        )
+        val inside = block(1, "bubble line", 120f, 120f, 200f, 240f)
+        // 中心 x=217.5 在原区域（含 6% 外扩）内，但已经在收掉一半外扩的框（103.6..216.4）外；
+        // 对含外扩的框覆盖率 55.6%，对收掉一半外扩的框只有 47.6% → 不能收编。
+        val side = block(2, "side note", 195f, 150f, 240f, 170f)
+
+        val routing = planner.route(listOf(region), listOf(inside, side), 1080, 1920)
+
+        assertEquals(listOf("bubble line"), routing.bubbleAssignments.first().blocks.map { it.text })
+        assertEquals(
+            listOf("side note"),
+            routing.outsideAssignments.flatMap { it.blocks }.map { it.text }
+        )
+    }
+
+    @Test
+    fun route_doesNotPullSideLineIntoBubbleEvenWithContinuationMarker() {
+        val region = BubbleRegion(
+            id = 15,
+            left = 100f,
+            top = 100f,
+            right = 220f,
+            bottom = 280f,
+            regionType = BubbleRegionType.BUBBLE,
+            confidence = 0.9f,
+            source = "test"
+        )
+        // 气泡台词以逗号收尾，但旁边这行与气泡在垂直方向大面积重叠 —— 是旁白，不是续行。
+        val upper = block(1, "bubble line,", 120f, 120f, 200f, 240f)
+        val side = block(2, "side note,", 160f, 150f, 300f, 170f)
+
+        val routing = planner.route(listOf(region), listOf(upper, side), 1080, 1920)
+
+        assertEquals(1, routing.bubbleAssignments.first().blocks.size)
+        assertEquals(
+            listOf("side note,"),
+            routing.outsideAssignments.flatMap { it.blocks }.map { it.text }
+        )
+    }
+
+    @Test
+    fun route_doesNotMergeOutsideLineWithoutContinuationMarker() {
+        val region = BubbleRegion(
+            id = 10,
+            left = 100f,
+            top = 100f,
+            right = 260f,
+            bottom = 155f,
+            regionType = BubbleRegionType.BUBBLE,
+            confidence = 0.9f,
+            source = "test"
+        )
+        val upper = block(1, "문장이 끝났다.", 110f, 110f, 250f, 150f)
+        val lower = block(2, "다른 문장이다.", 170f, 160f, 300f, 200f)
+
+        val routing = planner.route(listOf(region), listOf(upper, lower), 1080, 1920)
+
+        assertEquals(1, routing.bubbleAssignments.first().blocks.size)
+        assertEquals(1, routing.outsideAssignments.flatMap { it.blocks }.size)
+    }
+
+    @Test
     fun buildBubbleFromBlocks_keepsOutsideAsTransparentIndependentBubble() {
         val region = BubbleRegion(
             id = 3,

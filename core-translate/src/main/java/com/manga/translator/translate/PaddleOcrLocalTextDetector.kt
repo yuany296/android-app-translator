@@ -86,7 +86,22 @@ class PaddleOcrLocalTextDetector(
         })
     }
 
-    override fun detect(bitmap: Bitmap, sourceLanguageId: String): List<TextBlock> {
+    override fun detect(bitmap: Bitmap, sourceLanguageId: String): List<TextBlock> =
+        detectInternal(bitmap, sourceLanguageId, seamTopPx = 0, seamBottomPx = 0)
+
+    override fun detect(
+        bitmap: Bitmap,
+        sourceLanguageId: String,
+        seamTopPx: Int,
+        seamBottomPx: Int
+    ): List<TextBlock> = detectInternal(bitmap, sourceLanguageId, seamTopPx, seamBottomPx)
+
+    private fun detectInternal(
+        bitmap: Bitmap,
+        sourceLanguageId: String,
+        seamTopPx: Int,
+        seamBottomPx: Int
+    ): List<TextBlock> {
         if (!ensureOpenCvLoaded()) {
             Log.w(TAG, "paddle_engine_skip reason=opencv_unavailable")
             return emptyList()
@@ -95,7 +110,7 @@ class PaddleOcrLocalTextDetector(
         val engineReady = loadLock.withLock { ensureEngineReady(recKey) }
         if (!engineReady) return emptyList()
         return try {
-            runDetect(bitmap, recKey)
+            runDetect(bitmap, recKey, seamTopPx, seamBottomPx)
         } catch (err: Throwable) {
             Log.w(TAG, "paddle_detect_fail reason=${err.message?.take(400)}")
             emptyList()
@@ -133,7 +148,12 @@ class PaddleOcrLocalTextDetector(
         return ready
     }
 
-    private fun runDetect(bitmap: Bitmap, recKey: RecModelKey): List<TextBlock> {
+    private fun runDetect(
+        bitmap: Bitmap,
+        recKey: RecModelKey,
+        seamTopPx: Int,
+        seamBottomPx: Int
+    ): List<TextBlock> {
         val startedAt = System.currentTimeMillis()
         val srcW = bitmap.width
         val srcH = bitmap.height
@@ -278,8 +298,15 @@ class PaddleOcrLocalTextDetector(
             } + if (rawBlocks.size > MAX_LINE_PROBE) " …(+${rawBlocks.size - MAX_LINE_PROBE})" else ""
         )
 
-        // 4. 后聚合：把同一行/同一段落的碎片合并成完整句子（参考 translator 的 ocr-lines）
-        val merged = PaddleOcrBlockMerger.mergeBlocks(rawBlocks, srcW, srcH)
+        // 4. 后聚合：把同一行/同一段落的碎片合并成完整句子（参考 translator 的 ocr-lines）。
+        //    传入拼接图内部切缝：跨缝的两行不并段，贴缝的半行单独成组（2026-11-01）。
+        val merged = PaddleOcrBlockMerger.mergeBlocks(
+            blocks = rawBlocks,
+            imageWidth = srcW,
+            imageHeight = srcH,
+            seamTopPx = seamTopPx,
+            seamBottomPx = seamBottomPx
+        )
         val totalMs = System.currentTimeMillis() - startedAt
         Log.d(
             TAG,

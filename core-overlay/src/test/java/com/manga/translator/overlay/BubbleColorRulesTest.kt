@@ -43,6 +43,75 @@ class BubbleColorRulesTest {
         assertEquals(100, extractor.colorChroma(0xFF64C864.toInt()))
     }
 
+    // ------------------------------------------------------------------
+    // 采样密度（2026-10-31 用户反馈「有的时候颜色会不对」）
+    //
+    // ⚠️ 历史实现墨色步长是 `面积 / 8192`，实际采样数只有 ≈ 8192²/面积：
+    // 640×420 的框只有 ~280 个采样位置、几十个墨色像素，颜色会被抗锯齿/噪声带偏；
+    // 外圈采样超上限时直接截断，大框只剩上边一条边。这两条锁住修复后的口径。
+    // ------------------------------------------------------------------
+
+    @Test
+    fun inkSampleStepKeepsSamplingDenseForLargeBoxes() {
+        // 小框逐像素（与历史行为一致）
+        assertEquals(1, extractor.inkSampleStep(90, 90))
+        // 100×100 刚过上限：步长 2（2500 个采样点，仍远高于旧的「面积/8192」算法）
+        assertEquals(2, extractor.inkSampleStep(100, 100))
+        // 640×420：sqrt(268800/8192) = 5.73 → 6，采样位置 ≈ 106×70 = 7420（历史是 20×14）
+        assertEquals(6, extractor.inkSampleStep(640, 420))
+        // 1080×1920（整页长条）：约 16px 一格，仍能覆盖上万像素里的细笔画
+        val tall = extractor.inkSampleStep(1080, 1920)
+        assertTrue("长条图步长过大：$tall", tall in 1..24)
+        assertTrue(
+            "大框采样位置应接近上限",
+            (1080 / tall) * (1920 / tall) <= 8192 * 2
+        )
+    }
+
+    @Test
+    fun ringSamplingStrideSpreadsOverAllFourEdges() {
+        // 640×420 框（8% 环厚 33×12）：环像素 43080，按 6 取 1 → 7180 个样本
+        val stride = extractor.ringSampleStride(43080)
+        assertEquals(6, stride)
+        assertTrue(43080 / stride <= 8192)
+        // 小框不抽样，保持逐像素
+        assertEquals(1, extractor.ringSampleStride(2000))
+    }
+
+    // ------------------------------------------------------------------
+    // 实底气泡的容器边带（2026-11-01）：底色不再只从文字框外圈采。
+    // ------------------------------------------------------------------
+
+    @Test
+    fun solidBackgroundBandExcludesTextBoxAndKeepsMargin() {
+        // 容器 100..500，文字框 180..420：内缩 8%+8px = 32px → 边带 132..468；
+        // 文字框外扩 2px 后 178..422，边带仍有足够面积。
+        val boxes = extractor.solidBackgroundBandBoxes(
+            contentLeft = 180, contentTop = 180, contentRight = 420, contentBottom = 420,
+            regionLeft = 100, regionTop = 100, regionRight = 500, regionBottom = 500
+        )
+        assertTrue(boxes != null)
+        val b = boxes!!
+        assertEquals(132, b[0])
+        assertEquals(132, b[1])
+        assertEquals(468, b[2])
+        assertEquals(468, b[3])
+        assertEquals(178, b[4])
+        assertEquals(178, b[5])
+        assertEquals(422, b[6])
+        assertEquals(422, b[7])
+    }
+
+    @Test
+    fun solidBackgroundBandFallsBackWhenTextBoxFillsContainer() {
+        // 文字框几乎填满容器（只看得到 8px 内缩）：没有可靠边带 → null，调用方回退文字框环。
+        val boxes = extractor.solidBackgroundBandBoxes(
+            contentLeft = 100, contentTop = 100, contentRight = 300, contentBottom = 300,
+            regionLeft = 100, regionTop = 100, regionRight = 300, regionBottom = 300
+        )
+        assertEquals(null, boxes)
+    }
+
     @Test
     fun saturatedColorKeepsOriginalEvenOnWhiteBackground() {
         // 白底上的蓝字：对比度本就够 → 原色

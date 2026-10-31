@@ -27,10 +27,59 @@ class MlKitLocalTextDetector : LocalTextDetector {
             if (PaddleDetectionTiling.shouldTile(bitmap.width, bitmap.height, MAX_EDGE.toFloat())) {
                 detectTiled(recognizer, bitmap)
             } else {
-                detectScaled(recognizer, bitmap, offsetX = 0f, offsetY = 0f)
+                // 单趟也过一遍同一个合并器（2026-11-01）：短图没有分块，但同一句仍可能
+                // 被 ML Kit 拆成「完整多行块 + 近似单行块」；不合并就会在后续段落合并里
+                // 拼成两遍（真机 pageHash ca9603cd…）。
+                mergeSinglePass(detectScaled(recognizer, bitmap, offsetX = 0f, offsetY = 0f))
             }
         } finally {
             runCatching { recognizer.close() }
+        }
+    }
+
+    override fun detect(bitmap: Bitmap, sourceLanguageId: String, seamTopPx: Int, seamBottomPx: Int): List<TextBlock> {
+        val blocks = detect(bitmap, sourceLanguageId)
+        val seams = buildList {
+            if (seamTopPx in 1 until bitmap.height) add(seamTopPx.toFloat())
+            if (seamBottomPx in 1 until bitmap.height) add(seamBottomPx.toFloat())
+        }
+        // ML Kit 段落块可能同时包含缝上/缝下两行：按 lineBoxes 拆开，不重新 OCR。
+        return MlKitSeamSplitter.split(blocks, seams)
+    }
+
+    /**
+     * 单趟检测结果也走 [MlKitTiledBlockMerger]：短图没有分块，但 ML Kit 仍可能把同一句
+     * 拆成两个近似块；合并器只动「同框/近同框」的块，普通独立气泡不受影响。
+     * 没发生合并时原样返回，保留原 id/顺序。
+     */
+    private fun mergeSinglePass(blocks: List<TextBlock>): List<TextBlock> {
+        if (blocks.size <= 1) return blocks
+        val candidates = blocks.map { block ->
+            MlKitTiledBlockMerger.Candidate(
+                text = block.text,
+                left = block.left,
+                top = block.top,
+                right = block.right,
+                bottom = block.bottom,
+                lineCount = block.lineCount,
+                lineBoxes = block.lineBoxes,
+                tileIndex = 0
+            )
+        }
+        val merged = MlKitTiledBlockMerger.merge(candidates)
+        if (merged.size == blocks.size) return blocks
+        return merged.mapIndexed { index, candidate ->
+            TextBlock(
+                id = index,
+                text = candidate.text,
+                left = candidate.left,
+                top = candidate.top,
+                right = candidate.right,
+                bottom = candidate.bottom,
+                confidence = 0f,
+                lineCount = candidate.lineCount,
+                lineBoxes = candidate.lineBoxes
+            )
         }
     }
 
@@ -85,38 +134,35 @@ class MlKitLocalTextDetector : LocalTextDetector {
         }
         pool.shutdown()
         val candidates = mutableListOf<MlKitTiledBlockMerger.Candidate>()
-        var added = 0
-        for ((index, range) in ranges.withIndex()) {
+        var rawCount = 0
+        for (index in ranges.indices) {
             val blocks = tileResults[index].first
+            rawCount += blocks.size
             for (block in blocks) {
-                val candidate = MlKitTiledBlockMerger.Candidate(
+                candidates += MlKitTiledBlockMerger.Candidate(
                     text = block.text,
                     left = block.left,
                     top = block.top,
                     right = block.right,
                     bottom = block.bottom,
                     lineCount = block.lineCount,
-                    lineBoxes = block.lineBoxes
+                    lineBoxes = block.lineBoxes,
+                    tileIndex = index
                 )
-                if (candidates.none { existing ->
-                        MlKitTiledBlockMerger.boxIoU(existing, candidate) >=
-                            MlKitTiledBlockMerger.MERGE_IOU_THRESHOLD
-                    }
-                ) {
-                    candidates += candidate
-                    added += 1
-                }
             }
         }
+        val merged = MlKitTiledBlockMerger.merge(candidates)
         Log.d(
             TAG,
             "mlkit_det_tiled tiles=${ranges.size} axis=${if (horizontal) "x" else "y"} " +
                 "ranges=${ranges.joinToString(",") { "${it.start}-${it.endExclusive}" }} " +
-                "blocks=$added img=${bitmap.width}x${bitmap.height} " +
+                "raw=$rawCount blocks=${merged.size} " +
+                "tileBlocks=${tileResults.joinToString("/") { it.first.size.toString() }} " +
+                "img=${bitmap.width}x${bitmap.height} " +
                 "totalMs=${System.currentTimeMillis() - tileStartedAt} " +
                 "tileMs=${tileResults.joinToString("/") { it.second.toString() }}"
         )
-        return candidates.mapIndexed { index, candidate ->
+        return merged.mapIndexed { index, candidate ->
             TextBlock(
                 id = index,
                 text = candidate.text,

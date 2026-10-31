@@ -152,6 +152,9 @@ class SettingsRepository(context: Context) {
         if (getLastTranslateProfileName() == source) {
             editor.putString(KEY_LAST_TRANSLATE_PROFILE_NAME, target)
         }
+        if (getLastTermProfileName() == source) {
+            editor.putString(KEY_LAST_TERM_PROFILE_NAME, target)
+        }
         editor.apply()
         return RenameProfileResult.SUCCESS
     }
@@ -172,6 +175,9 @@ class SettingsRepository(context: Context) {
         }
         if (getLastTranslateProfileName() == trimmed) {
             editor.putString(KEY_LAST_TRANSLATE_PROFILE_NAME, "")
+        }
+        if (getLastTermProfileName() == trimmed) {
+            editor.putString(KEY_LAST_TERM_PROFILE_NAME, "")
         }
         editor.apply()
         return getProfileNames()
@@ -295,6 +301,21 @@ class SettingsRepository(context: Context) {
 
     fun setLastTranslateProfileName(name: String) {
         prefs.edit().putString(KEY_LAST_TRANSLATE_PROFILE_NAME, name.trim()).apply()
+    }
+
+    /**
+     * 「AI 术语提取」用的档案指针（2026-10-31）。
+     *
+     * 与 [getLastOcrProfileName] 同构：**空 = 跟随翻译配置**，非空 = 用那个档案的
+     * 厂商 / Base URL / Key。存在的理由：翻译引擎切到百度或 ML Kit 时没有 OpenAI 兼容的
+     * key，术语提取就完全用不了；用户需要能单独给它指一个云端档案。
+     */
+    fun getLastTermProfileName(): String {
+        return prefs.getString(KEY_LAST_TERM_PROFILE_NAME, "")?.trim().orEmpty()
+    }
+
+    fun setLastTermProfileName(name: String) {
+        prefs.edit().putString(KEY_LAST_TERM_PROFILE_NAME, name.trim()).apply()
     }
 
     fun getBaiduOcrUsage(limit: Int = BAIDU_OCR_MONTHLY_LIMIT): MonthlyQuotaUsage {
@@ -427,6 +448,7 @@ class SettingsRepository(context: Context) {
         const val KEY_LAST_PROFILE_NAME = "last_profile_name"
         const val KEY_LAST_OCR_PROFILE_NAME = "last_ocr_profile_name"
         const val KEY_LAST_TRANSLATE_PROFILE_NAME = "last_translate_profile_name"
+        const val KEY_LAST_TERM_PROFILE_NAME = "last_term_profile_name"
         const val KEY_BAIDU_OCR_MONTH = "baidu_ocr_month"
         const val KEY_BAIDU_OCR_MONTH_COUNT = "baidu_ocr_month_count"
         const val KEY_OCR_ENGINE = "ocr_engine"

@@ -1,6 +1,8 @@
 package com.manga.translator.app
 
 import com.manga.translator.translate.NonTranslatableText
+import com.manga.translator.translate.TextBlock
+import com.manga.translator.translate.TextLayoutMetrics
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -95,6 +97,7 @@ internal object SeamFragmentGroups {
                 val indices = members.sorted()
                 if (indices.size < MIN_REGION_FRAGMENTS) return@forEach
                 val items = indices.map { detections[it] }
+                if (!regionGroupCompatible(items)) return@forEach
                 if (!groupFitsSeamWindow(items, config)) return@forEach
                 if (!isAnchored(items, config, canvasWidth, canvasHeight)) return@forEach
                 groups += Group(
@@ -193,6 +196,43 @@ internal object SeamFragmentGroups {
         val lowerRotation = ordered[1].bubble.rotationDeg ?: 0f
         return abs(upperRotation - lowerRotation) <= BODY_MAX_ROTATION_DELTA_DEG
     }
+
+    /**
+     * region 组的额外安全闸（Android 特有）：`BubbleRegion` 的「同一个容器」可能是一个
+     * 大亮区，里面被拆成多个独立气泡；不能像参考项目那样只凭 region_id 无条件合并。
+     *
+     * 要求相邻碎片：
+     * - 每行字高比 ≥ [MIN_REGION_LINE_HEIGHT_RATIO]（字号不能差太多）；
+     * - 水平重叠 ≥ [MIN_REGION_HORIZONTAL_OVERLAP]（同一列，挡并排的另一段）。
+     *
+     * 韩文横排优先；竖排整列跨页不在本阶段范围。
+     */
+    fun regionGroupCompatible(items: List<SeamDetection>): Boolean {
+        if (items.size <= 1) return true
+        val ordered = items.sortedWith(compareBy<SeamDetection> { it.outer.top }.thenBy { it.outer.left })
+        for (index in 1 until ordered.size) {
+            val previous = ordered[index - 1]
+            val current = ordered[index]
+            val prevLine = previous.outer.height /
+                SeamTuning.lineCountOf(previous.bubble).coerceAtLeast(1)
+            val curLine = current.outer.height /
+                SeamTuning.lineCountOf(current.bubble).coerceAtLeast(1)
+            if (prevLine > 0f && curLine > 0f) {
+                val ratio = min(prevLine, curLine) / max(prevLine, curLine)
+                if (ratio < MIN_REGION_LINE_HEIGHT_RATIO) return false
+            }
+            if (previous.outer.horizontalOverlapRatio(current.outer) < MIN_REGION_HORIZONTAL_OVERLAP) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /** region 组相邻碎片每行字高的最小比例。 */
+    const val MIN_REGION_LINE_HEIGHT_RATIO = 0.35f
+
+    /** region 组相邻碎片的最小水平重叠（占较窄块）。 */
+    const val MIN_REGION_HORIZONTAL_OVERLAP = 0.25f
 
     /**
      * 参考项目 `groupFitsSeamWindow`：整组高度 ≤ 上限，且按纵向排序后相邻块间隙
@@ -305,10 +345,26 @@ internal object SeamFragmentGroups {
         val bothSolid = ordered.all { it.bubble.bgType.equals("solid", ignoreCase = true) }
         val regionIds = ordered.mapNotNull { it.bubble.regionId?.takeIf(String::isNotBlank) }.distinct()
         val regionTypes = ordered.mapNotNull { it.bubble.regionType?.takeIf(String::isNotBlank) }.distinct()
-        val text = ordered.map { it.bubble.originalText.trim() }
+        // OCR 分块/接缝重叠区可能把同一句检测两次（框略有偏移，IoU 不高）。它们不能
+        // 重复计入原文与行数，否则「文字越合越长」、sourceLineCount 虚高把气泡撑长。
+        val uniqueTextItems = mutableListOf<SeamDetection>()
+        ordered.forEach { item ->
+            val duplicateIndex = uniqueTextItems.indexOfFirst { existing ->
+                sameGroupText(existing.bubble.originalText, item.bubble.originalText) &&
+                    boxOverlapRatio(existing.outer, item.outer) >= MIN_DUPLICATE_BOX_OVERLAP
+            }
+            if (duplicateIndex < 0) {
+                uniqueTextItems += item
+            } else if (item.bubble.originalText.length >
+                uniqueTextItems[duplicateIndex].bubble.originalText.length
+            ) {
+                uniqueTextItems[duplicateIndex] = item
+            }
+        }
+        val text = uniqueTextItems.map { it.bubble.originalText.trim() }
             .filter { it.isNotEmpty() }
             .joinToString("\n")
-        val lineCount = ordered.sumOf { SeamTuning.lineCountOf(it.bubble) }
+        val lineCount = mergedLineCount(uniqueTextItems)
         val lineBoxes = ordered.flatMap { it.bubble.lineBoxes.orEmpty() }
             .takeIf { it.isNotEmpty() }
         val rotations = ordered.mapNotNull { it.bubble.rotationDeg }
@@ -346,6 +402,55 @@ internal object SeamFragmentGroups {
 
     private fun crosses(box: SeamBox, seam: Float): Boolean =
         box.top < seam && box.bottom > seam
+
+    /**
+     * 合并后的行数：
+     * - 各碎片都有逐行框（ML Kit 正常路径）→ 用**视觉行数**统计，重叠的重复行只算一行；
+     * - 任一碎片缺逐行框（Paddle 合并块/老数据）→ 退回「各碎片行数相加」（阶段 1 口径）。
+     *
+     * 为什么不能无条件相加：ML Kit 分块/接缝重叠区会把同一行报两次（框略偏移），
+     * 相加会把 1 行算成 2 行 → 气泡高度/盖板被撑长。
+     */
+    private fun mergedLineCount(items: List<SeamDetection>): Int {
+        val fallback = items.sumOf { SeamTuning.lineCountOf(it.bubble) }
+        if (items.any { it.bubble.lineBoxes.isNullOrEmpty() }) return fallback
+        val blocks = mutableListOf<TextBlock>()
+        items.forEach { item ->
+            item.bubble.lineBoxes.orEmpty().forEach { lb ->
+                if (lb.size >= 4) {
+                    blocks += TextBlock(
+                        id = blocks.size,
+                        text = "",
+                        left = lb[0],
+                        top = lb[1],
+                        right = lb[2],
+                        bottom = lb[3],
+                        lineCount = 1
+                    )
+                }
+            }
+        }
+        if (blocks.isEmpty()) return fallback
+        val visual = TextLayoutMetrics.countVisualLines(blocks)
+        return visual.coerceIn(1, fallback.coerceAtLeast(1))
+    }
+
+    /** 重复文本判定：去掉空白/标点后相同（韩文助词/标点差异不影响）。 */
+    private fun sameGroupText(left: String, right: String): Boolean {
+        val a = left.filter { it.isLetterOrDigit() }.lowercase()
+        val b = right.filter { it.isLetterOrDigit() }.lowercase()
+        return a.isNotEmpty() && a == b
+    }
+
+    /** 两框交集 / 较小框面积：判断「同一块重复检测」而不是上下相邻两行。 */
+    private fun boxOverlapRatio(left: SeamBox, right: SeamBox): Float {
+        val smaller = min(left.area, right.area)
+        if (smaller <= 0f) return 0f
+        return left.intersectionArea(right) / smaller
+    }
+
+    /** 同文重复框的最小重叠（占较小框）；低于它更可能是两个独立的同文本气泡。 */
+    const val MIN_DUPLICATE_BOX_OVERLAP = 0.30f
 
     private fun touchesFromAbove(box: SeamBox, seam: Float, window: Float): Boolean =
         box.bottom <= seam + 0.5f && box.bottom >= seam - window

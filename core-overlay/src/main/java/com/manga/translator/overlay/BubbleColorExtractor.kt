@@ -4,6 +4,9 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.BubbleGeometry
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.sqrt
 
 data class BubbleColors(
@@ -19,14 +22,18 @@ data class BubbleColors(
      */
     val originalHadOutline: Boolean = false,
     /**
-     * 外圈一致率（0..1）：文字框外圈采样里，贴着采样底色（距离 ≤ 24）的像素占比。
+     * 外圈/容器边带一致率（0..1）：采样里贴着采样底色（距离 ≤ 24）的像素占比。
      *
      * 为什么要它（2026-10-13 用户反馈「这个截页处的气泡框是纯色背景，但是它用的是清理图。
      * 希望处理为 solid」）：区域检测没命中时气泡一律被当成复杂背景（`bg_type=none`），
      * 盖板从**清理图**（inpaint 产物）裁切 —— 白气泡边上于是出现擦不干净的灰痕。
      * 外圈一致率就是「这一圈到底是不是一条平底色」的量测值，见 [flatBackground]。
      */
-    val bgCoverage: Float = 0f
+    val bgCoverage: Float = 0f,
+    /** 墨色采样到的像素数（诊断用；太少说明颜色是退化值，见 `sampled_colors` 日志）。 */
+    val inkSamples: Int = 0,
+    /** 底色采样到的像素数（诊断用；实底气泡走容器边带，样本数应足够）。 */
+    val bgSamples: Int = 0
 ) {
     /**
      * 这块底是不是一条「亮的平底色」→ 允许把盖板换成纯色平涂（`bg_type=solid`），
@@ -40,7 +47,9 @@ data class BubbleColors(
 /** 外圈采样结果：底色 + 一致率（见 [BubbleColors.bgCoverage]）。 */
 data class BubbleBackground(
     val color: Int,
-    val coverage: Float
+    val coverage: Float,
+    /** 参与统计的采样像素数（诊断用）。 */
+    val samples: Int = 0
 ) {
     /** 这条外圈量出来是「亮的平底色」→ 可以把盖板换成纯色平涂（见 [BubbleColors.flatBackground]）。 */
     val flatBackground: Boolean
@@ -55,7 +64,7 @@ internal const val INK_BUCKET_COUNT = 64 * 64 * 64
 
 /**
  * 参考 C:\homework\translator 的 kakaopage 设计（`extension/src/rendering/bubble-colors.js`）：
- * 1. 背景色 = 文字框边框区域各通道中值；
+ * 1. 背景色 = 纯色气泡取「容器内边带」、其余取文字框外圈，4bit 众数桶 + 桶内均值；
  * 2. 墨色 = 与背景 RGB 欧氏距离 >= 42 的像素，量化到 24 级桶取主导桶中心（支持彩色文字）；
  * 3. 可读性：墨色与背景对比度 >= 4.5 **或彩色（色度 >= 40）** 时保留原墨色
  *    （彩色字的可读性由必渲染的描边保证），否则取对比度更高的纯黑/纯白；
@@ -97,7 +106,7 @@ class BubbleColorExtractor {
         val boxW = right - left
         val boxH = bottom - top
 
-        val sampled = sampleBackgroundColor(bitmap, left, top, right, bottom, boxW, boxH)
+        val sampled = sampleBackgroundForBubble(bitmap, bubble, left, top, right, bottom, boxW, boxH)
             ?: return fallbackColors()
         val bgColor = sampled.color
         val inkColor = sampleInkColor(bitmap, left, top, right, bottom, bgColor)
@@ -112,7 +121,147 @@ class BubbleColorExtractor {
             strokeColor = strokeColor,
             bgColor = bgColor,
             originalHadOutline = originalHadOutline(inkColor, textColor),
-            bgCoverage = sampled.coverage
+            bgCoverage = sampled.coverage,
+            inkSamples = inkColor.inkPixels,
+            bgSamples = sampled.samples
+        )
+    }
+
+    /**
+     * 底色采样源选择（2026-11-01）：
+     *
+     * - `bgType=solid`：优先从**气泡容器内边带**采（容器框内缩 8%+8px，排除文字框），
+     *   因为文字框紧贴字形，外圈容易被笔画/描边污染；边带是真正的气泡底色。
+     * - 其他（旁白/复杂背景）：保持原来的文字框外圈采样。
+     *
+     * 边距不足、样本不够时都回退原路径 —— 不改变行为，只是多一次有上限的尝试。
+     */
+    private fun sampleBackgroundForBubble(
+        bitmap: Bitmap,
+        bubble: Bubble,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+        boxW: Int,
+        boxH: Int
+    ): BubbleBackground? {
+        if (bubble.bgType.equals("solid", ignoreCase = true)) {
+            sampleSolidBackgroundBand(bitmap, bubble, left, top, right, bottom)?.let { return it }
+        }
+        return sampleBackgroundColor(bitmap, left, top, right, bottom, boxW, boxH)
+    }
+
+    /**
+     * 实底气泡：从「容器框内缩后的边带 − 文字框」采样。
+     *
+     * 采样点有上限（[MAX_BAND_SAMPLES]），按边带面积开方取步长；边带太窄或样本不足返回 null，
+     * 调用方回退文字框环。纯像素读取，不新增 OCR/翻译请求。
+     */
+    private fun sampleSolidBackgroundBand(
+        bitmap: Bitmap,
+        bubble: Bubble,
+        contentLeft: Int,
+        contentTop: Int,
+        contentRight: Int,
+        contentBottom: Int
+    ): BubbleBackground? {
+        val outer = BubbleGeometry.outerRect(bubble)
+        val regionLeft = ((outer.left / 100f) * bitmap.width).toInt().coerceIn(0, bitmap.width - 1)
+        val regionTop = ((outer.top / 100f) * bitmap.height).toInt().coerceIn(0, bitmap.height - 1)
+        val regionRight = ((outer.right / 100f) * bitmap.width).toInt().coerceIn(regionLeft + 1, bitmap.width)
+        val regionBottom = ((outer.bottom / 100f) * bitmap.height).toInt().coerceIn(regionTop + 1, bitmap.height)
+        val boxes = solidBackgroundBandBoxes(
+            contentLeft = contentLeft,
+            contentTop = contentTop,
+            contentRight = contentRight,
+            contentBottom = contentBottom,
+            regionLeft = regionLeft,
+            regionTop = regionTop,
+            regionRight = regionRight,
+            regionBottom = regionBottom
+        ) ?: return null
+        val bandLeft = boxes[0]
+        val bandTop = boxes[1]
+        val bandRight = boxes[2]
+        val bandBottom = boxes[3]
+        val textLeft = boxes[4]
+        val textTop = boxes[5]
+        val textRight = boxes[6]
+        val textBottom = boxes[7]
+        val bandArea = (bandRight - bandLeft).toLong() * (bandBottom - bandTop).toLong()
+        val stride = ceil(sqrt(bandArea.toDouble() / MAX_BAND_SAMPLES)).toInt().coerceAtLeast(1)
+        val rs = IntArray(MAX_BAND_SAMPLES)
+        val gs = IntArray(MAX_BAND_SAMPLES)
+        val bs = IntArray(MAX_BAND_SAMPLES)
+        var count = 0
+        var y = bandTop
+        while (y < bandBottom) {
+            var x = bandLeft
+            while (x < bandRight) {
+                val inText = x >= textLeft && x < textRight && y >= textTop && y < textBottom
+                if (!inText) {
+                    val pixel = bitmap.getPixel(x, y)
+                    if (Color.alpha(pixel) >= ALPHA_THRESHOLD && count < rs.size) {
+                        rs[count] = (pixel shr 16) and 0xFF
+                        gs[count] = (pixel shr 8) and 0xFF
+                        bs[count] = pixel and 0xFF
+                        count++
+                    }
+                }
+                x += stride
+            }
+            y += stride
+        }
+        if (count < MIN_BG_SAMPLES) return null
+        return backgroundFromSamples(rs, gs, bs, count)
+    }
+
+    /**
+     * 容器边带框（像素，左闭右开）：
+     * `[bandLeft, bandTop, bandRight, bandBottom, textLeft, textTop, textRight, textBottom]`。
+     *
+     * 返回 null = 边距太窄（文字框几乎填满容器），调用方回退文字框环。
+     * 纯函数，便于 JVM 单测（不依赖 Bitmap）。
+     */
+    internal fun solidBackgroundBandBoxes(
+        contentLeft: Int,
+        contentTop: Int,
+        contentRight: Int,
+        contentBottom: Int,
+        regionLeft: Int,
+        regionTop: Int,
+        regionRight: Int,
+        regionBottom: Int
+    ): IntArray? {
+        val regionW = regionRight - regionLeft
+        val regionH = regionBottom - regionTop
+        if (regionW < MIN_BAND_REGION_PX || regionH < MIN_BAND_REGION_PX) return null
+        val insetX = max(MIN_BAND_INSET_PX, (regionW * BAND_INSET_RATIO).toInt())
+        val insetY = max(MIN_BAND_INSET_PX, (regionH * BAND_INSET_RATIO).toInt())
+        val bandLeft = regionLeft + insetX
+        val bandTop = regionTop + insetY
+        val bandRight = regionRight - insetX
+        val bandBottom = regionBottom - insetY
+        if (bandRight - bandLeft < 2 || bandBottom - bandTop < 2) return null
+        val textLeft = contentLeft - BAND_TEXT_PAD_PX
+        val textTop = contentTop - BAND_TEXT_PAD_PX
+        val textRight = contentRight + BAND_TEXT_PAD_PX
+        val textBottom = contentBottom + BAND_TEXT_PAD_PX
+        val overlapLeft = max(bandLeft, textLeft)
+        val overlapTop = max(bandTop, textTop)
+        val overlapRight = min(bandRight, textRight)
+        val overlapBottom = min(bandBottom, textBottom)
+        val overlapArea = if (overlapRight > overlapLeft && overlapBottom > overlapTop) {
+            (overlapRight - overlapLeft).toLong() * (overlapBottom - overlapTop).toLong()
+        } else {
+            0L
+        }
+        val bandArea = (bandRight - bandLeft).toLong() * (bandBottom - bandTop).toLong()
+        if (bandArea - overlapArea < MIN_BAND_AREA_PX) return null
+        return intArrayOf(
+            bandLeft, bandTop, bandRight, bandBottom,
+            textLeft, textTop, textRight, textBottom
         )
     }
 
@@ -138,23 +287,32 @@ class BubbleColorExtractor {
     ): BubbleBackground? {
         val thicknessX = (boxW * RING_RATIO).toInt().coerceAtLeast(1)
         val thicknessY = (boxH * RING_RATIO).toInt().coerceAtLeast(1)
-        val rs = IntArray((boxW * 2 * thicknessY + boxH * 2 * thicknessX).coerceAtMost(MAX_BG_SAMPLES))
+        // ⚠️ 历史实现：数组只开 MAX_BG_SAMPLES 格，先遍历上/下边、再遍历左/右边，
+        // 环像素超上限时**直接丢弃**剩余部分 —— 大框只剩上边一条（640×420 的框里
+        // 上边就已占满 8192），底色于是被「上边框/相邻画面」带偏，墨色距离筛选也跟着偏。
+        // 改为按固定间隔对整条环抽样：四条边都参与，样本数仍受 8192 约束。
+        val estimatedRing = boxW * 2 * thicknessY + boxH * 2 * thicknessX
+        val ringStride = ringSampleStride(estimatedRing)
+        val rs = IntArray(estimatedRing.coerceAtMost(MAX_BG_SAMPLES).coerceAtLeast(1))
         val gs = IntArray(rs.size)
         val bs = IntArray(rs.size)
         var count = 0
+        var seen = 0
+        fun addRingPixel(pixel: Int) {
+            if (Color.alpha(pixel) < ALPHA_THRESHOLD) return
+            if (seen++ % ringStride != 0) return
+            if (count >= rs.size) return
+            rs[count] = (pixel shr 16) and 0xFF
+            gs[count] = (pixel shr 8) and 0xFF
+            bs[count] = pixel and 0xFF
+            count++
+        }
         for (y in top until bottom) {
             val inTopRing = y < top + thicknessY
             val inBottomRing = y >= bottom - thicknessY
             if (!inTopRing && !inBottomRing) continue
             for (x in left until right) {
-                val pixel = bitmap.getPixel(x, y)
-                if (Color.alpha(pixel) < ALPHA_THRESHOLD) continue
-                if (count < rs.size) {
-                    rs[count] = (pixel shr 16) and 0xFF
-                    gs[count] = (pixel shr 8) and 0xFF
-                    bs[count] = pixel and 0xFF
-                    count++
-                }
+                addRingPixel(bitmap.getPixel(x, y))
             }
         }
         for (x in left until right) {
@@ -162,21 +320,27 @@ class BubbleColorExtractor {
             val inRightRing = x >= right - thicknessX
             if (!inLeftRing && !inRightRing) continue
             for (y in top until bottom) {
-                val pixel = bitmap.getPixel(x, y)
-                if (Color.alpha(pixel) < ALPHA_THRESHOLD) continue
-                if (count < rs.size) {
-                    rs[count] = (pixel shr 16) and 0xFF
-                    gs[count] = (pixel shr 8) and 0xFF
-                    bs[count] = pixel and 0xFF
-                    count++
-                }
+                addRingPixel(bitmap.getPixel(x, y))
             }
         }
         if (count < MIN_BG_SAMPLES) return null
-        // 主导色桶（2026-10-11 用户：「白气泡上贴了一块灰的」）：环采样常被污染 ——
-        // 框比气泡的锯齿轮廓大时，底部环采到气泡外的灰天空；逐通道中位数取到
-        // 「白 × 灰」的混合色 → 盖板变成灰的。改为 4bit/通道量化取**众数桶**，
-        // 再对桶内真实像素求均值：纯净环时与中位数一致，被污染时众数 = 气泡真正的底色。
+        return backgroundFromSamples(rs, gs, bs, count)
+    }
+
+    /**
+     * 由采样像素求主导底色 + 一致率（环采样与容器边带共用）。
+     *
+     * 主导色桶（2026-10-11 用户：「白气泡上贴了一块灰的」）：环采样常被污染 ——
+     * 框比气泡的锯齿轮廓大时，底部环采到气泡外的灰天空；逐通道中位数取到
+     * 「白 × 灰」的混合色 → 盖板变成灰的。改为 4bit/通道量化取**众数桶**，
+     * 再对桶内真实像素求均值：纯净环时与中位数一致，被污染时众数 = 气泡真正的底色。
+     */
+    private fun backgroundFromSamples(
+        rs: IntArray,
+        gs: IntArray,
+        bs: IntArray,
+        count: Int
+    ): BubbleBackground? {
         val bucketCounts = IntArray(BG_BUCKET_COUNT)
         val bucketR = IntArray(BG_BUCKET_COUNT)
         val bucketG = IntArray(BG_BUCKET_COUNT)
@@ -198,8 +362,8 @@ class BubbleColorExtractor {
         val bestCount = bucketCounts[best]
         if (bestCount == 0) return null
         val color = Color.rgb(bucketR[best] / bestCount, bucketG[best] / bestCount, bucketB[best] / bestCount)
-        // 外圈一致率（2026-10-13）：贴着主导色的采样像素占比。这是「这块底是不是一条平底色」
-        // 的唯一量测依据（见 [BubbleColors.flatBackground]），所以直接在**原始环采样**上算 ——
+        // 一致率：贴着主导色的采样像素占比。这是「这块底是不是一条平底色」
+        // 的唯一量测依据（见 [BubbleColors.flatBackground]），所以直接在**原始采样**上算 ——
         // 与主导色同源，纯净白气泡 ≈ 1.0，被插画/网点污染的外圈会明显低于阈值。
         val ring = IntArray(count)
         for (index in 0 until count) {
@@ -207,7 +371,8 @@ class BubbleColorExtractor {
         }
         return BubbleBackground(
             color = color,
-            coverage = BubbleBackgroundPolicy.ringCoverage(ring, count, color)
+            coverage = BubbleBackgroundPolicy.ringCoverage(ring, count, color),
+            samples = count
         )
     }
 
@@ -248,7 +413,11 @@ class BubbleColorExtractor {
         // 描边证据：在「离背景足够远」的像素里，近白/近黑的各有多少（见 [originalHadOutline]）。
         var nearWhite = 0
         var nearBlack = 0
-        val step = ((right - left) * (bottom - top) / MAX_INK_SAMPLES).coerceAtLeast(1)
+        // ⚠️ 历史实现是 `area / MAX_INK_SAMPLES`，实际采样数 ≈ MAX² / area：
+        // 640×420 的框只剩 20×14 个位置、真正的墨色像素只有几十个（同一张图里的深蓝字
+        // #143C6E 会被采成 #42628A），大旁白/合并块更稀。按面积开方取步长，样本数才真的
+        // 落在 8192 附近；小框仍然逐像素（开方后为 1）。
+        val step = inkSampleStep(right - left, bottom - top)
         var y = top
         while (y < bottom) {
             var x = left
@@ -354,6 +523,30 @@ class BubbleColorExtractor {
         val cg = ((bucket shr 6) and 63) * QUANT_STEP + QUANT_STEP / 2
         val cb = (bucket and 63) * QUANT_STEP + QUANT_STEP / 2
         return Color.rgb(cr.coerceIn(0, 255), cg.coerceIn(0, 255), cb.coerceIn(0, 255))
+    }
+
+    /**
+     * 墨色采样步长（像素）。
+     *
+     * 目标：框内采样点数量 ≈ [MAX_INK_SAMPLES]，不为大框做无意义的逐像素扫描，也不能
+     * 像历史实现那样为了「不超过上限」把实际采样数压到上限的几十分之一。
+     * 步长 = ceil(sqrt(面积 / 上限))；积小于上限的小框仍返回 1（逐像素）。
+     */
+    internal fun inkSampleStep(width: Int, height: Int): Int {
+        val area = width.toLong().coerceAtLeast(1L) * height.toLong().coerceAtLeast(1L)
+        if (area <= MAX_INK_SAMPLES) return 1
+        return ceil(sqrt(area.toDouble() / MAX_INK_SAMPLES)).toInt().coerceAtLeast(1)
+    }
+
+    /**
+     * 外圈采样步长（每 N 个环像素取 1 个）。
+     *
+     * 环像素超过 [MAX_BG_SAMPLES] 时**均匀抽样**，而不是「先到先得、后面的全丢」——
+     * 后者在大框上只采到上边一条边，底色会偏向上边框/相邻画面。
+     */
+    internal fun ringSampleStride(ringSize: Int): Int {
+        if (ringSize <= MAX_BG_SAMPLES) return 1
+        return ((ringSize + MAX_BG_SAMPLES - 1) / MAX_BG_SAMPLES).coerceAtLeast(1)
     }
 
     /** `(r,g,b)` → 量化桶下标；值域恒在 `0 until INK_BUCKET_COUNT` 内（由单测锁定）。 */
@@ -470,6 +663,25 @@ class BubbleColorExtractor {
         const val RING_RATIO = 0.08f
         const val MAX_BG_SAMPLES = 8192
         const val MIN_BG_SAMPLES = 16
+
+        /**
+         * 容器边带采样上限：2048 足够求众数底色，又比文字框环的 8192 便宜 ——
+         * solid 气泡走边带时**替代**原环采样，总耗时反而更低。
+         */
+        const val MAX_BAND_SAMPLES = 2048
+
+        /** 实底气泡的容器边带：容器框先内缩 8%+8px，避开气泡描边。 */
+        const val BAND_INSET_RATIO = 0.08f
+        const val MIN_BAND_INSET_PX = 8
+
+        /** 文字框外扩 2px 再排除，避开抗锯齿笔画。 */
+        const val BAND_TEXT_PAD_PX = 2
+
+        /** 边带可用面积下限：文字框几乎填满容器时直接回退文字框环。 */
+        const val MIN_BAND_AREA_PX = 64L
+
+        /** 容器框最短边下限：太小不值得走容器边带。 */
+        const val MIN_BAND_REGION_PX = 24
         /** 背景主导色桶数：4bit/通道 → 16³（见 [sampleBackgroundMedian] 的众数桶口径）。 */
         const val BG_BUCKET_COUNT = 16 * 16 * 16
         const val MAX_INK_SAMPLES = 8192

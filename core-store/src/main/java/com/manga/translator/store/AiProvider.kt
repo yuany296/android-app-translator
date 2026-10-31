@@ -37,6 +37,20 @@ enum class AiProvider(
         // （不是千问的 enable_thinking，字段方言见 ThinkingSupport）。
         supportsThinking = true
     ),
+    OPENCODE_GO(
+        id = "opencode-go",
+        label = "OpenCode Go",
+        // Go 订阅的 OpenAI Chat Completions 端点（Console 文档 /console/harnesses#base-urls）：
+        //   https://opencode.ai/inference/go + /openai/v1/chat/completions
+        // 模型列表在 .../inference/go/v1/models（比 base URL 少一段 /openai），
+        // 由 core-translate 的 OpenCodeGoSupport 统一改写；不要手填 /chat/completions。
+        defaultBaseUrl = "https://opencode.ai/inference/go/openai/v1",
+        // 翻译 + 视觉 OCR 都够用：1M 上下文、支持图片输入、Go 月额度最高的一档。
+        // 其它 Chat Completions 模型可在「获取模型列表」里选（Responses/Messages 专属模型会被过滤）。
+        defaultModel = "deepseek-v4.1-flash",
+        // Go 的 DeepSeek 系默认会思考；关掉时发 `thinking:{"type":"disabled"}`（与官方 DeepSeek 同方言）。
+        supportsThinking = true
+    ),
     KIMI(
         id = "kimi",
         label = "Kimi",

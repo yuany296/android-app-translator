@@ -113,10 +113,119 @@ class BubbleFirstRegionPlanner {
             imageHeight = imageHeight,
             separatedByWhitespace = separatedByWhitespace
         )
-        return BubbleFirstRouting(
+        // 同一句被拆成「气泡内 + 气泡外一行」时，两边各自成块 → 分别翻译（用户 2026-10-31
+        // 反馈「同一句被拆成两块」）。参考项目的行聚类发生在**容器归属之前**，且
+        // `areLocalPaddleRegionsCompatible` 对「一边没有容器」直接判兼容；这里补上同口径的
+        // 收编：只收「实底气泡 + 气泡外、在下方、紧邻、上一块以逗号/省略号收尾」的一行。
+        // 不动「两个实底气泡之间」——那可能是两个角色的台词，宁可分开。
+        val (mergedBubbles, remainingOutside) = mergeOutsideContinuationsIntoBubbles(
             bubbleAssignments = bubbleAssignments,
             outsideAssignments = outsideAssignments,
-            outsideBlocks = outsideBlocks
+            imageWidth = imageWidth,
+            imageHeight = imageHeight
+        )
+        return BubbleFirstRouting(
+            bubbleAssignments = mergedBubbles,
+            outsideAssignments = remainingOutside,
+            outsideBlocks = remainingOutside.flatMap { it.blocks }
+        )
+    }
+
+    /**
+     * 把「气泡外、紧跟在气泡台词下面」的续行收编进气泡（见 [route] 调用处注释）。
+     *
+     * 判据（全部满足才收）：
+     * 1. 气泡侧取**最下面**的块，外块取**最上面**的块；外块必须真的在下方；
+     * 2. 两块的垂直间隙 ≤ 一行高，且 [OcrBlockMergeRules] 判为可合并（行距/字号/对齐）；
+     * 3. 气泡侧最后一行以**续行标点**收尾（`,` / `，` / `、` / `…` / `—`）——
+     *    这是「话没说完」的文本证据；没有它就不收，避免把旁边独立的拟声词/旁白吞进来。
+     *
+     * 返回收编后的气泡分配和剩余的外部分配。
+     */
+    private fun mergeOutsideContinuationsIntoBubbles(
+        bubbleAssignments: List<BubbleRegionAssignment>,
+        outsideAssignments: List<BubbleRegionAssignment>,
+        imageWidth: Int,
+        imageHeight: Int
+    ): Pair<List<BubbleRegionAssignment>, List<BubbleRegionAssignment>> {
+        if (bubbleAssignments.isEmpty() || outsideAssignments.isEmpty()) {
+            return bubbleAssignments to outsideAssignments
+        }
+        val updatedBubbles = bubbleAssignments.toMutableList()
+        val remainingOutside = mutableListOf<BubbleRegionAssignment>()
+        outsideAssignments.forEach { outside ->
+            val lower = outside.blocks.minByOrNull { it.top } ?: run {
+                remainingOutside += outside
+                return@forEach
+            }
+            var bestIndex = -1
+            var bestGap = Float.MAX_VALUE
+            updatedBubbles.forEachIndexed { index, candidate ->
+                if (candidate.region.regionType != BubbleRegionType.BUBBLE) return@forEachIndexed
+                val upper = candidate.blocks.maxByOrNull { it.bottom } ?: return@forEachIndexed
+                if (lower.centerY() <= upper.centerY()) return@forEachIndexed
+                val avgLineHeight = TextLineGeometry.averageLineHeight(upper, lower)
+                // 必须是「上块的下方」，不是同一水平带里偏下一点的旁白：允许 0.1 行高的
+                // 检测框抖动，但不允许两块在垂直方向大面积重叠（那通常是气泡旁边的一行字）。
+                if (lower.top - upper.bottom < -avgLineHeight * CONTINUATION_MAX_VERTICAL_OVERLAP_RATIO) {
+                    return@forEachIndexed
+                }
+                val verticalGap = max(0f, lower.top - upper.bottom)
+                if (verticalGap > avgLineHeight) return@forEachIndexed
+                if (!endsWithContinuationMarker(upper.text)) return@forEachIndexed
+                if (!OcrBlockMergeRules.shouldMerge(upper, lower, sameKnownRegion = false).merge) {
+                    return@forEachIndexed
+                }
+                if (verticalGap < bestGap) {
+                    bestGap = verticalGap
+                    bestIndex = index
+                }
+            }
+            if (bestIndex < 0) {
+                remainingOutside += outside
+                return@forEach
+            }
+            val target = updatedBubbles[bestIndex]
+            val mergedBlocks = (target.blocks + outside.blocks)
+                .sortedWith(compareBy<TextBlock> { it.top }.thenBy { it.left })
+            updatedBubbles[bestIndex] = BubbleRegionAssignment(
+                region = expandRegionToBlocks(target.region, mergedBlocks, imageWidth, imageHeight),
+                blocks = mergedBlocks
+            )
+        }
+        return updatedBubbles to remainingOutside
+    }
+
+    /** 话没说完的收尾标点（半角/全角逗号、顿号、省略号、破折号）。 */
+    private fun endsWithContinuationMarker(text: String): Boolean {
+        val last = text.trim().lastOrNull() ?: return false
+        return last in CONTINUATION_TAIL_CHARS
+    }
+
+    /** 收编后把区域扩到覆盖所有文字块（含少量外扩），否则 `isSolidBubbleRegion` 会判成 none。 */
+    private fun expandRegionToBlocks(
+        region: BubbleRegion,
+        blocks: List<TextBlock>,
+        imageWidth: Int,
+        imageHeight: Int
+    ): BubbleRegion {
+        if (blocks.isEmpty()) return region
+        val rawLeft = blocks.minOf { it.left }
+        val rawTop = blocks.minOf { it.top }
+        val rawRight = blocks.maxOf { it.right }
+        val rawBottom = blocks.maxOf { it.bottom }
+        val padX = max(OUTSIDE_BASE_GAP_PX, (rawRight - rawLeft) * OUTSIDE_PADDING_RATIO)
+        val padY = max(OUTSIDE_BASE_GAP_PX, (rawBottom - rawTop) * OUTSIDE_PADDING_RATIO)
+        return region.copy(
+            left = min(region.left, rawLeft - padX).coerceIn(0f, imageWidth.toFloat()),
+            top = min(region.top, rawTop - padY).coerceIn(0f, imageHeight.toFloat()),
+            right = max(region.right, rawRight + padX).coerceIn(1f, imageWidth.toFloat()),
+            bottom = max(region.bottom, rawBottom + padY).coerceIn(1f, imageHeight.toFloat()),
+            source = if (region.source.contains(CONTINUATION_SOURCE_TAG)) {
+                region.source
+            } else {
+                region.source + CONTINUATION_SOURCE_TAG
+            }
         )
     }
 
@@ -373,11 +482,37 @@ class BubbleFirstRegionPlanner {
     }
 
     private fun matchScore(region: BubbleRegion, block: TextBlock): Float {
-        val centerInside = block.centerX() in region.left..region.right && block.centerY() in region.top..region.bottom
-        val overlapLeft = max(region.left, block.left)
-        val overlapTop = max(region.top, block.top)
-        val overlapRight = min(region.right, block.right)
-        val overlapBottom = min(region.bottom, block.bottom)
+        // OpenCV 区域检测器给区域外扩了 `max(6px, 6%)`（见 `BubbleRegionDetector`），
+        // 那是为了让窄文字框也能被收进来；但外扩环里可能正好压着气泡旁边的一行旁白。
+        // 归属判定用**收掉一半外扩**的框（不去满：检测框可能确实比轮廓大几像素，
+        // 全去掉会把真气泡文字判成外部），既保留容差、又不让旁白整块落在环里。
+        val opencvRegion = region.source.contains(OPENCV_REGION_SOURCE_TAG)
+        val insetX = if (opencvRegion) {
+            max(
+                OPENCV_REGION_MIN_PAD_PX,
+                (region.right - region.left) * OPENCV_REGION_PAD_RATIO
+            ) * OPENCV_REGION_INSET_RATIO
+        } else {
+            0f
+        }
+        val insetY = if (opencvRegion) {
+            max(
+                OPENCV_REGION_MIN_PAD_PX,
+                (region.bottom - region.top) * OPENCV_REGION_PAD_RATIO
+            ) * OPENCV_REGION_INSET_RATIO
+        } else {
+            0f
+        }
+        val left = region.left + insetX
+        val top = region.top + insetY
+        val right = region.right - insetX
+        val bottom = region.bottom - insetY
+        if (right <= left || bottom <= top) return 0f
+        val centerInside = block.centerX() in left..right && block.centerY() in top..bottom
+        val overlapLeft = max(left, block.left)
+        val overlapTop = max(top, block.top)
+        val overlapRight = min(right, block.right)
+        val overlapBottom = min(bottom, block.bottom)
         val overlapArea = if (overlapRight > overlapLeft && overlapBottom > overlapTop) {
             (overlapRight - overlapLeft) * (overlapBottom - overlapTop)
         } else {
@@ -386,8 +521,14 @@ class BubbleFirstRegionPlanner {
         val blockArea = block.areaPx().coerceAtLeast(1f)
         val overlapRatio = overlapArea / blockArea
         return when {
-            centerInside -> 1f + overlapRatio
-            overlapRatio >= MIN_REGION_OVERLAP_RATIO -> overlapRatio
+            // 参考项目 `find_best_visual_region`：中心在容器内还要有 ≥18% 的覆盖率；
+            // 中心在外时必须 ≥55% 才算「文字主要落在容器里」。
+            //
+            // 2026-10-31 用户反馈「气泡框旁边还有一行字，它和气泡框内的文字一起合并了」：
+            // 旧实现只看 `centerInside`（不看覆盖率）或 ≥18% 重叠 —— 旁边的行只要中心
+            // 落进区域外扩后的包围盒就会挂到气泡上，和气泡台词并成一句。
+            centerInside && overlapRatio >= MIN_REGION_OVERLAP_RATIO -> 1f + overlapRatio
+            overlapRatio >= MIN_REGION_BOX_OVERLAP_RATIO -> overlapRatio
             else -> 0f
         }
     }
@@ -764,6 +905,34 @@ class BubbleFirstRegionPlanner {
         private const val COLUMN_PAIR_ASPECT = 1.15f
 
         private const val MIN_REGION_OVERLAP_RATIO = 0.18f
+
+        /** OpenCV 区域检测器的 source 标记（其区域框带外扩，见 [matchScore]）。 */
+        private const val OPENCV_REGION_SOURCE_TAG = "opencv_contour"
+
+        /** 与 `BubbleRegionDetector.REGION_PAD_RATIO` 同值：归属判定前把外扩去掉。 */
+        private const val OPENCV_REGION_PAD_RATIO = 0.06f
+
+        /** 与 `BubbleRegionDetector.MIN_PADDING_PX` 同值。 */
+        private const val OPENCV_REGION_MIN_PAD_PX = 6f
+
+        /** 归属判定收掉外扩的比例：一半。全收会误伤「检测框比轮廓略大」的真气泡文字。 */
+        private const val OPENCV_REGION_INSET_RATIO = 0.5f
+
+        /** 续行收尾标点：命中才允许把气泡外的一行收编进气泡（见 [endsWithContinuationMarker]）。 */
+        private const val CONTINUATION_TAIL_CHARS = ",，、·…—-~～"
+
+        /** 续行收编允许的垂直重叠（× 行高）：只容忍框抖动，避免把同水平带的旁白收进来。 */
+        private const val CONTINUATION_MAX_VERTICAL_OVERLAP_RATIO = 0.1f
+
+        /** 收编后的区域 source 标记（诊断用：日誌里能看出这块跨了气泡内外）。 */
+        private const val CONTINUATION_SOURCE_TAG = "+continuation"
+
+        /**
+         * 中心不在气泡区域内时，文字块至少要覆盖区域面积的这个比例才收编
+         * （参考项目 `find_best_visual_region` 的 `overlap_ratio >= 0.55`）。
+         * 低于它的多半是气泡旁边的一行旁白/拟声词，不能被并进气泡台词。
+         */
+        private const val MIN_REGION_BOX_OVERLAP_RATIO = 0.55f
         private const val OUTSIDE_BASE_GAP_PX = 8f
         private const val OUTSIDE_PADDING_RATIO = 0.10f
         private const val BUBBLE_SPLIT_BASE_GAP_PX = 8f

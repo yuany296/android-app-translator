@@ -288,7 +288,15 @@ fun HistoryScreen(
         AlertDialog(
             onDismissRequest = { confirmClear = false },
             title = { Text("清空翻译历史") },
-            text = { Text("确定删除全部 ${entries.size} 条历史记录吗？清空后这些页面再次翻译会重新调用 API。") },
+            // 2026-10-31：旧文案写「清空后这些页面再次翻译会重新调用 API」，是假的 ——
+            // 清空只删快照，句子缓存还在，下次照样复用。这里改成实话。
+            text = {
+                Text(
+                    "将删除全部 ${entries.size} 条记录。只清记录、不动已存下的译文缓存，" +
+                        "下次遇到同样的句子仍会直接复用。要让某一页重新翻译，请单独删除那条记录" +
+                        "（删除会同时作废该页缓存）。"
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {

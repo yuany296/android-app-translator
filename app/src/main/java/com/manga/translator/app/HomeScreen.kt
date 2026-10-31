@@ -53,6 +53,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -102,9 +103,29 @@ sealed interface MlKitDownloadState {
 }
 
 /**
+ * 「跟随翻译配置」后面标注具体跟的是谁（2026-10-31 用户要求）。
+ *
+ * 原来只写「跟随翻译配置」，用户得往上滚到「翻译服务」那张卡才知道跟的是哪个档案 ——
+ * 这次直接把名字带上，省一次视线移动。没配档案时说「当前未配置」，
+ * 不写「跟随翻译配置（）」那种空括号。
+ */
+private fun followProfileLabel(profileName: String): String =
+    "跟随翻译配置（${profileName.ifEmpty { "当前未配置" }}）"
+
+/**
+ * 档案弹层 / 档案表单「这一份是给谁配的」（2026-10-31）。
+ *
+ * 三种去处决定「选完这个档案之后做什么」：
+ * - [TRANSLATE]：把档案字段整套套到全局设置上（换翻译配置）；
+ * - [VISION] / [TERM]：**只记一个指针**，不动全局翻译配置 ——
+ *   翻译选百度或 ML Kit 时，重读 / 术语提取仍可以单独用某个云端档案。
+ */
+private enum class ProfileTarget { TRANSLATE, VISION, TERM }
+
+/**
  * 首页（设计稿 `06-首页改法`）。
  *
- * 结构：页头 → 状态行（**只在需要时出现**）→ 语言对 → OCR服务 → 多模态重读 → 翻译服务 → 底部主按钮。
+ * 结构：页头 → 状态行（**只在需要时出现**）→ 语言对 → OCR服务 → 翻译服务 → 多模态重读 → AI 术语提取 → 底部主按钮。
  *
  * 「翻译设置」页已并入本页（2026-09-17，4→3）；2026-09-28 底栏新增「浏览器」tab（内嵌翻译入口）。
  */
@@ -128,8 +149,9 @@ fun LauncherScreen(
         )
     }
     var profileSheetOpen by remember { mutableStateOf(false) }
-    // 档案弹层为谁而开：翻译（选了就全局套用）还是多模态重读（只记档案指针，不动翻译配置）。
-    var profileSheetForVision by remember { mutableStateOf(false) }
+    // 档案弹层为谁而开（2026-10-31 从布尔升成三态）：
+    // 翻译（选了就全局套用）／多模态重读（只记指针）／AI 术语提取（只记指针）。
+    var profileSheetTarget by remember { mutableStateOf(ProfileTarget.TRANSLATE) }
     var baiduSheetOpen by remember { mutableStateOf(false) }
     // OCR 低质量回退多模态（2026-10-14，独立 pref，不属于 API 档案）。
     // 源语言没有「自动识别」：语言完全按用户配置走（2026-10-15 用户裁定移除「语言可能选错了」
@@ -139,8 +161,10 @@ fun LauncherScreen(
     // 厂商 / Base URL / Key —— 翻译选 ML Kit 时也能单独选一个云端档案给重读用。
     // 复用 lastOcrProfileName 指针：重命名/删除档案时 SettingsRepository 已维护它。
     var visionProfile by remember { mutableStateOf(repo.getLastOcrProfileName()) }
+    // AI 术语提取的档案选择（2026-10-31）：空 = 跟随翻译配置，口径与上面完全一样。
+    var termProfile by remember { mutableStateOf(repo.getLastTermProfileName()) }
     var formOpen by remember { mutableStateOf(false) }
-    var formForVision by remember { mutableStateOf(false) }
+    var formTarget by remember { mutableStateOf(ProfileTarget.TRANSLATE) }
     // 百度两项凭据都填了才算配好（与状态行、卡片值共用）。
     val baiduConfigured = settings.baiduTranslateAppId.isNotBlank() &&
         settings.baiduTranslateSecretKey.isNotBlank()
@@ -263,36 +287,8 @@ fun LauncherScreen(
                 }
             }
 
-            // 多模态重读（2026-10-14 定稿）：与 OCR 服务同级的独立区块。
-            // 配置档案用**同一套档案库**（同一个弹层），但是**独立的选择**：
-            // 没选 = 跟随翻译配置；选了 = 用那个档案的厂商 / Base URL / Key（见 `ServiceLocator`），
-            // 翻译选 ML Kit / 百度也不影响。模型名走档案表单里的「多模态识别模型」（留空跟随翻译模型）。
-            SectionTitle("多模态重读")
-            MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
-                MtPrefSwitchRow(
-                    name = "启用",
-                    hint = "本地读不好时交给云端重读（需配 API）",
-                    checked = lowQualityVisionOcr,
-                    onCheckedChange = {
-                        lowQualityVisionOcr = it
-                        repo.setLowQualityVisionOcrEnabled(it)
-                    }
-                )
-                MtDivider()
-                MtListRow(
-                    name = "配置档案",
-                    value = when {
-                        visionProfile.isNotEmpty() -> visionProfile
-                        engine == TranslateEngine.CLOUD -> "跟随翻译配置"
-                        else -> "未配置"
-                    },
-                    onClick = {
-                        profileSheetForVision = true
-                        profileSheetOpen = true
-                    }
-                )
-            }
-
+            // 2026-10-31 用户调序：翻译服务上移、多模态重读下移（多模态重读是 OCR 的补充手段，
+            // 放在翻译服务旁边容易被读成「翻译的一个选项」）。
             SectionTitle("翻译服务")
             // 服务设置卡用直角（2026-09-18 用户要求）。
             MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
@@ -322,6 +318,55 @@ fun LauncherScreen(
                     )
                 }
             }
+
+            // 多模态重读（2026-10-14 定稿）：与 OCR 服务同级的独立区块。
+            // 配置档案用**同一套档案库**（同一个弹层），但是**独立的选择**：
+            // 没选 = 跟随翻译配置；选了 = 用那个档案的厂商 / Base URL / Key（见 `ServiceLocator`），
+            // 翻译选 ML Kit / 百度也不影响。模型名走档案表单里的「多模态识别模型」（留空跟随翻译模型）。
+            SectionTitle("多模态重读")
+            MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
+                MtPrefSwitchRow(
+                    name = "启用",
+                    hint = "本地读不好时交给云端重读（需配 API）",
+                    checked = lowQualityVisionOcr,
+                    onCheckedChange = {
+                        lowQualityVisionOcr = it
+                        repo.setLowQualityVisionOcrEnabled(it)
+                    }
+                )
+                MtDivider()
+                MtListRow(
+                    name = "配置档案",
+                    value = when {
+                        visionProfile.isNotEmpty() -> visionProfile
+                        engine == TranslateEngine.CLOUD -> followProfileLabel(selectedProfile)
+                        else -> "未配置"
+                    },
+                    onClick = {
+                        profileSheetTarget = ProfileTarget.VISION
+                        profileSheetOpen = true
+                    }
+                )
+            }
+
+            // AI 术语提取（2026-10-31）：与多模态重读同构 —— 共用档案库、独立选择、空 = 跟随翻译。
+            // 刻意**不给开关**：多模态重读是 OCR 读不好时自动触发的，所以必须能关；
+            // 提取是用户在句子页手动点「提取术语」才发生，不点就不花钱。
+            SectionTitle("AI 术语提取")
+            MtCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(0.dp)) {
+                MtListRow(
+                    name = "配置档案",
+                    value = when {
+                        termProfile.isNotEmpty() -> termProfile
+                        engine == TranslateEngine.CLOUD -> followProfileLabel(selectedProfile)
+                        else -> "未配置"
+                    },
+                    onClick = {
+                        profileSheetTarget = ProfileTarget.TERM
+                        profileSheetOpen = true
+                    }
+                )
+            }
         }
 
         HomeActionBar(
@@ -332,46 +377,65 @@ fun LauncherScreen(
     }
 
     if (profileSheetOpen) {
-        val visionMode = profileSheetForVision
+        val target = profileSheetTarget
+        val followMode = target != ProfileTarget.TRANSLATE
         ProfileSheet(
             profiles = profileNames,
-            title = if (visionMode) "选择多模态重读档案" else "配置档案",
-            // 多模态模式下给一条「跟随翻译配置」：选了档案后还能回到跟随态。
-            showFollowOption = visionMode,
-            selected = if (visionMode) visionProfile else selectedProfile,
+            title = when (target) {
+                ProfileTarget.VISION -> "选择多模态重读档案"
+                ProfileTarget.TERM -> "选择术语提取档案"
+                ProfileTarget.TRANSLATE -> "配置档案"
+            },
+            // 重读 / 术语提取都留一条「跟随翻译配置」：选了档案后还能回到跟随态。
+            showFollowOption = followMode,
+            followLabel = followProfileLabel(selectedProfile),
+            selected = when (target) {
+                ProfileTarget.VISION -> visionProfile
+                ProfileTarget.TERM -> termProfile
+                ProfileTarget.TRANSLATE -> selectedProfile
+            },
             onSelect = { name ->
-                if (visionMode) {
+                when (target) {
                     // 只记档案指针，不动全局翻译配置（2026-10-14 深夜定稿：
                     // 翻译选 ML Kit 时多模态可以单独选一个云端档案）。
-                    repo.setLastOcrProfileName(name)
-                    visionProfile = name
-                } else {
-                    // 套档案只搬「档案自己的」字段（凭据 / 模型 / 思考），语言对与 OCR 选择保留
-                    // 用户当前值 —— 2026-10-15 用户反馈「换翻译配置会换掉源语言，希望不要换掉」。
-                    repo.getProfile(name)?.let { profile ->
-                        val next = settings.applyProfile(profile)
-                        Log.d(
-                            TAG_PROFILE,
-                            "profile_apply name=$name keepLang=${next.sourceLanguage}->${next.targetLanguage} " +
-                                "engine=${next.translateEngine}"
-                        )
-                        onSettingsChange(next)
+                    ProfileTarget.VISION -> {
+                        repo.setLastOcrProfileName(name)
+                        visionProfile = name
                     }
-                    repo.setLastTranslateProfileName(name)
-                    selectedProfile = name
+                    // 术语提取同理（2026-10-31）：翻译走百度 / ML Kit 时，
+                    // 这里仍可以单独指一个云端档案给 AI 提取术语用。
+                    ProfileTarget.TERM -> {
+                        repo.setLastTermProfileName(name)
+                        termProfile = name
+                    }
+                    ProfileTarget.TRANSLATE -> {
+                        // 套档案只搬「档案自己的」字段（凭据 / 模型 / 思考），语言对与 OCR 选择保留
+                        // 用户当前值 —— 2026-10-15 用户反馈「换翻译配置会换掉源语言，希望不要换掉」。
+                        repo.getProfile(name)?.let { profile ->
+                            val next = settings.applyProfile(profile)
+                            Log.d(
+                                TAG_PROFILE,
+                                "profile_apply name=$name keepLang=${next.sourceLanguage}->${next.targetLanguage} " +
+                                    "engine=${next.translateEngine}"
+                            )
+                            onSettingsChange(next)
+                        }
+                        repo.setLastTranslateProfileName(name)
+                        selectedProfile = name
+                    }
                 }
                 profileSheetOpen = false
-                profileSheetForVision = false
+                profileSheetTarget = ProfileTarget.TRANSLATE
             },
             onCreate = {
                 profileSheetOpen = false
-                formForVision = visionMode
+                formTarget = target
                 formEditingName = ""
                 formOpen = true
             },
             onEdit = { name ->
                 profileSheetOpen = false
-                formForVision = visionMode
+                formTarget = target
                 formEditingName = name
                 formOpen = true
             },
@@ -380,6 +444,7 @@ fun LauncherScreen(
                 profileNames = repo.getProfileNames()
                 if (selectedProfile == old) selectedProfile = new
                 if (visionProfile == old) visionProfile = new
+                if (termProfile == old) termProfile = new
             },
             onDuplicate = { name ->
                 var target = "$name 副本"
@@ -394,8 +459,10 @@ fun LauncherScreen(
             onDelete = { name ->
                 repo.deleteProfile(name)
                 profileNames = repo.getProfileNames()
-                // deleteProfile 会同步清掉 lastOcrProfileName 指针，这里把 UI 状态跟上。
+                // deleteProfile 会同步清掉 lastOcrProfileName / lastTermProfileName 指针，
+                // 这里把 UI 状态跟上。
                 if (visionProfile == name) visionProfile = ""
+                if (termProfile == name) termProfile = ""
                 if (selectedProfile == name) {
                     val next = repo.getProfileNames().firstOrNull().orEmpty()
                     selectedProfile = next
@@ -421,7 +488,7 @@ fun LauncherScreen(
             },
             onDismiss = {
                 profileSheetOpen = false
-                profileSheetForVision = false
+                profileSheetTarget = ProfileTarget.TRANSLATE
             }
         )
     }
@@ -435,15 +502,22 @@ fun LauncherScreen(
             onRememberApiKey = { providerId, key -> repo.saveProviderApiKey(providerId, key) },
             onSaved = { name, updated ->
                 repo.saveProfile(name, updated)
-                if (formForVision) {
-                    // 从「多模态重读」的档案弹层进来建/改的：只落到重读的档案指针，
+                when (formTarget) {
+                    // 从「多模态重读」/「AI 术语提取」的档案弹层进来建/改的：只落到对应指针，
                     // 不套用到全局翻译配置（否则翻译会被顺手切走）。
-                    repo.setLastOcrProfileName(name)
-                    visionProfile = name
-                } else {
-                    repo.setLastTranslateProfileName(name)
-                    selectedProfile = name
-                    onSettingsChange(updated)
+                    ProfileTarget.VISION -> {
+                        repo.setLastOcrProfileName(name)
+                        visionProfile = name
+                    }
+                    ProfileTarget.TERM -> {
+                        repo.setLastTermProfileName(name)
+                        termProfile = name
+                    }
+                    ProfileTarget.TRANSLATE -> {
+                        repo.setLastTranslateProfileName(name)
+                        selectedProfile = name
+                        onSettingsChange(updated)
+                    }
                 }
                 profileNames = repo.getProfileNames()
                 formOpen = false
@@ -772,6 +846,8 @@ private fun ProfileSheet(
     title: String = "配置档案",
     /** true = 在列表顶部显示「跟随翻译配置」行（多模态重读选档案时，用于回到跟随态）。 */
     showFollowOption: Boolean = false,
+    /** 「跟随翻译配置」整行文案（含括号里的档案名），由调用方拼好传进来。 */
+    followLabel: String = "跟随翻译配置",
     onSelect: (String) -> Unit,
     onCreate: () -> Unit,
     onEdit: (String) -> Unit,
@@ -832,11 +908,12 @@ private fun ProfileSheet(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "跟随翻译配置",
+                                    text = followLabel,
                                     fontSize = 15.sp,
                                     color = MtColors.TextPrimary,
                                     modifier = Modifier.weight(1f),
-                                    maxLines = 1
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 if (selected.isEmpty()) {
                                     Icon(
@@ -1143,7 +1220,7 @@ private fun ProfileFormScreen(
     var visionModelBoxWidthPx by remember { mutableStateOf(0) }
     // 思考功能（2026-10-02 用户要求「加一个参数表示是否开启思考功能」）：
     // 有思考会慢很多，所以**新建默认关**；编辑时沿用该档案已保存的值。
-    // 只有支持该参数的厂商（千问 / GLM / DeepSeek）才允许打开，见 thinkingSupported。
+    // 只有支持该参数的厂商（千问 / GLM / DeepSeek / OpenCode Go）才允许打开，见 thinkingSupported。
     var thinking by remember { mutableStateOf(if (isEdit) initial.enableThinking else false) }
     val thinkingSupported = provider.supportsThinking
     var providerMenu by remember { mutableStateOf(false) }
@@ -1449,7 +1526,7 @@ private fun ProfileFormScreen(
                 }
 
                 // 思考功能（2026-10-02）：模型「先思考再作答」更准但明显更慢，
-                // 所以默认关、且只对支持该参数的厂商（千问 / GLM / DeepSeek）可开。
+                // 所以默认关、且只对支持该参数的厂商（千问 / GLM / DeepSeek / OpenCode Go）可开。
                 MtThinkingRow(
                     checked = thinkingSupported && thinking,
                     enabled = thinkingSupported,

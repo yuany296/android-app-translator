@@ -259,8 +259,10 @@ class CaptureForegroundService : Service() {
 
                 if (outcome.hasOverlay) {
                     val doneText = when {
-                        outcome.cacheTotalCount > 0 ->
-                            "完成·缓存${outcome.cacheHitCount}/${outcome.cacheTotalCount}"
+                        // 只说「缓存了几句」，不报总数：用户要的是「这次省了多少」，
+                        // X/Y 里的 Y 会被读成「已有多少」。
+                        outcome.cacheHitCount > 0 ->
+                            "完成·缓存${outcome.cacheHitCount}句"
                         else -> outcome.warningMessage ?: "完成"
                     }
                     overlayController?.setFloatingState(FloatingState.DONE, doneText)

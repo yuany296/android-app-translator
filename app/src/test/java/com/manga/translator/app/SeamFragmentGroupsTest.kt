@@ -30,7 +30,8 @@ class SeamFragmentGroupsTest {
         regionType: String? = null,
         confidence: Float = 1f,
         rotationDeg: Float? = null,
-        sourceLineCount: Int = 1
+        sourceLineCount: Int = 1,
+        lineBoxes: List<FloatArray>? = null
     ): Bubble = Bubble(
         x = 0f,
         y = 0f,
@@ -43,7 +44,8 @@ class SeamFragmentGroupsTest {
         sourceLineCount = sourceLineCount,
         regionId = regionId,
         regionType = regionType,
-        confidence = confidence
+        confidence = confidence,
+        lineBoxes = lineBoxes
     )
 
     private fun detection(
@@ -59,7 +61,8 @@ class SeamFragmentGroupsTest {
         regionType: String? = null,
         confidence: Float = 1f,
         rotationDeg: Float? = null,
-        sourceLineCount: Int = 1
+        sourceLineCount: Int = 1,
+        lineBoxes: List<FloatArray>? = null
     ): SeamDetection {
         val outer = SeamBox(left, top, right, bottom)
         return SeamDetection(
@@ -70,7 +73,8 @@ class SeamFragmentGroupsTest {
                 regionType = regionType,
                 confidence = confidence,
                 rotationDeg = rotationDeg,
-                sourceLineCount = sourceLineCount
+                sourceLineCount = sourceLineCount,
+                lineBoxes = lineBoxes
             ),
             outer = outer,
             content = content ?: outer,
@@ -141,6 +145,94 @@ class SeamFragmentGroupsTest {
         assertEquals(1080f / canvasHeight * 100f, merged.y, 0.01f)
         assertEquals(400f / canvasWidth * 100f, merged.w, 0.01f)
         assertEquals((1315f - 1080f) / canvasHeight * 100f, merged.h, 0.01f)
+    }
+
+    @Test
+    fun duplicateTextFragmentsDoNotInflateMergedTextOrLineCount() {
+        // ML Kit 分块检测可能在重叠区把同一句报两次（框偏移、IoU 不高）。
+        // 成组时不能把同一句重复拼进去，也不能把行数相加成 2。
+        val regionId = "bubble:dup"
+        val plan = plan(
+            listOf(
+                detection(
+                    "같은 말", 300f, 1120f, 700f, 1210f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                ),
+                detection(
+                    "같은 말", 300f, 1180f, 700f, 1270f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                )
+            )
+        )
+
+        assertEquals(1, plan.groupedRegion)
+        val merged = plan.owned.single().bubble
+        assertEquals("같은 말", merged.originalText)
+        assertEquals(1, merged.sourceLineCount)
+    }
+
+    @Test
+    fun overlappingLineBoxesDoNotInflateMergedLineCount() {
+        // 同一行被 ML Kit 报成两个略偏移的碎片：逐行框重叠 → 视觉行数仍是 1。
+        val regionId = "bubble:line-dup"
+        val plan = plan(
+            listOf(
+                detection(
+                    "첫 조각", 300f, 1120f, 700f, 1210f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH,
+                    lineBoxes = listOf(floatArrayOf(300f, 1120f, 700f, 1170f))
+                ),
+                detection(
+                    "둘째 조각", 300f, 1160f, 700f, 1250f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH,
+                    lineBoxes = listOf(floatArrayOf(300f, 1140f, 700f, 1190f))
+                )
+            )
+        )
+
+        assertEquals(1, plan.groupedRegion)
+        assertEquals(1, plan.owned.single().bubble.sourceLineCount)
+    }
+
+    @Test
+    fun sideBySideFragmentsInSameRegionAreNotGrouped() {
+        // 一个大亮区可能装多个独立气泡：同 region_id 但横向并排 → 不能成组。
+        val regionId = "bubble:wide"
+        val plan = plan(
+            listOf(
+                detection(
+                    "왼쪽 대사", 200f, 1120f, 350f, 1195f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                ),
+                detection(
+                    "오른쪽 대사", 500f, 1205f, 650f, 1280f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                )
+            )
+        )
+
+        assertEquals(0, plan.groupedRegion)
+        assertFalse(plan.verdicts.any { it == "grouped_region" })
+    }
+
+    @Test
+    fun veryDifferentLineHeightsInSameRegionAreNotGrouped() {
+        val regionId = "bubble:mixed"
+        val plan = plan(
+            listOf(
+                detection(
+                    "큰 글자", 300f, 1080f, 700f, 1180f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                ),
+                detection(
+                    "작은 글자", 300f, 1205f, 700f, 1235f,
+                    regionId = regionId, regionType = SeamFragmentGroups.REGION_TYPE_SPEECH
+                )
+            )
+        )
+
+        assertEquals(0, plan.groupedRegion)
+        assertFalse(plan.verdicts.any { it == "grouped_region" })
     }
 
     // -----------------------------------------------------------------------

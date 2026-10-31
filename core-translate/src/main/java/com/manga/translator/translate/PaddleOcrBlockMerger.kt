@@ -14,13 +14,80 @@ import kotlin.math.min
  */
 object PaddleOcrBlockMerger {
 
-    fun mergeBlocks(blocks: List<TextBlock>, imageWidth: Int, imageHeight: Int): List<TextBlock> {
+    fun mergeBlocks(
+        blocks: List<TextBlock>,
+        imageWidth: Int,
+        imageHeight: Int,
+        seamTopPx: Int = 0,
+        seamBottomPx: Int = 0
+    ): List<TextBlock> {
         if (blocks.size <= 1) return blocks
-        val lines = mergeIntoLines(blocks)
-        val paragraphs = mergeIntoParagraphs(lines, imageWidth, imageHeight)
+        // 拼接图内部的切缝（2026-11-01）：段落合并不能跨缝，贴缝的半行单独成组，
+        // 交给接缝配对。纯几何，不增加 OCR 次数。
+        val seams = buildList {
+            if (seamTopPx in 1 until imageHeight) add(seamTopPx.toFloat())
+            if (seamBottomPx in 1 until imageHeight) add(seamBottomPx.toFloat())
+        }
+        // 同一句被两次检测/识别成近似变体时先只留一份（2026-11-01，pageHash ca9603cd…）：
+        // 两版都进段落合并会被拼成「正确句 + 错字句」，译文重复两遍。
+        // 只对「文本高相似 + 框在横纵方向都高度重叠」生效，不碰两个独立气泡。
+        val deduped = dedupeNearDuplicateBlocks(blocks)
+        if (deduped.size <= 1) return deduped
+        val lines = mergeIntoLines(deduped)
+        val paragraphs = mergeIntoParagraphs(lines, imageWidth, imageHeight, seams)
         return paragraphs.mapIndexed { index, group ->
             mergeGroupToBlock(group, index, imageWidth, imageHeight)
         }.filter { it.text.isNotBlank() }
+    }
+
+    /**
+     * 近似重复块去重：几何先挡（便宜），再做 Levenshtein（贵）。
+     * 保留更可信的一份：行数更多 > 置信度更高 > 文本更长 > 面积更大。
+     */
+    private fun dedupeNearDuplicateBlocks(blocks: List<TextBlock>): List<TextBlock> {
+        val kept = mutableListOf<TextBlock>()
+        for (block in blocks) {
+            val index = kept.indexOfFirst { existing -> isNearDuplicateBlock(existing, block) }
+            if (index < 0) {
+                kept += block
+            } else if (isBetterDuplicate(block, kept[index])) {
+                kept[index] = block
+            }
+        }
+        return kept
+    }
+
+    private fun isNearDuplicateBlock(a: TextBlock, b: TextBlock): Boolean {
+        val verticalOverlap = (min(a.bottom, b.bottom) - max(a.top, b.top)).coerceAtLeast(0f) /
+            min(a.heightPx(), b.heightPx()).coerceAtLeast(1f)
+        val horizontalOverlap = (min(a.right, b.right) - max(a.left, b.left)).coerceAtLeast(0f) /
+            min(a.widthPx(), b.widthPx()).coerceAtLeast(1f)
+        if (verticalOverlap < 0.55f || horizontalOverlap < 0.50f) return false
+        val aText = OcrTextSimilarity.normalize(a.text)
+        val bText = OcrTextSimilarity.normalize(b.text)
+        return OcrTextSimilarity.isNearDuplicate(aText, bText)
+    }
+
+    private fun isBetterDuplicate(candidate: TextBlock, existing: TextBlock): Boolean {
+        val candidateLines = TextLineGeometry.lineCount(candidate)
+        val existingLines = TextLineGeometry.lineCount(existing)
+        if (candidateLines != existingLines) return candidateLines > existingLines
+        // 行数相同再比「文本换行结构与行数是否一致」：近似变体里常有一份是单行合并块
+        // （文本无 \n 但 lineCount=2），正确识别的多行块会带 \n。
+        val candidateConsistency = kotlin.math.abs(
+            (candidate.text.count { it == '\n' } + 1) - candidateLines
+        )
+        val existingConsistency = kotlin.math.abs(
+            (existing.text.count { it == '\n' } + 1) - existingLines
+        )
+        if (candidateConsistency != existingConsistency) {
+            return candidateConsistency < existingConsistency
+        }
+        if (candidate.confidence != existing.confidence) return candidate.confidence > existing.confidence
+        val candidateText = OcrTextSimilarity.normalize(candidate.text).length
+        val existingText = OcrTextSimilarity.normalize(existing.text).length
+        if (candidateText != existingText) return candidateText > existingText
+        return candidate.areaPx() > existing.areaPx()
     }
 
     private fun mergeIntoLines(blocks: List<TextBlock>): List<List<TextBlock>> {
@@ -109,15 +176,28 @@ object PaddleOcrBlockMerger {
     private fun mergeIntoParagraphs(
         lines: List<List<TextBlock>>,
         imageWidth: Int,
-        imageHeight: Int
+        imageHeight: Int,
+        seams: List<Float>
     ): List<List<TextBlock>> {
         if (lines.size <= 1) return lines
         val lineBlocks = lines.map { mergeGroupToBlock(it, -1, imageWidth, imageHeight) }
         val groups = mutableListOf<MutableList<TextBlock>>()
         for (block in lineBlocks) {
+            // 贴图像上/下边或拼接图内部切缝的行很可能是被切开的半行（2026-11-01）：
+            // 不并进上一段，留给接缝配对逻辑单独处理；否则这一行会被算进本页译文，
+            // 下一张图又认领一次 → 接缝处重复/漏翻。纯几何，不增加 OCR 次数。
+            if (isEdgeCutLine(block, imageHeight, seams)) {
+                groups += mutableListOf(block)
+                continue
+            }
             var placed = false
             for (group in groups) {
-                if (group.any { shouldJoinParagraph(it, block) }) {
+                // 已单独成组的贴边行不能再吸收普通行。
+                if (group.any { isEdgeCutLine(it, imageHeight, seams) }) continue
+                if (group.any {
+                        shouldJoinParagraph(it, block) && !crossesSeam(it, block, seams)
+                    }
+                ) {
                     group += block
                     placed = true
                     break
@@ -133,6 +213,35 @@ object PaddleOcrBlockMerger {
             group.flatMap { lineToOriginals[it] ?: listOf(it) }
         }
     }
+
+    /**
+     * 这一行是不是「被图像上/下边或拼接图内部切缝切开的半行」。
+     *
+     * 图像边：容差 = max(2px, 6% 行高)，上限 4px。
+     * 内部切缝：跨线、或框的上/下沿贴线（在容差内）都算 —— 完整行离缝几个像素就不算。
+     */
+    private fun isEdgeCutLine(block: TextBlock, imageHeight: Int, seams: List<Float>): Boolean {
+        if (imageHeight <= 0) return false
+        val tolerance = edgeCutTolerance(block)
+        if (block.top <= tolerance || block.bottom >= imageHeight - tolerance) return true
+        return seams.any { seam ->
+            val crosses = block.top < seam && block.bottom > seam
+            val touchesBottom = kotlin.math.abs(block.bottom - seam) <= tolerance
+            val touchesTop = kotlin.math.abs(block.top - seam) <= tolerance
+            crosses || touchesBottom || touchesTop
+        }
+    }
+
+    /** 两块是否分处切缝两侧：段落合并必须断开，否则跨缝两句会被并成一段。 */
+    private fun crossesSeam(a: TextBlock, b: TextBlock, seams: List<Float>): Boolean {
+        if (seams.isEmpty()) return false
+        val aCenter = (a.top + a.bottom) / 2f
+        val bCenter = (b.top + b.bottom) / 2f
+        return seams.any { seam -> (aCenter < seam) != (bCenter < seam) }
+    }
+
+    private fun edgeCutTolerance(block: TextBlock): Float =
+        max(2f, min(EDGE_CUT_MAX_TOLERANCE_PX, block.heightPx() * EDGE_CUT_LINE_HEIGHT_RATIO))
 
     private fun shouldJoinParagraph(a: TextBlock, b: TextBlock): Boolean {
         val aVertical = isVerticalBlock(a)
@@ -391,6 +500,7 @@ object PaddleOcrBlockMerger {
 
     private fun TextBlock.widthPx(): Float = (right - left).coerceAtLeast(1f)
     private fun TextBlock.heightPx(): Float = (bottom - top).coerceAtLeast(1f)
+    private fun TextBlock.areaPx(): Float = widthPx() * heightPx()
     private fun TextBlock.centerX(): Float = (left + right) / 2f
     private fun TextBlock.centerY(): Float = (top + bottom) / 2f
 
@@ -450,6 +560,10 @@ object PaddleOcrBlockMerger {
     private const val PARAGRAPH_CENTER_DIST_RATIO = 0.85f
     private const val PARAGRAPH_MAX_AXIS_DIST_RATIO = 1.5f // 段落合并前主轴中心距上限（横排看 Y、竖排看 X）
     private const val ROW_SPLIT_CENTER_RATIO = 0.30f
+
+    /** 贴边半行判据：行高比例与最大容差（像素）。 */
+    private const val EDGE_CUT_LINE_HEIGHT_RATIO = 0.06f
+    private const val EDGE_CUT_MAX_TOLERANCE_PX = 4f
 
     // 倾斜行楼梯碎片合并：中心连线斜率范围（tan，约 2°~19°）
     private const val SLANT_SLOPE_MIN = 0.03f

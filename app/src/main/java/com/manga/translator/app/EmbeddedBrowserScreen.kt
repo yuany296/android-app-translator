@@ -137,8 +137,8 @@ import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.AppSettings
 import com.manga.translator.translate.Bubble
 import com.manga.translator.store.BrowserHistoryEntry
-import com.manga.translator.store.BrowserFavoriteRepository
 import com.manga.translator.store.BrowserFavorite
+import com.manga.translator.store.BrowserFavoriteRepository
 import com.manga.translator.store.BrowserHistoryRepository
 import com.manga.translator.store.BrowserSearchEngine
 import com.manga.translator.store.BrowserSiteAdapter
@@ -147,6 +147,7 @@ import com.manga.translator.store.BrowserUrlResolver
 import com.manga.translator.store.FavoriteAddResult
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.TranslateEngine
+import com.manga.translator.store.TranslationOrigin
 import com.manga.translator.store.applyProfile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -1452,6 +1453,9 @@ fun EmbeddedBrowserScreen(
 
     val webView = remember {
         WebView(context).apply {
+            // 关掉系统边缘拉伸回弹：Android 12+ 在滚到顶/底继续拖时会把整个 WebView
+            // 拉长或压扁一瞬，长条漫画看起来就是「页面变形」。漫画阅读不需要这个效果。
+            overScrollMode = android.view.View.OVER_SCROLL_NEVER
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.loadsImagesAutomatically = true
@@ -2016,7 +2020,17 @@ fun EmbeddedBrowserScreen(
         }
         webpageTextBusy = true
         statusText = "正在收集页面文字…"
-        Log.d(TAG, "webpage_text_start url=${BrowserHistoryRepository.urlWithoutScheme(webView.url.orEmpty())}")
+        // 2026-10-31：给句子表记来源（纯展示），后续 put 会带进缓存条目。
+        TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
+        // 每次点「翻译页面文字」= 一个独立会话。旧实现所有网页文字共用
+        // pageHash="webpage-text"，翻译历史「按页」会把几百条网页句子糊成一张卡；
+        // 带时间戳后每次会话单独成组，用户能按时间找到某次翻译。
+        val webpageSessionId = "webpage-text:" + System.currentTimeMillis()
+        Log.d(
+            TAG,
+            "webpage_text_start session=$webpageSessionId " +
+                "url=${BrowserHistoryRepository.urlWithoutScheme(webView.url.orEmpty())}"
+        )
         sessionScope.launch {
             var appliedTotal = 0
             try {
@@ -2075,7 +2089,7 @@ fun EmbeddedBrowserScreen(
                             bubbles = bubbles,
                             settings = settings,
                             translateKey = translateKey,
-                            pageHash = "webpage-text",
+                            pageHash = webpageSessionId,
                             glossaryEntries = glossaryEntries,
                             timer = TranslationTimer(),
                             onTranslatorDownloading = null
@@ -2216,6 +2230,8 @@ fun EmbeddedBrowserScreen(
                 // 4) 共用管线（IO）：位图交给 translateImage，此后不再手动回收。
                 val useDom = domOverlay
                 statusText = "识别翻译中…"
+                // 2026-10-31：句子表来源标签（截图翻译链路 = 当前站点）。
+                TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
                 val startedAt = System.currentTimeMillis()
                 val outcome = withContext(Dispatchers.IO) {
                     translator.translateImage(
@@ -2973,7 +2989,7 @@ private suspend fun runTranslationSession(
     // 覆盖层渲染开关：会话内可因场景下发失败自动降级为整图替换。
     var useDom = useDomOverlay
     var doneCount = 0
-    var cacheCount = 0
+    var cacheSentenceCount = 0
     var failureCount = 0
     var lastWarning: String? = null
 
@@ -3427,7 +3443,7 @@ private suspend fun runTranslationSession(
             } else {
                 append("已翻 $doneCount 张")
             }
-            if (cacheCount > 0) append(" · 缓存$cacheCount")
+            if (cacheSentenceCount > 0) append(" · 缓存${cacheSentenceCount}句")
             if (failureCount > 0) append(" · 失败$failureCount")
             // 「处理了但没翻出东西」必须可见：以前这些图是**静默**跳过的，
             // 用户只会看到「某张图没翻」，不知道是识别不到还是程序漏了。
@@ -3951,9 +3967,9 @@ private suspend fun runTranslationSession(
                 } else {
                     attempts[image.attemptKey()] = MAX_ATTEMPTS_PER_IMAGE
                     doneCount += 1
-                    if (outcome.cacheTotalCount > 0 && outcome.cacheHitCount == outcome.cacheTotalCount) {
-                        cacheCount += 1
-                    }
+                    // 累计「这一轮有多少句直接用了缓存」，而不是「有几张图整套命中」。
+                    // 半页命中也是有价值的复用，按图计数会把它吞掉。
+                    cacheSentenceCount += outcome.cacheHitCount
                     outcome.warningMessage?.let { lastWarning = it }
                     incomingCross = outcome.crossOut
                     incomingCrossSrc = if (outcome.crossOut.isEmpty()) null else image.src
@@ -4110,7 +4126,7 @@ private suspend fun runTranslationSession(
             Log.d(
                 TAG,
                 "session_end token=$token mode=$sessionMode done=$doneCount shown=${placedIds.size} " +
-                    "cache=$cacheCount fail=$failureCount"
+                    "cacheSentences=$cacheSentenceCount fail=$failureCount"
             )
         }
     }

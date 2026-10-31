@@ -4,6 +4,7 @@ import android.util.Base64
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.GlossaryEntry
 import com.manga.translator.store.TranslationHistoryEntry
+import com.manga.translator.store.TranslationOrigin
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.NonTranslatableText
 import com.manga.translator.translate.TranslationResult
@@ -132,8 +133,25 @@ class PageTranslationResolver(
                         .ifBlank { bubble.originalText }
                         .replace(Regex("\\s+"), " ").trim()
                     translatedByOriginal[bubble.originalText] = value
-                    sentenceRepo.put(effective.sourceLanguage, effective.targetLanguage, bubble.originalText, value)
+                    // 2026-10-31：带上来源标签与页面标识，句子历史页据此显示「来自哪、哪一页」。
+                    sentenceRepo.put(
+                        effective.sourceLanguage,
+                        effective.targetLanguage,
+                        bubble.originalText,
+                        value,
+                        originLabel = TranslationOrigin.label,
+                        originPageHash = pageHash
+                    )
                 }
+                // 2026-10-31：原→译成对打印，用来核对「话有没有贴到别的框上」。
+                // 只打前 12 对、每侧截 12 字，避免长章节刷屏。
+                timer.mark(
+                    "translate_pairs",
+                    "n=${missing.size} " + missing.take(12).joinToString(" ") { bubble ->
+                        "[" + bubble.originalText.replace(Regex("\\s+"), " ").take(12) + "→" +
+                            translatedByOriginal[bubble.originalText].orEmpty().take(12) + "]"
+                    }
+                )
                 TranslationResult(
                     bubbles.map { bubble ->
                         bubble.copy(translatedText = translatedByOriginal[bubble.originalText] ?: bubble.originalText)

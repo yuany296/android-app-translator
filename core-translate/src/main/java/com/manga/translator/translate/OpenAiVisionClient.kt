@@ -210,7 +210,11 @@ class OpenAiVisionClient(
                 glossary = glossary,
                 pageContext = pageContext
             )
-            val inputArray = JSONArray().apply { chunk.forEach { put(it) } }
+            // 2026-10-31：输入也带上序号。整页上下文块里有一份 [C1]..[Cn] 的页面序，
+            // 如果 input 只是一串裸字符串，模型很容易把「上下文的前 N 行」当成本批输入
+            // （真机事故：缓存命中一句后，本批缺 7 句，模型却翻了整页前 7 句，译文整体错一位）。
+            // 把 i 直接写进输入，模型复制序号即可，不再需要自己数第几个。
+            val inputArray = buildIndexedInputJson(chunk)
             return requestWithFallback(
                 endpoint = endpoint,
                 model = model,
@@ -223,7 +227,7 @@ class OpenAiVisionClient(
                     model = model,
                     systemPrompt = buildTranslateSystemPrompt(sourceLanguageId, targetLanguageId),
                     prompt = prompt,
-                    inputTextsJson = inputArray.toString(),
+                    inputTextsJson = inputArray,
                     useJsonResponseFormat = useJsonFormat,
                     thinking = thinking,
                     thinkingBudget = normalizedThinkingBudget,
@@ -245,7 +249,14 @@ class OpenAiVisionClient(
             if (size <= 0) return
             val chunk = texts.subList(start, end)
             val first = requestChunk(chunk, jsonFormat = true)
-            var parsed = parseTranslations(first.raw, chunk)
+            var parsed = parseTranslations(first.raw, chunk, requireExplicitIndex = true)
+            // 诊断「原文和译文对不上」：indexed=false 说明模型没按输入序号回，
+            // 纯数组已在上一步被拒；indexed=true 时再看 reason 是否有越界/重复。
+            Log.d(
+                TAG,
+                "[$traceId] translate_parse count=$size indexed=${parsed.indexed} " +
+                    "failed=${parsed.parseFailed} reason=${parsed.reason ?: "-"}"
+            )
             if (parsed.parseFailed) {
                 Log.w(TAG, "[$traceId] translate_parse_fallback count=$size reason=${parsed.reason}")
             }
@@ -265,7 +276,7 @@ class OpenAiVisionClient(
                 // 单句（或拆到上限）：换 json_format=false 重发一次 —— 有的端点带 json_object
                 // 反而爱注水/被截断。
                 val retry = runCatching { requestChunk(chunk, jsonFormat = false) }.getOrNull()
-                val retryParsed = retry?.let { parseTranslations(it.raw, chunk) }
+                val retryParsed = retry?.let { parseTranslations(it.raw, chunk, requireExplicitIndex = true) }
                 val retryOk = retry != null && retryParsed != null &&
                     !retryParsed.parseFailed && retry.finishReason != FINISH_REASON_LENGTH
                 if (retryOk) {
@@ -299,7 +310,7 @@ class OpenAiVisionClient(
         if (suspects.isNotEmpty()) {
             val retryTexts = suspects.map { texts[it] }
             val retried = runCatching { requestChunk(retryTexts, jsonFormat = true) }.getOrNull()
-            val retriedParsed = retried?.let { parseTranslations(it.raw, retryTexts) }
+            val retriedParsed = retried?.let { parseTranslations(it.raw, retryTexts, requireExplicitIndex = true) }
             var applied = 0
             if (retriedParsed != null && !retriedParsed.parseFailed &&
                 retried?.finishReason != FINISH_REASON_LENGTH
@@ -324,6 +335,167 @@ class OpenAiVisionClient(
             translations = values.mapIndexed { index, value -> value ?: texts[index] },
             failedIndices = finalFailed
         )
+    }
+
+    /**
+     * 翻译输入的统一形态：`[{"i":0,"text":"..."}, ...]`。
+     *
+     * 为什么不是裸字符串数组（2026-10-31）：请求同时带整页上下文时，模型面前有两组句子；
+     * 裸数组没有「第几条」的视觉标记，模型会按上下文的前 N 行回译文，造成整批错位。
+     * 序号写进输入后，模型只需复制 `i`；解析侧再用 `requireExplicitIndex` 兜底。
+     */
+    internal fun buildIndexedInputJson(texts: List<String>): String {
+        val array = JSONArray()
+        texts.forEachIndexed { index, text ->
+            array.put(
+                JSONObject()
+                    .put("i", index)
+                    .put("text", text)
+            )
+        }
+        return array.toString()
+    }
+
+    fun extractTerms(
+        provider: String,
+        baseUrl: String,
+        model: String,
+        apiKey: String,
+        sentences: List<String>,
+        sourceLanguageId: String,
+        targetLanguageId: String,
+        enableThinking: Boolean,
+        thinkingBudget: Int
+    ): List<TermSuggestion> {
+        if (sentences.isEmpty()) return emptyList()
+        val endpoint = normalizeBaseUrl(baseUrl) + "/chat/completions"
+        val providerId = provider.trim().lowercase()
+        val traceId = "term-" + SystemClock.elapsedRealtime().toString()
+        val initialThinking = ThinkingSupport.initialMode(
+            providerSupportsThinking = ThinkingSupport.providerSupportsThinking(providerId),
+            enableThinking = enableThinking
+        )
+        val picked = sentences.map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_TERM_INPUT_SENTENCES)
+        if (picked.isEmpty()) return emptyList()
+        val input = JSONArray().apply { picked.forEach { put(it.take(300)) } }
+        val prompt = buildTermPrompt(sourceLanguageId, targetLanguageId, picked.size)
+        val result = requestWithFallback(
+            endpoint = endpoint,
+            model = model,
+            apiKey = apiKey,
+            traceId = traceId,
+            initialThinking = initialThinking,
+            initialJsonFormat = true
+        ) { useJsonFormat, thinking ->
+            buildTextTranslateBody(
+                model = model,
+                systemPrompt = "You extract proper nouns so a manga translator can render them consistently. " +
+                    "Return JSON only.",
+                prompt = prompt,
+                inputTextsJson = input.toString(),
+                useJsonResponseFormat = useJsonFormat,
+                thinking = thinking,
+                thinkingBudget = thinkingBudget.coerceIn(1024, 131072),
+                providerId = providerId,
+                maxOutputTokens = MAX_TERM_OUTPUT_TOKENS
+            )
+        }
+        val terms = parseTermSuggestions(result.raw)
+        Log.d(
+            TAG,
+            "[$traceId] extract_terms sentences=${picked.size} terms=${terms.size} " +
+                "finish=${result.finishReason ?: "-"}"
+        )
+        return terms
+    }
+
+    /**
+     * 术语提取提示词（2026-10-31）。
+     *
+     * 三条硬约束都来自「候选要能直接入库」：原文必须逐字照抄（否则注入翻译时匹配不上）、
+     * 必须给译名（不给就等于让用户自己起名）、只要专有名词（否则普通词会把术语表灌爆）。
+     */
+    internal fun buildTermPrompt(
+        sourceLanguageId: String,
+        targetLanguageId: String,
+        sentenceCount: Int
+    ): String {
+        val sourceName = languageDisplayName(sourceLanguageId)
+        val targetName = languageDisplayName(targetLanguageId)
+        return listOf(
+            "The input is $sentenceCount comic dialogue line(s) in $sourceName.",
+            "List the proper nouns a translator must render consistently: character names, places, " +
+                "organizations, items, and titles.",
+            "Only include names that appear literally in the input. Copy the source spelling exactly, " +
+                "do not normalize or translate it.",
+            "Give the best $targetName rendering for each term.",
+            "Ignore ordinary words, interjections, and onomatopoeia.",
+            "At most $MAX_TERM_RESULTS terms. If there is no proper noun, return an empty list.",
+            "Return JSON only with schema: " +
+                "{\"terms\":[{\"s\":\"source text\",\"t\":\"$targetName text\",\"k\":\"person|place|org|item|other\"}]}"
+        ).joinToString("\n")
+    }
+
+    internal fun parseTermSuggestions(raw: String): List<TermSuggestion> {
+        val text = runCatching { extractCompletionText(raw) }.getOrNull() ?: return emptyList()
+        val candidate = extractJsonCandidate(text)
+        if (candidate.isBlank()) return emptyList()
+        val arr = runCatching {
+            if (candidate.trimStart().startsWith("[")) {
+                JSONArray(candidate)
+            } else {
+                val root = JSONObject(candidate)
+                root.optJSONArray("terms")
+                    ?: root.optJSONArray("items")
+                    ?: root.optJSONArray("translations")
+                    ?: JSONArray()
+            }
+        }.getOrElse { return emptyList() }
+        val out = mutableListOf<TermSuggestion>()
+        for (i in 0 until arr.length()) {
+            val item = arr.opt(i) as? JSONObject ?: continue
+            val source = item.optString("s", "")
+                .ifBlank { item.optString("source", "") }
+                .ifBlank { item.optString("original", "") }
+                .trim()
+            val target = item.optString("t", "")
+                .ifBlank { item.optString("target", "") }
+                .ifBlank { item.optString("translation", "") }
+                .trim()
+            val kind = item.optString("k", "").ifBlank { item.optString("type", "") }.trim()
+            if (source.isEmpty() || target.isEmpty() || source == target) continue
+            if (out.any { it.source.equals(source, ignoreCase = true) }) continue
+            out += TermSuggestion(
+                source = source,
+                target = target,
+                kind = kind.ifBlank { "other" }
+            )
+        }
+        // OCR 常把一句长台词切成碎片，模型就会把「整句」和「截断后的尾巴」当成两个术语
+        // （实测：「데뷔못하면 죽는병걸림」与「죽는병걸림」同译文各占一条）。
+        // 规则只吃掉**同译文 + 归一化后互为子串**的碎片，保留最长的那条；
+        // 同译名的两个不同人名（例如两个角色都译成「小美」）互为子串的概率极低，不会被误删。
+        return dropFragmentDuplicates(out).take(MAX_TERM_RESULTS)
+    }
+
+    private fun dropFragmentDuplicates(items: List<TermSuggestion>): List<TermSuggestion> {
+        fun norm(text: String): String = text.lowercase().filter { it.isLetterOrDigit() }
+        val kept = mutableListOf<TermSuggestion>()
+        // 长的先过，碎片才会被判定为「被包含」而被丢掉。
+        items.sortedByDescending { norm(it.source).length }.forEach { item ->
+            val source = norm(item.source)
+            val target = norm(item.target)
+            val isFragment = kept.any { other ->
+                val otherSource = norm(other.source)
+                val otherTarget = norm(other.target)
+                // 原文互为子串（碎片）且译文也互为子串（碎片被单独翻译了一次）才算重复。
+                (otherSource.contains(source) || source.contains(otherSource)) &&
+                    (otherTarget == target || otherTarget.contains(target) || target.contains(otherTarget))
+            }
+            if (!isFragment) kept += item
+        }
+        // 还原成模型给出的顺序：用户按「先给的更可信」从上往下看。
+        return items.filter { it in kept }
     }
 
     fun groupTextBlocks(
@@ -370,20 +542,26 @@ class OpenAiVisionClient(
                 providerId = providerId
             )
         }
-return parseGroups(result.raw, blocks)
+        return parseGroups(result.raw, blocks)
     }
 
     fun fetchAvailableModels(baseUrl: String, apiKey: String): List<String> {
         if (baseUrl.isBlank() || apiKey.isBlank()) {
             throw IOException("Missing API config for fetching models")
         }
-        val endpoint = normalizeBaseUrl(baseUrl) + "/models"
-        val request = Request.Builder()
-            .url(endpoint)
-            .header("Authorization", "Bearer $apiKey")
-            .header("Accept", "application/json")
-            .get()
-            .build()
+        val normalizedBaseUrl = normalizeBaseUrl(baseUrl)
+        val endpoint = OpenCodeGoSupport.modelsEndpoint(normalizedBaseUrl)
+        // OpenCode Go 的模型元数据带 `api` 字段：只保留 Chat Completions 原生模型，
+        // 免得用户选到只走 Responses / Anthropic Messages 的模型后翻译必失败。
+        val filterByApi = OpenCodeGoSupport.isOpenCodeHost(normalizedBaseUrl)
+        val request = OpenCodeGoSupport.applyHeaders(
+            Request.Builder()
+                .url(endpoint)
+                .header("Authorization", "Bearer $apiKey")
+                .header("Accept", "application/json")
+                .get(),
+            endpoint
+        ).build()
         client.newCall(request).execute().use { response ->
             val raw = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
@@ -396,7 +574,9 @@ return parseGroups(result.raw, blocks)
             for (index in 0 until data.length()) {
                 val item = data.optJSONObject(index) ?: continue
                 val id = item.optString("id", "").trim()
-                if (id.isNotEmpty()) ids += id
+                if (id.isEmpty()) continue
+                if (filterByApi && !OpenCodeGoSupport.isChatCompletionsModel(item)) continue
+                ids += id
             }
             return ids.distinct().sorted()
         }
@@ -1226,12 +1406,14 @@ return parseGroups(result.raw, blocks)
         thinking: ThinkingMode
     ): ApiResult {
         val requestBody = body.toString()
-        val req = Request.Builder()
-            .url(endpoint)
-            .addHeader("Content-Type", "application/json")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .post(requestBody.toRequestBody("application/json".toMediaType()))
-            .build()
+        val req = OpenCodeGoSupport.applyHeaders(
+            Request.Builder()
+                .url(endpoint)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Authorization", "Bearer $apiKey")
+                .post(requestBody.toRequestBody("application/json".toMediaType())),
+            endpoint
+        ).build()
 
         val started = SystemClock.elapsedRealtime()
         Log.d(TAG, "[$traceId] request_send json_format=$jsonFormat thinking=${thinking.name} bytes=${requestBody.length}")
@@ -1275,7 +1457,16 @@ return parseGroups(result.raw, blocks)
      * 刻意**不打日志**：这一层要能被 JVM 单测直接调用（`android.util.Log` 在单测里 not mocked），
      * 失败原因通过 [ParsedTranslations.reason] 带出去，由调用方记录。
      */
-    internal fun parseTranslations(raw: String, sourceTexts: List<String>): ParsedTranslations {
+    internal fun parseTranslations(
+        raw: String,
+        sourceTexts: List<String>,
+        /**
+         * 是否必须带 `i` 序号。翻译请求现在把序号写进输入，生产链路一律传 true：
+         * 纯数组无法证明「返回的第 3 条对应输入的第 3 条」，长度相同也可能整体错位
+         * （整页上下文 + 缓存命中造成本批不连续时尤其危险）。单测/旧调用默认 false。
+         */
+        requireExplicitIndex: Boolean = false
+    ): ParsedTranslations {
         val text = runCatching { extractCompletionText(raw) }.getOrElse { err ->
             return ParsedTranslations(sourceTexts, parseFailed = true, reason = "empty_completion:${err.message?.take(60)}")
         }
@@ -1286,26 +1477,28 @@ return parseGroups(result.raw, blocks)
         return runCatching {
             if (candidate.trimStart().startsWith("[")) {
                 val arr = JSONArray(candidate)
-                return@runCatching ParsedTranslations(normalizeTranslationList(arr, sourceTexts), parseFailed = false, reason = null)
+                return@runCatching normalizeTranslationList(arr, sourceTexts, requireExplicitIndex)
             }
             val root = JSONObject(candidate)
             when {
-                root.has("translations") -> ParsedTranslations(
-                    normalizeTranslationList(root.optJSONArray("translations") ?: JSONArray(), sourceTexts),
-                    parseFailed = false,
-                    reason = null
+                root.has("translations") -> normalizeTranslationList(
+                    root.optJSONArray("translations") ?: JSONArray(),
+                    sourceTexts,
+                    requireExplicitIndex
                 )
                 root.has("items") -> {
                     val items = root.optJSONArray("items") ?: JSONArray()
                     val out = MutableList(sourceTexts.size) { index -> sourceTexts[index] }
                     for (i in 0 until items.length()) {
                         val item = items.optJSONObject(i) ?: continue
-                        val index = item.optInt("index", -1)
+                        val index = item.optInt("i", item.optInt("index", item.optInt("id", -1)))
                         if (index in out.indices) {
-                            out[index] = item.optString("text", out[index]).ifBlank { out[index] }
+                            val value = item.optString("t", "")
+                                .ifBlank { item.optString("text", out[index]) }
+                            out[index] = value.ifBlank { out[index] }
                         }
                     }
-                    ParsedTranslations(out, parseFailed = false, reason = null)
+                    ParsedTranslations(out, parseFailed = false, reason = null, indexed = true)
                 }
                 else -> ParsedTranslations(
                     sourceTexts,
@@ -1322,16 +1515,89 @@ return parseGroups(result.raw, blocks)
         }
     }
 
-    private fun normalizeTranslationList(arr: JSONArray, sourceTexts: List<String>): List<String> {
-        val out = MutableList(sourceTexts.size) { index -> sourceTexts[index] }
-        for (i in 0 until minOf(arr.length(), out.size)) {
-            val value = when (val item = arr.opt(i)) {
-                is JSONObject -> item.optString("text", out[i])
+    /**
+     * 数组形态的译文归一化（2026-10-31 修「译文贴错框」）。
+     *
+     * 旧实现**只按数组下标回填**：模型只要换一次顺序、或者多返回几条（注入了整页上下文时
+     * 很常见：整页 7 句、本批只缺 1 句，模型按整页顺序返回 7 条），整批译文就静默错位 ——
+     * 不报错、不重试、也不会被「译文==原文」的毒检查拦住，表现出来就是「话贴到别的框上」。
+     *
+     * 现在的口径：
+     * 1. 每条自带 `i`/`index`/`id` 时**只认序号**；序号越界/重复一律判 parseFailed
+     *    （真机事故：本批 7 句，模型按整页 1-based 返回 i=1..7，0 号被漏掉）；
+     * 2. 生产链路要求多句批次必须带序号（[requireExplicitIndex]），纯数组无法证明一一对应；
+     *    单句批次没有顺序歧义，仍容忍纯数组；
+     * 3. 纯数组只在单测/旧调用允许，且**长度必须与输入一致**，多一条只容忍「末尾空串」。
+     */
+    private fun normalizeTranslationList(
+        arr: JSONArray,
+        sourceTexts: List<String>,
+        requireExplicitIndex: Boolean
+    ): ParsedTranslations {
+        val indexedValues = HashMap<Int, String>()
+        val positionalValues = ArrayList<String>(arr.length())
+        val seenIndices = HashSet<Int>()
+        var sawIndex = false
+        var sawOutOfRange = false
+        var sawDuplicate = false
+        for (i in 0 until arr.length()) {
+            val item = arr.opt(i)
+            val value = when (item) {
+                is JSONObject -> item.optString("t", "").ifBlank { item.optString("text", "") }
                 else -> item?.toString().orEmpty()
+            }.trim()
+            positionalValues += value
+            val index = if (item is JSONObject) {
+                item.optInt("i", item.optInt("index", item.optInt("id", -1)))
+            } else {
+                -1
             }
-            out[i] = value.ifBlank { out[i] }
+            if (index in sourceTexts.indices) {
+                sawIndex = true
+                if (!seenIndices.add(index)) sawDuplicate = true
+                if (value.isNotEmpty()) indexedValues[index] = value
+            } else if (index >= 0) {
+                // 页面上下文用 C1..Cn / 或 1-based 序号时，模型可能把 7 句本批输入返回成
+                // i=1..7。旧实现把越界项静默丢掉，0 号留原文，看起来「翻了一部分」；
+                // 这里必须判失败，交给拆批/重试，不能把错位结果写进句子缓存。
+                sawOutOfRange = true
+            }
         }
-        return out
+        if (sawIndex) {
+            if (requireExplicitIndex && (sawOutOfRange || sawDuplicate)) {
+                return ParsedTranslations(
+                    sourceTexts,
+                    parseFailed = true,
+                    reason = "bad_index out_of_range=$sawOutOfRange duplicate=$sawDuplicate " +
+                        "got=${positionalValues.size} want=${sourceTexts.size}",
+                    indexed = true
+                )
+            }
+            val out = MutableList(sourceTexts.size) { index ->
+                indexedValues[index] ?: sourceTexts[index]
+            }
+            return ParsedTranslations(out, parseFailed = false, reason = null, indexed = true)
+        }
+        if (requireExplicitIndex && sourceTexts.size > 1) {
+            return ParsedTranslations(
+                sourceTexts,
+                parseFailed = true,
+                reason = "missing_index got=${positionalValues.size} want=${sourceTexts.size}"
+            )
+        }
+        val trailingBlank = positionalValues.size == sourceTexts.size + 1 &&
+            positionalValues.last().isEmpty()
+        if (positionalValues.size != sourceTexts.size && !trailingBlank) {
+            return ParsedTranslations(
+                sourceTexts,
+                parseFailed = true,
+                reason = "length_mismatch got=${positionalValues.size} want=${sourceTexts.size}"
+            )
+        }
+        val out = MutableList(sourceTexts.size) { index ->
+            positionalValues.getOrNull(index).orEmpty().ifBlank { sourceTexts[index] }
+        }
+        return ParsedTranslations(out, parseFailed = false, reason = null)
     }
 
     private fun parseGroups(raw: String, blocks: List<TextBlock>): List<TextBlockGroup> {
@@ -1687,7 +1953,13 @@ return parseGroups(result.raw, blocks)
             "Translate each input text into $targetName. They are dialogue or narration from a comic page.",
             "Keep the original meaning; do not add information not present in the source and do not omit content.",
             "Keep order strictly the same as input index.",
-            "Return JSON only with schema: {\"translations\":[\"t0\",\"t1\", ...]}",
+            // 2026-10-31：必须让每条译文自带序号。旧版让模型返回纯数组，顺序一旦变化
+            // 就会整批贴错框（静默、无重试）。序号必须来自输入下标，不能按整页阅读顺序编。
+            "INPUT_TEXTS_JSON is an array of objects: [{\"i\":0,\"text\":\"...\"}, ...].",
+            "Translate only the \"text\" field of each input object. Never translate the context block.",
+            "Return JSON only with schema: {\"translations\":[{\"i\":0,\"t\":\"...\"},{\"i\":1,\"t\":\"...\"}]}",
+            "Each \"i\" must be copied from the input object's \"i\"; never renumber by page order, " +
+                "context order, or sentence order.",
             "The translations array length must equal input length = ${texts.size}.",
             "Write natural spoken $targetName that matches the tone of the source " +
                 "(casual speech stays casual, exclamations stay exclamations).",
@@ -1743,17 +2015,20 @@ return parseGroups(result.raw, blocks)
         if (shown.size <= texts.size) return null
         val truncated = shown.size < normalizedPage.size
         return buildString {
+            // 2026-10-31：上下文用 C1..Cn 标号，刻意不复用 input 的 0..n-1 数字。
+            // 真机事故里模型把 [1]..[7] 的上下文当成输入序号，整批译文错一位；
+            // 现在两套编号长得不一样，模型无法「顺手」复用。
             append("The full page, in reading order, is context only")
             append(" (some lines may be omitted or already translated):\n")
             shown.forEachIndexed { index, line ->
-                append("[").append(index + 1).append("] ").append(line).append('\n')
+                append("[C").append(index + 1).append("] ").append(line).append('\n')
             }
             if (truncated) append("... (context truncated)\n")
             append(
                 "Use this context to resolve pronouns, omitted subjects, speaker tone, " +
                     "honorifics, and continuity across nearby lines. Translate only " +
                     "INPUT_TEXTS_JSON; do not translate the context lines, and do not merge " +
-                    "or split input lines."
+                    "or split input lines. Context labels C1..Cn are NOT input indices."
             )
         }
     }
@@ -1942,7 +2217,9 @@ return parseGroups(result.raw, blocks)
         val values: List<String>,
         val parseFailed: Boolean,
         /** 失败原因（供调用方打日志）：`no_json_candidate` / `missing_translations_key` / … */
-        val reason: String? = null
+        val reason: String? = null,
+        /** 本次响应是否带了 `i` 序号（诊断「整批错位」时看这一位）。 */
+        val indexed: Boolean = false
     )
 
     private data class BaiduAccessTokenCache(
@@ -1961,6 +2238,10 @@ private companion object {
         const val TAG = "VisionClient"
         const val READ_TIMEOUT_SECONDS = 120L
         const val MAX_OUTPUT_TOKENS = 2048
+        /** 句子级术语提取：一批最多看几句、最多要几个词、输出上限（2026-10-31）。 */
+        const val MAX_TERM_INPUT_SENTENCES = 40
+        const val MAX_TERM_RESULTS = 20
+        const val MAX_TERM_OUTPUT_TOKENS = 2048
         /** 云端文本翻译：每句预留的输出 token（20 句的 JSON 在 2048 上限下必被截断）。 */
         const val TRANSLATE_OUTPUT_TOKENS_PER_TEXT = 96
         /** 单次翻译请求的输出 token 上限（再大就该靠拆批，而不是赌模型不啰嗦）。 */
@@ -2008,6 +2289,18 @@ data class TextTranslationOutcome(
 )
 
 /**
+ * AI 提取出的一条术语候选（2026-10-31）。
+ *
+ * 只做「候选」，不自动入库：用户勾选/改译名后才写进术语表。
+ * [source] 要求与原文逐字一致，否则后续匹配不上；[kind] 是 person/place/org/item/other。
+ */
+data class TermSuggestion(
+    val source: String,
+    val target: String,
+    val kind: String = "other"
+)
+
+/**
  * 思考参数的发送模式（2026-10-02 新增，用户要求「加一个参数表示是否开启思考功能」）。
  *
  * - [ENABLED]：显式打开。
@@ -2026,8 +2319,8 @@ enum class ThinkingMode { ENABLED, DISABLED_EXPLICIT, OMIT }
  * `com.manga.translator.store.AiProvider.supportsThinking` 一致，避免两处各自漂移。
  */
 object ThinkingSupport {
-    /** 与 `AiProvider.QWEN` / `AiProvider.GLM` / `AiProvider.DEEPSEEK` 对应（注意同步修改两边）。 */
-    private val PROVIDER_IDS = setOf("qwen", "glm", "deepseek")
+    /** 与 `AiProvider.QWEN` / `AiProvider.GLM` / `AiProvider.DEEPSEEK` / `AiProvider.OPENCODE_GO` 对应（注意同步修改两边）。 */
+    private val PROVIDER_IDS = setOf("qwen", "glm", "deepseek", "opencode-go")
 
     /**
      * 思考字段有两种「方言」（2026-10-12 按各家官方文档修正）：
@@ -2036,8 +2329,11 @@ object ThinkingSupport {
      *
      * DeepSeek 官方端点对不认识的字段是**静默忽略**（不报错）——此前错发千问方言的
      * `enable_thinking:false`，结果「关思考」完全没生效且降级链也不会触发（无错误可判）。
+     *
+     * OpenCode Go 的 DeepSeek 模型同样接受 `thinking.type`（Go 中继对 DeepSeek 的
+     * `reasoning_effort` 组合反而会 400）；GLM 也走 type 方言。
      */
-    private val THINKING_TYPE_PROVIDERS = setOf("glm", "deepseek")
+    private val THINKING_TYPE_PROVIDERS = setOf("glm", "deepseek", "opencode-go")
 
     fun providerSupportsThinking(providerId: String): Boolean {
         return providerId.trim().lowercase() in PROVIDER_IDS

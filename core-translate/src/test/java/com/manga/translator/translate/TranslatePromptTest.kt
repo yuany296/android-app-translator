@@ -43,6 +43,24 @@ class TranslatePromptTest {
     }
 
     @Test
+    fun userPrompt_requiresInputIndexesAndWarnsContextLabelsAreNotIndexes() {
+        val page = listOf("첫 줄", "둘째 줄", "셋째 줄")
+        val prompt = client.buildTranslatePrompt(
+            texts = listOf("첫 줄", "셋째 줄"),
+            sourceLanguageId = "ko",
+            targetLanguageId = "zh-cn",
+            pageContext = page
+        )
+        // 输入是带 i 的对象数组，模型不需要自己数第几个（数错就会整批错位）。
+        assertTrue(prompt.contains("INPUT_TEXTS_JSON is an array of objects"))
+        assertTrue(prompt.contains("Translate only the \"text\" field"))
+        assertTrue(prompt.contains("never renumber by page order"))
+        // 上下文标号刻意与输入序号区分开。
+        assertTrue(prompt.contains("[C1]"))
+        assertFalse(prompt.contains("[1] 첫 줄"))
+    }
+
+    @Test
     fun userPrompt_injectsOnlyGlossaryTermsPresentInThisBatch() {
         val glossary = listOf(
             "케이지" to "笼子",
@@ -73,8 +91,9 @@ class TranslatePromptTest {
             pageContext = page
         )
         assertTrue(prompt.contains("context only"))
-        assertTrue(prompt.contains("[1] 첫 줄"))
-        assertTrue(prompt.contains("[3] 셋째 줄"))
+        assertTrue(prompt.contains("[C1] 첫 줄"))
+        assertTrue(prompt.contains("[C3] 셋째 줄"))
+        assertTrue(prompt.contains("Context labels C1..Cn are NOT input indices"))
         assertTrue(prompt.contains("do not translate the context lines"))
         // 本批仍然只要求 1 条输出，不能把上下文也翻出来。
         assertTrue(prompt.contains("input length = 1"))
@@ -97,7 +116,7 @@ class TranslatePromptTest {
         val page = (1..120).map { "line$it" }
         val block = requireNotNull(client.buildPageContextBlock(page, listOf("line1")))
         assertTrue(block.contains("context truncated"))
-        assertEquals(80, Regex("\\[\\d+\\]").findAll(block).count())
+        assertEquals(80, Regex("\\[C\\d+\\]").findAll(block).count())
     }
 
     @Test

@@ -9,14 +9,38 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+/**
+ * 一条句子译文（2026-10-31 起也是「句子历史」的一行）。
+ *
+ * [originLabel] / [originPageHash] / [createdAtMs] / [lastHitAtMs] / [hitCount] 是
+ * 2026-10-31 新增的溯源元数据：以前只有原文和译文，界面上没法回答「这句是哪来的、
+ * 什么时候翻的、被复用过几次」。旧文件缺这些字段时按默认值补齐，不做版本作废。
+ */
 data class SentenceTranslation(
     val sourceLanguage: String,
     val targetLanguage: String,
     val originalText: String,
-    val translatedText: String
+    val translatedText: String,
+    /** 展示用来源（站点 host 或「悬浮球」），空 = 旧数据未知。 */
+    val originLabel: String = "",
+    /** 最近一次出现的页面标识，用于「按页」分组。 */
+    val originPageHash: String = "",
+    val createdAtMs: Long = 0L,
+    val lastHitAtMs: Long = 0L,
+    val hitCount: Int = 0
 )
 
 enum class SentenceCacheMatchKind { EXACT, COMPACT, FUZZY }
+
+/**
+ * 回填来源用的快照坐标（2026-10-31）：某一页的标识和它被翻译的时间。
+ *
+ * 见 [SentenceTranslationRepository.backfillOrigin]。
+ */
+data class OriginSnapshot(
+    val pageHash: String,
+    val timestampMs: Long
+)
 
 /**
  * 句子缓存的坐标（2026-10-15）。
@@ -57,6 +81,7 @@ class SentenceTranslationRepository(context: Context) {
     private val index = linkedMapOf<String, SentenceTranslation>()
     private var compactDirty = true
     private val compactIndex = hashMapOf<String, MutableList<String>>()
+    private var lastStatsPersistMs = 0L
 
     fun lookup(sourceLanguage: String, targetLanguage: String, originalText: String): SentenceCacheLookup {
         val normalized = normalize(originalText)
@@ -70,7 +95,7 @@ class SentenceTranslationRepository(context: Context) {
                     Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=exact text=${truncate(originalText)}")
                     return SentenceCacheLookup.MISS
                 }
-                return SentenceCacheLookup(entry.translatedText, SentenceCacheMatchKind.EXACT)
+                return recordHit(entry, SentenceCacheMatchKind.EXACT)
             }
 
             val compact = compactKey(normalized)
@@ -84,7 +109,7 @@ class SentenceTranslationRepository(context: Context) {
                                 Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=compact text=${truncate(originalText)}")
                                 return SentenceCacheLookup.MISS
                             }
-                            return SentenceCacheLookup(entry.translatedText, SentenceCacheMatchKind.COMPACT)
+                            return recordHit(entry, SentenceCacheMatchKind.COMPACT)
                         }
                     }
                 }
@@ -113,7 +138,7 @@ class SentenceTranslationRepository(context: Context) {
                                 "lookup fuzzy_hit lang=$langKey dist=$bestDist " +
                                     "src=${truncate(originalText)} matched=${truncate(entry.originalText)}"
                             )
-                            return SentenceCacheLookup(entry.translatedText, SentenceCacheMatchKind.FUZZY)
+                            return recordHit(entry, SentenceCacheMatchKind.FUZZY)
                         }
                     }
                 }
@@ -123,7 +148,14 @@ class SentenceTranslationRepository(context: Context) {
         }
     }
 
-    fun put(sourceLanguage: String, targetLanguage: String, originalText: String, translatedText: String) {
+    fun put(
+        sourceLanguage: String,
+        targetLanguage: String,
+        originalText: String,
+        translatedText: String,
+        originLabel: String = "",
+        originPageHash: String = ""
+    ) {
         val normalized = normalize(originalText)
         val value = normalize(translatedText)
         if (normalized.isEmpty() || value.isEmpty()) return
@@ -136,16 +168,82 @@ class SentenceTranslationRepository(context: Context) {
         synchronized(lock) {
             ensureLoaded()
             val key = keyOf(sourceLanguage, targetLanguage, normalized)
-            index.remove(key)
+            val previous = index.remove(key)
+            val now = System.currentTimeMillis()
             index[key] = SentenceTranslation(
                 sourceLanguage = sourceLanguage,
                 targetLanguage = targetLanguage,
                 originalText = normalized,
-                translatedText = value
+                translatedText = value,
+                originLabel = originLabel.trim().ifBlank { previous?.originLabel.orEmpty() },
+                originPageHash = originPageHash.trim().ifBlank { previous?.originPageHash.orEmpty() },
+                // 首次写入时间沿用旧值，避免改一次译文就把「什么时候开始的」冲掉。
+                createdAtMs = previous?.createdAtMs?.takeIf { it > 0L } ?: now,
+                lastHitAtMs = previous?.lastHitAtMs ?: 0L,
+                hitCount = previous?.hitCount ?: 0
             )
             compactDirty = true
             trimIfNeeded()
             persist()
+        }
+    }
+
+    /** 全量快照，按「最近用过」倒序；句子历史页的数据源。 */
+    fun all(): List<SentenceTranslation> {
+        synchronized(lock) {
+            ensureLoaded()
+            return index.values.sortedWith(
+                compareByDescending<SentenceTranslation> { maxOf(it.lastHitAtMs, it.createdAtMs) }
+                    .thenByDescending { it.createdAtMs }
+            )
+        }
+    }
+
+    /**
+     * 用历史快照回填旧条目的「来自哪一页 / 什么时候翻的」（2026-10-31）。
+     *
+     * 为什么需要：`originPageHash` / `createdAtMs` 是 2026-10-31 才加的字段，
+     * 之前的句子一律是空值。于是「翻译历史 → 按页」会把这批句子全部归成一组
+     * 「来源未知」，界面上跟「按句」看不出区别 —— 用户反馈的正是这个。
+     * 而页面级的历史快照里正好留着每页的 pageHash、时间和当时的原文，可以补回去。
+     *
+     * **只填空字段，不覆盖已有值**；重复调用幂等。返回真正被补上的条数
+     * （0 = 没有可补的，调用方不必提示）。
+     *
+     * 注意 [mapping] 的键必须用 [originKey] 构造，否则一条也匹配不上（且不会报错）。
+     */
+    fun backfillOrigin(mapping: Map<String, OriginSnapshot>): Int {
+        if (mapping.isEmpty()) return 0
+        synchronized(lock) {
+            ensureLoaded()
+            var filled = 0
+            for ((key, entry) in index.toList()) {
+                val patched = backfilledEntry(entry, mapping[key]) ?: continue
+                index[key] = patched
+                filled += 1
+            }
+            if (filled > 0) persist()
+            return filled
+        }
+    }
+
+    /** 改译文：只动这一条，命中统计与来源保持不变。返回是否命中到条目。 */
+    fun updateTranslation(
+        sourceLanguage: String,
+        targetLanguage: String,
+        originalText: String,
+        translatedText: String
+    ): Boolean {
+        val normalized = normalize(originalText)
+        val value = normalize(translatedText)
+        if (normalized.isEmpty() || value.isEmpty()) return false
+        synchronized(lock) {
+            ensureLoaded()
+            val key = keyOf(sourceLanguage, targetLanguage, normalized)
+            val entry = index[key] ?: return false
+            index[key] = entry.copy(translatedText = value)
+            persist()
+            return true
         }
     }
 
@@ -196,6 +294,23 @@ class SentenceTranslationRepository(context: Context) {
         return remove(listOf(SentenceCacheKey(sourceLanguage, targetLanguage, originalText))) > 0
     }
 
+    /**
+     * 命中计数（2026-10-31）：给句子历史页显示「命中 N 次 / 最近使用」。
+     *
+     * 只更新内存并**限频落盘**（最多 30 秒一次）：lookup 在翻译热路径上，一页几十句，
+     * 每命中一次就重写 400KB 的 JSON 会把 I/O 打满。
+     */
+    private fun recordHit(entry: SentenceTranslation, kind: SentenceCacheMatchKind): SentenceCacheLookup {
+        val now = System.currentTimeMillis()
+        val updated = entry.copy(hitCount = entry.hitCount + 1, lastHitAtMs = now)
+        index[keyOf(entry.sourceLanguage, entry.targetLanguage, entry.originalText)] = updated
+        if (now - lastStatsPersistMs >= STATS_PERSIST_INTERVAL_MS) {
+            lastStatsPersistMs = now
+            runCatching { persist() }
+        }
+        return SentenceCacheLookup(updated.translatedText, kind)
+    }
+
     private fun ensureLoaded() {
         if (loaded) return
         loaded = true
@@ -225,7 +340,13 @@ class SentenceTranslationRepository(context: Context) {
                     sourceLanguage = sourceLanguage,
                     targetLanguage = targetLanguage,
                     originalText = originalText,
-                    translatedText = translatedText
+                    translatedText = translatedText,
+                    // 2026-10-31 新增字段：旧文件没有 → 默认值（来源未知、时间未知）。
+                    originLabel = item.optString("originLabel", ""),
+                    originPageHash = item.optString("originPageHash", ""),
+                    createdAtMs = item.optLong("createdAtMs", 0L),
+                    lastHitAtMs = item.optLong("lastHitAtMs", 0L),
+                    hitCount = item.optInt("hitCount", 0)
                 )
             }
             compactDirty = true
@@ -262,6 +383,11 @@ class SentenceTranslationRepository(context: Context) {
                     .put("targetLanguage", entry.targetLanguage)
                     .put("originalText", entry.originalText)
                     .put("translatedText", entry.translatedText)
+                    .put("originLabel", entry.originLabel)
+                    .put("originPageHash", entry.originPageHash)
+                    .put("createdAtMs", entry.createdAtMs)
+                    .put("lastHitAtMs", entry.lastHitAtMs)
+                    .put("hitCount", entry.hitCount)
             )
         }
         file.writeText(
@@ -341,6 +467,39 @@ class SentenceTranslationRepository(context: Context) {
         const val MAX_ENTRIES = 5000
 
         /**
+         * 回填规则（纯函数，便于单测）：返回补好的条目，或 null 表示这条不用动。
+         *
+         * 三条规矩：
+         * 1. 没有快照 → 不动；
+         * 2. 只填空字段，已有值一律保留（旧数据可能比历史快照更准）；
+         * 3. 两个字段都已填 → 不动（幂等的来源：重复跑返回 0）。
+         */
+        fun backfilledEntry(
+            entry: SentenceTranslation,
+            snapshot: OriginSnapshot?
+        ): SentenceTranslation? {
+            if (snapshot == null) return null
+            val needHash = entry.originPageHash.isEmpty()
+            val needTime = entry.createdAtMs <= 0L
+            if (!needHash && !needTime) return null
+            return entry.copy(
+                originPageHash = if (needHash) snapshot.pageHash else entry.originPageHash,
+                createdAtMs = if (needTime) snapshot.timestampMs else entry.createdAtMs
+            )
+        }
+
+        /**
+         * 句子表的键：`源语言|目标语言|原文`（原文按入库规则归一化：去首尾空白 + 压缩空白）。
+         *
+         * 暴露出来是给「用历史快照回填来源」用的 —— 回填方必须和内部用同一套键，
+         * 否则一条也匹配不上，而且不会报错（只会静默回填 0 条）。
+         */
+        fun originKey(sourceLanguage: String, targetLanguage: String, originalText: String): String {
+            val text = originalText.trim().replace(Regex("\\s+"), " ")
+            return "${sourceLanguage.trim()}|${targetLanguage.trim()}|$text"
+        }
+
+        /**
          * 句子缓存语义版本（2026-10-18）。提示词、页面上下文策略或翻译规则发生
          * 影响译文的改变时 +1：旧条目在 [ensureLoaded] 时整份丢弃，避免旧硬译
          * 永远命中、新策略只对新句子生效。
@@ -350,5 +509,8 @@ class SentenceTranslationRepository(context: Context) {
         private const val MIN_FUZZY_COMPACT_LEN = 8
         private const val MIN_COMMON_PREFIX = 6
         private const val FUZZY_TOLERANCE_LONG_LEN = 14
+
+        /** 命中统计的落盘间隔（毫秒）：翻译热路径上不能每次命中都重写整份 JSON。 */
+        private const val STATS_PERSIST_INTERVAL_MS = 30_000L
     }
 }

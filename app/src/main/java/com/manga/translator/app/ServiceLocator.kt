@@ -13,7 +13,9 @@ import com.manga.translator.store.GlossaryRepository
 import com.manga.translator.store.BrowserFavoriteRepository
 import com.manga.translator.store.BrowserHistoryRepository
 import com.manga.translator.store.OcrEngine
+import com.manga.translator.store.OriginSnapshot
 import com.manga.translator.store.PageOverlayAdjustmentRepository
+import com.manga.translator.store.parseHistoryBubbles
 import com.manga.translator.store.SentenceTranslationRepository
 import com.manga.translator.store.SettingsRepository
 import com.manga.translator.store.TranslationHistoryRepository
@@ -173,6 +175,79 @@ object ServiceLocator {
     }
 
     /**
+     * 解析「AI 术语提取」用的 API 配置；null = 云端不可用，提取按钮点了也没用。
+     *
+     * 口径与 [resolveVisionApiConfig] 完全同构（2026-10-31 用户要求「加一个和多模态重读一样的配置」）：
+     * - 首页「AI 术语提取」区块里**选了档案** → 用那个档案（翻译选百度 / ML Kit 也不影响提取）；
+     * - **没选**（空指针）→ 跟随翻译配置：翻译走云端 + 有 key 才可用。
+     *
+     * 与重读的区别：模型取档案的 `translateModel`，不取 `visionModel` —— 提取是纯文本任务，
+     * 用视觉模型的价位去跑划不来（且视觉模型的上下文经常不支持长文本）。
+     */
+    fun resolveTermApiConfig(): TermApiConfig? {
+        val s = settingsRepository.getSettings()
+        val termProfileName = settingsRepository.getLastTermProfileName()
+        if (termProfileName.isNotEmpty()) {
+            val profile = settingsRepository.getProfile(termProfileName) ?: return null
+            if (profile.translateBaseUrl.isBlank() || profile.translateApiKey.isBlank()) return null
+            return TermApiConfig(
+                providerId = profile.translateProvider,
+                baseUrl = profile.translateBaseUrl,
+                model = profile.translateModel,
+                apiKey = profile.translateApiKey,
+                enableThinking = profile.enableThinking,
+                thinkingBudget = profile.thinkingBudget
+            )
+        }
+        val cloudReady = com.manga.translator.store.TranslateEngine.fromId(s.translateEngine) ==
+            com.manga.translator.store.TranslateEngine.CLOUD &&
+            s.translateBaseUrl.isNotBlank() &&
+            s.translateApiKey.isNotBlank()
+        if (!cloudReady) return null
+        return TermApiConfig(
+            providerId = s.translateProvider,
+            baseUrl = s.translateBaseUrl,
+            model = s.translateModel,
+            apiKey = s.translateApiKey,
+            enableThinking = s.enableThinking,
+            thinkingBudget = s.thinkingBudget
+        )
+    }
+
+    /**
+     * 用页面级历史快照给句子表补「来自哪一页 / 什么时候翻的」（2026-10-31，幂等）。
+     *
+     * 为什么要在启动时补一次：这两个字段是今天才加的，之前存的句子全是空值，
+     * 于是「翻译历史 → 按页」会把这批句子糊成一组「来源未知」，跟「按句」看不出区别。
+     * 历史快照里恰好留着每页的 pageHash、时间和当时的原文，能对得上就补上。
+     *
+     * 只填空字段（不覆盖已有值），所以重复运行没有副作用；返回补了几条。
+     * 匹配用的键必须和仓库内部一致，因此统一走 [SentenceTranslationRepository.originKey]。
+     */
+    fun backfillSentenceOrigin(): Int {
+        val history = runCatching { translationHistoryRepository.all() }.getOrDefault(emptyList())
+        if (history.isEmpty()) return 0
+        val mapping = HashMap<String, OriginSnapshot>()
+        // history 已按时间倒序：同一句在多页出现时，先遇到的是最近那次，正是想要的。
+        for (entry in history) {
+            val pageHash = entry.pageHash
+            if (pageHash.isBlank()) continue
+            parseHistoryBubbles(entry.bubblesJson).forEach { bubble ->
+                val key = SentenceTranslationRepository.originKey(
+                    entry.sourceLanguage,
+                    entry.targetLanguage,
+                    bubble.originalText
+                )
+                if (!mapping.containsKey(key)) {
+                    mapping[key] = OriginSnapshot(pageHash, entry.timestampMs)
+                }
+            }
+        }
+        if (mapping.isEmpty()) return 0
+        return sentenceTranslationRepository.backfillOrigin(mapping)
+    }
+
+    /**
      * 把位图编码成多模态 OCR 用的 JPEG data URL。
      *
      * 像素量超过 [VISION_MAX_PIXELS] 时等比缩小（长图 webtoon 一页 720×6000+，
@@ -209,6 +284,16 @@ data class VisionApiConfig(
     val apiKey: String
 )
 
+/** AI 术语提取解析出的 API 配置（见 [ServiceLocator.resolveTermApiConfig]）。 */
+data class TermApiConfig(
+    val providerId: String,
+    val baseUrl: String,
+    val model: String,
+    val apiKey: String,
+    val enableThinking: Boolean,
+    val thinkingBudget: Int
+)
+
 /**
  * 按设置选择本地 OCR 引擎；Paddle 引擎失败时回退 ML Kit。
  *
@@ -230,18 +315,33 @@ class EngineSelectingTextDetector(
     /** 本进程内「本地空结果 → 多模态也没读出」的连续次数。 */
     private var emptyVisionMisses = 0
 
-    override fun detect(bitmap: android.graphics.Bitmap, sourceLanguageId: String): List<TextBlock> {
+    override fun detect(bitmap: android.graphics.Bitmap, sourceLanguageId: String): List<TextBlock> =
+        detect(bitmap, sourceLanguageId, seamTopPx = 0, seamBottomPx = 0)
+
+    override fun detect(
+        bitmap: android.graphics.Bitmap,
+        sourceLanguageId: String,
+        seamTopPx: Int,
+        seamBottomPx: Int
+    ): List<TextBlock> {
         val settings = ServiceLocator.settingsRepository.getSettings()
-        val local = detectWithEngineFallback(bitmap, sourceLanguageId)
+        val local = detectWithEngineFallback(bitmap, sourceLanguageId, seamTopPx, seamBottomPx)
         return maybeVisionFallback(bitmap, local, sourceLanguageId, settings)
     }
 
     /** 原有引擎选择：Paddle 失败/为空回退 ML Kit。 */
-    private fun detectWithEngineFallback(bitmap: android.graphics.Bitmap, sourceLanguageId: String): List<TextBlock> {
+    private fun detectWithEngineFallback(
+        bitmap: android.graphics.Bitmap,
+        sourceLanguageId: String,
+        seamTopPx: Int,
+        seamBottomPx: Int
+    ): List<TextBlock> {
         val settings = ServiceLocator.settingsRepository.getSettings()
         val engine = OcrEngine.fromId(settings.ocrEngine)
         if (engine == OcrEngine.PADDLE) {
-            val paddleBlocks = runCatching { paddle.detect(bitmap, sourceLanguageId) }
+            val paddleBlocks = runCatching {
+                paddle.detect(bitmap, sourceLanguageId, seamTopPx, seamBottomPx)
+            }
                 .getOrElse { err ->
                     android.util.Log.w(TAG, "paddle_fallback_to_mlkit reason=${err.message?.take(80)}")
                     null
@@ -251,7 +351,7 @@ class EngineSelectingTextDetector(
             }
             android.util.Log.d(TAG, "paddle_empty_fallback_to_mlkit")
         }
-        return mlKit.detect(bitmap, sourceLanguageId)
+        return mlKit.detect(bitmap, sourceLanguageId, seamTopPx, seamBottomPx)
     }
 
     /** 低质量回退多模态：API 可用（见 [ServiceLocator.resolveVisionApiConfig]）+ 闸门通过才发请求；目标脚本更多才替换。 */

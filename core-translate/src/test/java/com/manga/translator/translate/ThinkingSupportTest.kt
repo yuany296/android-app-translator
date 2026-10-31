@@ -12,7 +12,7 @@ import org.junit.Test
  *
  * 背景：用户在「新建配置」里要求加一个「是否开启思考功能」的参数，并明确
  * 「有思考功能会慢很多」。这里锁定四件事：
- * 1. 只有千问 / GLM / DeepSeek 走思考参数（与 `AiProvider.supportsThinking` 一致）；
+ * 1. 只有千问 / GLM / DeepSeek / OpenCode Go 走思考参数（与 `AiProvider.supportsThinking` 一致）；
  * 2. 关闭时**显式发**关闭字段（否则 Qwen3 / DeepSeek 这类默认开思考的模型不受控）；
  * 3. 不支持的厂商保持旧行为（完全不发该字段）；
  * 4. 字段方言分两家：千问发 `enable_thinking`（+`thinking_budget`），
@@ -23,10 +23,11 @@ class ThinkingSupportTest {
     private val maxOutputTokens = 2048
 
     @Test
-    fun providerSupportsThinking_onlyQwenGlmDeepseek() {
-        listOf("qwen", "glm", "deepseek", " Qwen ", "GLM\n", "DeepSeek").forEach { id ->
-            assertTrue("应支持思考参数：$id", ThinkingSupport.providerSupportsThinking(id))
-        }
+    fun providerSupportsThinking_onlyQwenGlmDeepseekAndOpencodeGo() {
+        listOf("qwen", "glm", "deepseek", "opencode-go", " Qwen ", "GLM\n", "DeepSeek", " OpenCode-Go ")
+            .forEach { id ->
+                assertTrue("应支持思考参数：$id", ThinkingSupport.providerSupportsThinking(id))
+            }
         listOf("openai", "kimi", "siliconflow", "volces", "custom", "baidu", "")
             .forEach { id ->
                 assertFalse("不应支持思考参数：$id", ThinkingSupport.providerSupportsThinking(id))
@@ -113,7 +114,7 @@ class ThinkingSupportTest {
 
     @Test
     fun applyTo_deepseekEnabledSendsThinkingTypeEnabled() {
-        listOf("glm", "deepseek").forEach { providerId ->
+        listOf("glm", "deepseek", "opencode-go").forEach { providerId ->
             val body = JSONObject()
 
             ThinkingSupport.applyTo(
@@ -133,7 +134,7 @@ class ThinkingSupportTest {
 
     @Test
     fun applyTo_deepseekDisabledSendsThinkingTypeDisabledWithMaxTokens() {
-        listOf("glm", "deepseek").forEach { providerId ->
+        listOf("glm", "deepseek", "opencode-go").forEach { providerId ->
             val body = JSONObject()
 
             ThinkingSupport.applyTo(
@@ -155,7 +156,7 @@ class ThinkingSupportTest {
 
     @Test
     fun applyTo_omitSendsNoThinkingField() {
-        listOf("qwen", "glm", "deepseek", "kimi").forEach { providerId ->
+        listOf("qwen", "glm", "deepseek", "opencode-go", "kimi").forEach { providerId ->
             val body = JSONObject()
 
             ThinkingSupport.applyTo(body, ThinkingMode.OMIT, budget = 8192, maxOutputTokens = maxOutputTokens, providerId = providerId)

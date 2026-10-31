@@ -156,6 +156,8 @@ class TranslateOrchestrator(
                 }
             )
         } else {
+            // 2026-10-31：截图链路的句子来源只能是「截图翻译」（拿不到被翻译 App 的身份）。
+            com.manga.translator.store.TranslationOrigin.label = "截图翻译"
             translationResolver.resolveTranslations(
                 bubbles = effectiveOcrResult.bubbles,
                 settings = settings,
@@ -636,7 +638,17 @@ private data class VisualPrep(
         val bubbleColors = result.bubbles.mapIndexed { index, bubble ->
             index to ServiceLocator.bubbleColorExtractor.extract(screenshotBitmap, bubble)
         }.toMap()
-        timer.mark("bubble_colors", "count=${bubbleColors.size}")
+        timer.mark(
+            "bubble_colors",
+            bubbleColors.entries.sortedBy { it.key }.joinToString(" ") { (index, color) ->
+                "b$index=#%06X/#%06X(n=%d/%d)".format(
+                    color.textColor and 0xFFFFFF,
+                    color.bgColor and 0xFFFFFF,
+                    color.inkSamples,
+                    color.bgSamples
+                )
+            }
+        )
         return VisualPrep(
             erasePatches = erasePatches,
             bubbleRenderRects = bubbleRenderRects,

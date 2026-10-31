@@ -72,6 +72,8 @@ enum class MainTab(val label: String) {
     HOME("首页"),
     BROWSER("浏览器"),
     GLOSSARY("术语表"),
+    // 2026-10-31 用户裁定：底栏仍叫「翻译历史」。这一页的内容从「每页一条快照」
+    // 换成了句子表本身，但对用户来说它就是这个功能的入口，名字不该跟着数据模型改。
     HISTORY("翻译历史")
 }
 
@@ -304,6 +306,10 @@ class MainActivity : ComponentActivity() {
                 var historyEntries by remember { mutableStateOf(emptyList<TranslationHistoryEntry>()) }
                 // 首次读盘完成前为 true，历史页据此显示「加载中」而不是空态（2026-10-22 用户反馈）。
                 var historyLoading by remember { mutableStateOf(true) }
+                // 2026-10-31：句子表（取代「翻译历史」快照视图）。界面直接读缓存本身，
+                // 看到的和真正生效的是同一份数据。
+                var sentenceEntries by remember { mutableStateOf(emptyList<com.manga.translator.store.SentenceTranslation>()) }
+                var sentencesLoading by remember { mutableStateOf(true) }
                 val scope = rememberCoroutineScope()
 
                 fun refreshGlossaryList() {
@@ -329,13 +335,109 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                fun refreshSentences() {
+                    scope.launch {
+                        sentenceEntries = withContext(Dispatchers.IO) {
+                            ServiceLocator.sentenceTranslationRepository.all()
+                        }
+                    }
+                }
+
+                // ---- AI 术语提取（2026-10-31）----
+                // 用户在句子列表里勾几句 → 这里只做「拿候选」，入库要等他在弹层里确认。
+                var termSheetOpen by remember { mutableStateOf(false) }
+                var termLoading by remember { mutableStateOf(false) }
+                var termError by remember { mutableStateOf<String?>(null) }
+                var termSuggestions by remember {
+                    mutableStateOf(emptyList<com.manga.translator.translate.TermSuggestion>())
+                }
+                var termSentenceCount by remember { mutableStateOf(0) }
+                var termTargets by remember {
+                    mutableStateOf(emptyList<com.manga.translator.store.SentenceTranslation>())
+                }
+                var termTarget by remember { mutableStateOf("") }
+                var termExisting by remember { mutableStateOf(emptySet<String>()) }
+
+                fun refreshTermExisting(collection: String) {
+                    termExisting = runCatching {
+                        ServiceLocator.glossaryRepository.getEntries(collection)
+                            .map { it.source.lowercase() }
+                            .toSet()
+                    }.getOrDefault(emptySet())
+                }
+
+                suspend fun runTermExtraction(
+                    targets: List<com.manga.translator.store.SentenceTranslation>,
+                    toast: (String) -> Unit
+                ) {
+                    // 术语提取有自己的档案指针（首页「AI 术语提取」区块）：
+                    // 空 = 跟随翻译配置。翻译走百度 / ML Kit 时这里仍可单独指一个云端档案。
+                    val api = ServiceLocator.resolveTermApiConfig()
+                    if (api == null) {
+                        toast("术语提取要云端 API · 去首页「AI 术语提取」选个配置档案")
+                        return
+                    }
+                    // 只把**原文**交给模型：它要判断哪个词是专有名词，看译文会被自己的译名带偏。
+                    val sentences = targets.map { it.originalText.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                    if (sentences.isEmpty()) {
+                        toast("选中的句子没有原文")
+                        return
+                    }
+                    val collections = runCatching {
+                        ServiceLocator.glossaryRepository.listCollections()
+                    }.getOrDefault(emptyList())
+                    val target = termTarget.ifBlank { collections.firstOrNull().orEmpty() }
+                    termTarget = target
+                    termSentenceCount = sentences.size
+                    termTargets = targets
+                    termSuggestions = emptyList()
+                    termError = null
+                    termLoading = true
+                    termSheetOpen = true
+                    if (target.isNotBlank()) refreshTermExisting(target)
+                    try {
+                        val result = withContext(Dispatchers.IO) {
+                            ServiceLocator.visionClient.extractTerms(
+                                provider = api.providerId,
+                                baseUrl = api.baseUrl,
+                                model = api.model,
+                                apiKey = api.apiKey,
+                                sentences = sentences,
+                                sourceLanguageId = targets.first().sourceLanguage,
+                                targetLanguageId = targets.first().targetLanguage,
+                                enableThinking = api.enableThinking,
+                                thinkingBudget = api.thinkingBudget
+                            )
+                        }
+                        termSuggestions = result
+                    } catch (err: Exception) {
+                        termError = err.message?.takeIf { it.isNotBlank() } ?: "网络或模型返回异常"
+                    } finally {
+                        termLoading = false
+                    }
+                }
+
+                // 一次性补齐旧句子的「来自哪一页 / 什么时候翻的」（2026-10-31，幂等）：
+                // 不补的话「翻译历史 → 按页」会把改造前的句子全糊成一组「来源未知」。
+                LaunchedEffect(Unit) {
+                    val filled = withContext(Dispatchers.IO) {
+                        runCatching { ServiceLocator.backfillSentenceOrigin() }
+                            .onFailure { Log.w(TAG, "sentence_origin_backfill_fail", it) }
+                            .getOrDefault(-1)
+                    }
+                    Log.i(TAG, "sentence_origin_backfill result=$filled")
+                    if (filled > 0) refreshSentences()
+                }
+
                 LaunchedEffect(pageIndex) {
                     if (pageIndex == MainTab.HISTORY.ordinal) {
-                        historyLoading = true
-                        historyEntries = withContext(Dispatchers.IO) {
-                            ServiceLocator.translationHistoryRepository.all()
+                        sentencesLoading = true
+                        sentenceEntries = withContext(Dispatchers.IO) {
+                            ServiceLocator.sentenceTranslationRepository.all()
                         }
-                        historyLoading = false
+                        sentencesLoading = false
                     }
                 }
 
@@ -586,97 +688,29 @@ class MainActivity : ComponentActivity() {
                             }
 
                             MainTab.HISTORY.ordinal -> {
-                                HistoryScreen(
-                                    entries = historyEntries,
-                                    isLoading = historyLoading,
-                                    onRefresh = { refreshHistory() },
-                                    onDelete = { id ->
+                                SentencesScreen(
+                                    entries = sentenceEntries,
+                                    isLoading = sentencesLoading,
+                                    onRefresh = { refreshSentences() },
+                                    onEdit = { entry, newText ->
                                         scope.launch {
-                                            withContext(Dispatchers.IO) {
-                                                ServiceLocator.translationHistoryRepository.delete(id)
-                                            }
-                                            refreshHistory()
-                                        }
-                                    },
-                                    onClear = {
-                                        scope.launch {
-                                            withContext(Dispatchers.IO) {
-                                                ServiceLocator.translationHistoryRepository.clear()
-                                            }
-                                            refreshHistory()
-                                            toast("翻译历史已清空")
-                                        }
-                                    },
-                                    // 改译文（2026-10-15）：历史只是快照，真正决定「下次遇到这句用什么」
-                                    // 的是句子缓存，所以两边一起改 —— 只动快照的话下次命中缓存还是旧的错译。
-                                    // 2026-10-15 补：改一条**已作废**的句子 = 让它重新生效（仓库里清
-                                    // `invalidated`），所以提示要明说，不能让用户以为改的是一条死条目。
-                                    onEditTranslation = { entryId, bubbleIndex, newText ->
-                                        scope.launch {
-                                            val ref = withContext(Dispatchers.IO) {
-                                                val updated = ServiceLocator.translationHistoryRepository
-                                                    .updateBubbleTranslation(entryId, bubbleIndex, newText)
-                                                    ?: return@withContext null
-                                                ServiceLocator.sentenceTranslationRepository.put(
-                                                    updated.sourceLanguage,
-                                                    updated.targetLanguage,
-                                                    updated.originalText,
+                                            val ok = withContext(Dispatchers.IO) {
+                                                ServiceLocator.sentenceTranslationRepository.updateTranslation(
+                                                    entry.sourceLanguage,
+                                                    entry.targetLanguage,
+                                                    entry.originalText,
                                                     newText
                                                 )
-                                                updated
                                             }
-                                            if (ref != null) {
-                                                refreshHistory()
-                                                toast(
-                                                    if (ref.wasInvalidated) {
-                                                        "已重新生效 · 以后遇到这句都用它"
-                                                    } else {
-                                                        "已更新译文 · 以后遇到这句都用它"
-                                                    }
-                                                )
-                                            } else {
-                                                toast("这条记录已不存在")
-                                            }
+                                            refreshSentences()
+                                            toast(if (ok) "已更新译文 · 以后遇到这句都用它" else "这条已不存在")
                                         }
                                     },
-                                    // 作废单句：删掉这条缓存，下次遇到重新翻译（治「原文本身就被错拼」）。
-                                    // 2026-10-15：同时把历史里这句标成「已作废」并刷新列表 —— 以前只删缓存，
-                                    // 列表看上去一模一样，用户以为它还能用（用户反馈）。
-                                    onInvalidateBubble = { entryId, bubbleIndex ->
+                                    onInvalidate = { targets ->
                                         scope.launch {
                                             val removed = withContext(Dispatchers.IO) {
-                                                val ref = ServiceLocator.translationHistoryRepository
-                                                    .bubbleRefAt(entryId, bubbleIndex)
-                                                    ?: return@withContext null
                                                 ServiceLocator.sentenceTranslationRepository.remove(
-                                                    ref.sourceLanguage,
-                                                    ref.targetLanguage,
-                                                    ref.originalText
-                                                )
-                                                // 标记与删缓存必须同一段落盘：只做一半会出现
-                                                // 「界面说作废了、缓存还在」或反过来。
-                                                ServiceLocator.translationHistoryRepository
-                                                    .markBubbleInvalidated(entryId, bubbleIndex)
-                                            }
-                                            if (removed != null) refreshHistory()
-                                            toast(
-                                                when (removed) {
-                                                    null -> "这条记录已不存在"
-                                                    true -> "已作废这句 · 下次遇到会重新翻译"
-                                                    false -> "已标为作废 · 这句本来就没进缓存"
-                                                }
-                                            )
-                                        }
-                                    },
-                                    // 作废整页：这一页所有句子一起删，适合「好几处都被合并错」的情况。
-                                    onInvalidatePage = { entryId ->
-                                        scope.launch {
-                                            val removed = withContext(Dispatchers.IO) {
-                                                val refs = ServiceLocator.translationHistoryRepository
-                                                    .pageBubbleRefs(entryId)
-                                                    ?: return@withContext -1
-                                                val count = ServiceLocator.sentenceTranslationRepository.remove(
-                                                    refs.map {
+                                                    targets.map {
                                                         SentenceCacheKey(
                                                             it.sourceLanguage,
                                                             it.targetLanguage,
@@ -684,24 +718,107 @@ class MainActivity : ComponentActivity() {
                                                         )
                                                     }
                                                 )
-                                                ServiceLocator.translationHistoryRepository
-                                                    .markAllInvalidated(entryId)
-                                                count
                                             }
-                                            if (removed != -1) refreshHistory()
+                                            refreshSentences()
                                             toast(
-                                                when {
-                                                    removed < 0 -> "这条记录已不存在"
-                                                    removed > 0 -> "已作废本页 $removed 句 · 下次重新翻译"
-                                                    else -> "已标为作废 · 本页没有可作废的缓存"
+                                                if (removed > 0) {
+                                                    "已作废 $removed 句 · 下次重新翻译"
+                                                } else {
+                                                    "这些句子已经不在缓存里"
                                                 }
                                             )
                                         }
+                                    },
+                                    onClear = {
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                ServiceLocator.sentenceTranslationRepository.clear()
+                                            }
+                                            refreshSentences()
+                                            toast("句子已清空 · 下次会重新翻译")
+                                        }
+                                    },
+                                    onExtractTerms = { targets ->
+                                        scope.launch { runTermExtraction(targets, toast = ::toast) }
                                     }
                                 )
                             }
                         }
                     }
+                }
+
+                // AI 术语提取的候选确认弹层：确认之前一个字都不写进术语表。
+                if (termSheetOpen) {
+                    val termCollections = runCatching {
+                        ServiceLocator.glossaryRepository.listCollections()
+                    }.getOrDefault(emptyList())
+                    TermExtractionSheet(
+                        loading = termLoading,
+                        error = termError,
+                        suggestions = termSuggestions,
+                        sentenceCount = termSentenceCount,
+                        collections = termCollections,
+                        targetCollection = termTarget,
+                        existingSources = termExisting,
+                        onTargetCollectionChange = { name ->
+                            termTarget = name
+                            refreshTermExisting(name)
+                        },
+                        onCreateCollection = { name ->
+                            val created = runCatching {
+                                ServiceLocator.glossaryRepository.createCollection(name)
+                            }.getOrDefault(false)
+                            if (created) {
+                                // 新建后直接启用：术语只有落在「生效」的表里才会注入翻译。
+                                // 不启用的话，用户刚建完、刚加完词，下一页却完全不生效。
+                                runCatching {
+                                    val active = ServiceLocator.glossaryRepository.getActiveCollections()
+                                    if (!active.contains(name)) {
+                                        ServiceLocator.glossaryRepository.setActiveCollections(active + name)
+                                    }
+                                }
+                                glossaryReloadTick += 1
+                                null
+                            } else {
+                                "建不了：名称已存在或已达数量上限"
+                            }
+                        },
+                        onRetry = {
+                            scope.launch { runTermExtraction(termTargets, toast = ::toast) }
+                        },
+                        onConfirm = { finalTerms ->
+                            scope.launch {
+                                val added = withContext(Dispatchers.IO) {
+                                    var count = 0
+                                    finalTerms.forEach { term ->
+                                        val ok = runCatching {
+                                            ServiceLocator.glossaryRepository.add(
+                                                termTarget,
+                                                term.source,
+                                                term.target
+                                            )
+                                        }.getOrDefault(false)
+                                        if (ok) count += 1
+                                    }
+                                    count
+                                }
+                                termSheetOpen = false
+                                glossaryReloadTick += 1
+                                refreshTermExisting(termTarget)
+                                val skipped = finalTerms.size - added
+                                toast(
+                                    if (added == 0) {
+                                        "没有新增 · 这些词术语表里已经有了"
+                                    } else if (skipped > 0) {
+                                        "已加入 $added 个 · 跳过 $skipped 个（已有或表已满）"
+                                    } else {
+                                        "已加入 $added 个 · 以后翻译会照着用"
+                                    }
+                                )
+                            }
+                        },
+                        onDismiss = { termSheetOpen = false }
+                    )
                 }
             }
         }
