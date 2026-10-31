@@ -2846,6 +2846,11 @@ class WebtoonImageTranslator(
             "bubble_continuation_merge",
             "merged=${routing.bubbleAssignments.count { it.region.source.contains("+continuation") }}"
         )
+        // 共享容器合并（2026-11-01）：同一气泡被区域检测拆成多个重叠 region 时合回了几个。
+        timer.mark(
+            "bubble_shared_merge",
+            "merged=${routing.bubbleAssignments.count { it.region.source.contains("+shared") }}"
+        )
         // 最终分组文本（排障用）：`原文@x,y` —— 直接对照「两句话是不是被并成一句」。
         timer.mark(
             "bubble_first_texts",

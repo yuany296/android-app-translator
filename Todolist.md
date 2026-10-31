@@ -22,6 +22,9 @@
 - [x] OCR 近似变体去重：`MlKitTiledBlockMerger` / `PaddleOcrBlockMerger` 对
       「文本高相似 + 框强重叠」的同一句两版只保留更可信的一份（现场
       `pageHash ca9603cd…`：正确两行版 + 错字单行版被拼成一句，译文重复两遍）。
+- [x] 共享气泡容器合并：同一物理气泡被区域检测拆成多个**重叠** region 时，
+      若文本能接成一段且不跨 seam，合回一个 assignment 再翻译
+      （`mergeSharedContainerRegions`；相邻但不重叠的 region 刻意不合并）。
 - [x] 单测、构建、装机；真机复测项写入 `HumanTODO.md`。
 
 ### 三、为什么不会拖慢
@@ -55,6 +58,10 @@
 - `PaddleOcrBlockMerger`：合并前先做同样的近似变体去重；保留行数更多 >
   文本换行结构更一致 > 置信度更高 > 文本更长 > 面积更大。两条路径都只动
   「几乎同框」的块，不碰独立气泡。
+- `BubbleFirstRegionPlanner.mergeSharedContainerRegions`：两个 BUBBLE region
+  交集/较小面积 ≥0.40、横纵各 ≥0.50，且存在一对块 `shouldMerge(sameKnownRegion=true)`
+  且不跨 seam → 合回一个 assignment；region 扩到覆盖全部块，`source` 加 `+shared`。
+  相邻但不重叠的 region 不合并（宁可分开）。
 
 ### 五、验证
 
@@ -63,9 +70,11 @@
 - `MlKitTiledBlockMergerTest`：跨块/同块近似变体去重、不同文本高重叠保留、
   原有同块同文本低 IoU 行为不变。
 - `MlKitSeamSplitterTest`：跨缝段落按 lineBoxes 拆开；同侧不拆；行数/文本不匹配时原样保留。
+- `BubbleFirstRegionPlannerTest`：重叠 region + 连续文本合并；文本相隔远/相邻不重叠/跨 seam
+  不合并。
 - `BubbleColorRulesTest`：容器边带框计算（正常/文字框几乎填满容器两种）。
 - `:core-overlay:testDebugUnitTest` 64 条、`:core-translate:testDebugUnitTest` 234 条、
-  `:app:testDebugUnitTest` 344 条，0 失败；`:app:assembleDebug` 通过并装机（01:21）。
+  `:app:testDebugUnitTest` 348 条，0 失败；`:app:assembleDebug` 通过并装机（01:35）。
 - 真机：看接缝处半行是否还重复/漏翻；看纯色气泡文字色/盖板色是否更稳；
   `sampled_colors` 里应出现 `n=`。
 
@@ -78,6 +87,9 @@
 - 拆不了就原样保留：ML Kit 没有 `lineBoxes`，或 `text.lines()` 行数与 `lineBoxes` 不一致时，
   不猜文本（避免把一句拆坏），这类现场仍依赖 planner + 接缝配对。
 - 容器边带只对 `bgType=solid` 生效；旁白/复杂背景完全走原路径。
+- 共享容器合并只处理**框重叠 ≥40%（横纵各 ≥50%）**的 region；相邻但不重叠的
+  同一个气泡（轮廓被大缝切断）本轮不合并，避免把两个独立气泡并掉；需要时再补
+  底色/形状证据。
 - 采样数只用于诊断，不参与判定。
 
 ## 67. 用户 2026-10-31：颜色偶发不准 + 合并不对（同句拆两块 / 气泡旁一行并进台词）
