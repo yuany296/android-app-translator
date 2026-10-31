@@ -113,20 +113,17 @@ class BubbleFirstRegionPlanner {
             imageHeight = imageHeight,
             separatedByWhitespace = separatedByWhitespace
         )
-        // 同一物理气泡被区域检测拆成多个 region（2026-11-01）：先把「框明显重叠 +
-        // 文本能接上」的实底 region 合回一个 assignment，再走后续的续行收编。
-        val sharedMergedBubbles = mergeSharedContainerRegions(
-            assignments = bubbleAssignments,
-            imageWidth = imageWidth,
-            imageHeight = imageHeight
-        )
         // 同一句被拆成「气泡内 + 气泡外一行」时，两边各自成块 → 分别翻译（用户 2026-10-31
         // 反馈「同一句被拆成两块」）。参考项目的行聚类发生在**容器归属之前**，且
         // `areLocalPaddleRegionsCompatible` 对「一边没有容器」直接判兼容；这里补上同口径的
         // 收编：只收「实底气泡 + 气泡外、在下方、紧邻、上一块以逗号/省略号收尾」的一行。
         // 不动「两个实底气泡之间」——那可能是两个角色的台词，宁可分开。
+        //
+        // 2026-11-01 用户裁定：同一个气泡框里**故意错位的两段**不需要合并（3d15f3f7 /
+        // 8b81a41d 现场）。因此不再按「共享气泡容器」合并 region；只保留上面这条
+        // 基于文本续行 + 几何的明确收编，避免把同气泡的两段并成一句。
         val (mergedBubbles, remainingOutside) = mergeOutsideContinuationsIntoBubbles(
-            bubbleAssignments = sharedMergedBubbles,
+            bubbleAssignments = bubbleAssignments,
             outsideAssignments = outsideAssignments,
             imageWidth = imageWidth,
             imageHeight = imageHeight
@@ -135,112 +132,6 @@ class BubbleFirstRegionPlanner {
             bubbleAssignments = mergedBubbles,
             outsideAssignments = remainingOutside,
             outsideBlocks = remainingOutside.flatMap { it.blocks }
-        )
-    }
-
-    /**
-     * 「共享气泡容器」合并（2026-11-01）：
-     *
-     * 同一物理气泡被 OpenCV 区域检测拆成两个 region 时，两个 region 的框通常**明显重叠**
-     * （`intersection / min(area)` ≥ [SHARED_CONTAINER_MIN_OVERLAP_RATIO]，横纵也都压过
-     * 一半），且两块文本在几何上能接成一段。满足这两条才合回一个 assignment。
-     *
-     * 刻意不做「相邻但不重叠」的合并：那可能是两个独立气泡，宁可分开。
-     * 也不跨 seam（`crossesSeamBoundary` 已有的屏障继续生效）。
-     */
-    private fun mergeSharedContainerRegions(
-        assignments: List<BubbleRegionAssignment>,
-        imageWidth: Int,
-        imageHeight: Int
-    ): List<BubbleRegionAssignment> {
-        if (assignments.size < 2) return assignments
-        val working = assignments.toMutableList()
-        var changed = true
-        while (changed) {
-            changed = false
-            var bestUpper = -1
-            var bestLower = -1
-            var bestOverlap = 0f
-            for (i in working.indices) {
-                val a = working[i]
-                if (a.region.regionType != BubbleRegionType.BUBBLE || a.blocks.isEmpty()) continue
-                for (j in i + 1 until working.size) {
-                    val b = working[j]
-                    if (b.region.regionType != BubbleRegionType.BUBBLE || b.blocks.isEmpty()) continue
-                    val overlap = sharedContainerOverlap(a.region, b.region) ?: continue
-                    if (overlap < SHARED_CONTAINER_MIN_OVERLAP_RATIO) continue
-                    if (!textsCanShareContainer(a.blocks, b.blocks)) continue
-                    if (overlap > bestOverlap) {
-                        bestOverlap = overlap
-                        bestUpper = i
-                        bestLower = j
-                    }
-                }
-            }
-            if (bestUpper < 0) break
-            val upper = working[bestUpper]
-            val lower = working[bestLower]
-            val mergedBlocks = (upper.blocks + lower.blocks)
-                .sortedWith(compareBy<TextBlock> { it.top }.thenBy { it.left })
-            val mergedRegion = expandRegionToBlocks(
-                region = unionRegion(upper.region, lower.region),
-                blocks = mergedBlocks,
-                imageWidth = imageWidth,
-                imageHeight = imageHeight
-            )
-            working[bestUpper] = BubbleRegionAssignment(region = mergedRegion, blocks = mergedBlocks)
-            working.removeAt(bestLower)
-            changed = true
-        }
-        return working
-    }
-
-    /** 两个 region 的重叠率（交集 / 较小区域面积）；无交集返回 null。 */
-    private fun sharedContainerOverlap(a: BubbleRegion, b: BubbleRegion): Float? {
-        val overlapLeft = max(a.left, b.left)
-        val overlapTop = max(a.top, b.top)
-        val overlapRight = min(a.right, b.right)
-        val overlapBottom = min(a.bottom, b.bottom)
-        if (overlapRight <= overlapLeft || overlapBottom <= overlapTop) return null
-        val overlapW = overlapRight - overlapLeft
-        val overlapH = overlapBottom - overlapTop
-        val minW = min(a.right - a.left, b.right - b.left).coerceAtLeast(1f)
-        val minH = min(a.bottom - a.top, b.bottom - b.top).coerceAtLeast(1f)
-        if (overlapW / minW < SHARED_CONTAINER_MIN_AXIS_OVERLAP_RATIO) return null
-        if (overlapH / minH < SHARED_CONTAINER_MIN_AXIS_OVERLAP_RATIO) return null
-        val overlapArea = overlapW * overlapH
-        val minArea = min(
-            (a.right - a.left) * (a.bottom - a.top),
-            (b.right - b.left) * (b.bottom - b.top)
-        ).coerceAtLeast(1f)
-        return overlapArea / minArea
-    }
-
-    /** 两组块里是否存在一对「几何上能接成一段」且不跨 seam 的块。 */
-    private fun textsCanShareContainer(a: List<TextBlock>, b: List<TextBlock>): Boolean {
-        for (first in a) {
-            for (second in b) {
-                if (crossesSeamBoundary(first, second)) continue
-                if (OcrBlockMergeRules.shouldMerge(first, second, sameKnownRegion = true).merge) {
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
-    private fun unionRegion(a: BubbleRegion, b: BubbleRegion): BubbleRegion {
-        return a.copy(
-            left = min(a.left, b.left),
-            top = min(a.top, b.top),
-            right = max(a.right, b.right),
-            bottom = max(a.bottom, b.bottom),
-            confidence = min(a.confidence, b.confidence),
-            source = if (a.source.contains(SHARED_CONTAINER_SOURCE_TAG)) {
-                a.source
-            } else {
-                a.source + SHARED_CONTAINER_SOURCE_TAG
-            }
         )
     }
 
@@ -1018,15 +909,6 @@ class BubbleFirstRegionPlanner {
         private const val COLUMN_PAIR_ASPECT = 1.15f
 
         private const val MIN_REGION_OVERLAP_RATIO = 0.18f
-
-        /** 共享气泡容器：交集 / 较小区域面积的下限（两框明显重叠才可能是同一个气泡）。 */
-        private const val SHARED_CONTAINER_MIN_OVERLAP_RATIO = 0.40f
-
-        /** 共享气泡容器：横纵两个方向各自的最小重叠（相对较窄/较矮的区域）。 */
-        private const val SHARED_CONTAINER_MIN_AXIS_OVERLAP_RATIO = 0.50f
-
-        /** 合并后的 source 标记（诊断用）。 */
-        private const val SHARED_CONTAINER_SOURCE_TAG = "+shared"
 
         /** OpenCV 区域检测器的 source 标记（其区域框带外扩，见 [matchScore]）。 */
         private const val OPENCV_REGION_SOURCE_TAG = "opencv_contour"
