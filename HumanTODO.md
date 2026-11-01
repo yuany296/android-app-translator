@@ -3166,6 +3166,8 @@ UI 本身已装机截图核对（首页 / 浏览器弹层都和画布定稿一�
 - [x] **Pixiv canvas 阅读器（模拟机已验证）**：`comic-store-viewer.pixiv.net` 点球自动 `canvas_page_fallback` → 截图翻译；日志 `shot_ok mode=dom`，OCR 能识别当前页正文。
 - [x] **网页文字悬浮球（模拟机已验证）**：设置→网页文字翻译→开启“网页文字悬浮球”；页面左侧出现「文」球，点一下翻译、再点恢复原文；`force-stop` 重开后球仍显示。
 - [ ] **网页语言真机复测**：中文页（目标中文）应提示“无需翻译”且不跑 OCR；日文/韩文页正常翻译；Pixiv 这类 `lang` 为空但正文日文的页面应走正文采样，不应因浏览器英文 UI 误判成 en。
+- [ ] **Pixiv 翻页复测**：在 `comic-store-viewer.pixiv.net` 翻 3–5 页，确认每页点球都能截图识别；发 `perf_summary` 的 `ocr_ms/translate_ms/post_ms/total_ms`。
+- [x] **P3 样本（模拟机 Pixiv 首屏）**：`ocr_ms=5502 translate_ms=0 post_ms=381 total_ms=7343`，OCR 是大头；后续按真机多页数据决定优化。
 
 ## 2026-11-01（追加）旧夹具回归：对齐 / 截断台词
 

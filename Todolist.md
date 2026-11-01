@@ -148,11 +148,14 @@
       - 模拟机验证：开关开启→球出现→点球 `webpage_text_batch applied=3`→球变对勾→
         再点 `webpage_text_restore restored=3`；`force-stop` 重开球仍在。
 
-- [ ] **P3 延迟剖析与优化**
+- [x] **P3 延迟剖析（工具已落地，优化待数据）**
       - 已加 `TranslationTimer.elapsedMs` 和页面级 `perf_summary`
         `ocr_ms/translate_ms/post_ms/total_ms`（`WebtoonImageTranslator` 收尾处）。
+      - 模拟机 Pixiv 截图链路样本（`shot_ok`）：
+        `ocr_ms=5502 translate_ms=0 post_ms=381 total_ms=7343 bubbles=10`。
+        OCR 是当前大头；翻译 0 是命中缓存/无缺失，post 为擦字+几何+渲染。
       - 待做：真机冷缓存采样 3–5 页（先“作废本页”），区分单条带/多切片、首次/缓存命中；
-        再按占比决定优化项。约束：不增加 OCR 次数、模型请求、不等待邻页。
+        再按占比决定 OCR 速度档/切片并行/缓存优化。约束：不增加 OCR 次数、模型请求、不等待邻页。
 
 - [ ] **P4 日漫支持**
       - 竖排/右→左：气泡内文本行序、OCR 行合并方向、阅读顺序按右→左；横排日漫也兼容。
