@@ -19,20 +19,33 @@
 - 诊断日志：`bubble_alignment`（每页最多 8 个气泡，打印 `left/center/right`、
   行数、逐行框数、原文前 12 字），后续对齐问题先看这一行。
 
-### 二、截断台词（已定位，待定修法）
+### 二、截断台词（已按 B 修）
 
 - 夹具：`.verify/web/seam.html`（`seamA.png` + `seamB.png`），
   缝上有一句被切成两半的 `잘라진 대사입니`。
-- 日志：`seam_pair_state status=failed ... error=no_match`、
-  `seam_race_skip ... prev[y+h=34.9] cur[y=52.0] best=0.80`。
-- 原因：**上半截在上一张图里没有被 OCR 检成候选**（只有下半截进了 scene），
-  `SeamRaceBand.findGeometricMatch` 要求上下贴边候选合计 ≥3，直接 `no_match`；
-  下半截于是被当成独立气泡翻译，上页残留的半截原文留在缝上。
-- 两种修法（需要用户裁定）：
-  - **A 保守**：贴顶/贴底的半句在无配对时**不单独翻译**（宁可不翻，也不出半句错译）；
-  - **B 合成**：用下半截反推上页底边同宽短框，强行建跨缝带 + 不透明 flat cover，
-    把两半盖住并只出一份译文；风险是可能盖到上页底部无关内容。
-- 本轮未改截断逻辑：先保留原行为，避免在没确认像素证据前引入误盖。
+- 原日志：`slice_classify ... dropped_neighbor=1`、`seam_verdict d1=dropped_fragment`；
+  上下两半都低于 `fragmentHeightPx`（0.4 行），各自被丢弃 → 谁都没翻译。
+- 修法 B：`SeamConfig` 新增 `allowCrossFragment`（默认 false，保持旧行为）；
+  网页链路置 true。跨下边界的薄片如果拼接图 OCR 已经读到整行，不再丢弃，而是
+  `owned(cross=true)`，由接缝带跨两半盖住并只出一份译文。
+- 单测：`SeamBubbleMergerTest.crossingFragmentIsOwnedWhenAllowCrossFragment`；
+  旧的 `sliverCrossingBottomEdgeIsNotHandedOver` 仍守住默认 false 的旧行为。
+- 模拟机验证（`seam.html`）：
+  - `slice_classify ... owned=2 cross=1`；
+  - `seam_verdict d0=owned d1=cross_fragment`；
+  - `seam_scene mode=band bubbles=1 ... own=[b0] next=[c0]`；
+  - `seam_dispatch ... texts=[잘라진 대사입니→被截断的台词]`；
+  - DOM 只有一个 `被截断的台词` 文字节点 + 一个 `mt-bg-none` 盖板，mt1/mt2 两半都被摘除。
+- 风险：如果薄片文本本身只是残片（不是整行），会画出一句残片译文；当前只对网页
+  （`allowCrossFragment=true`）生效，后续可加像素证据再收紧。
+
+### 三、右对齐为什么是斜的
+
+- 对齐已修（`text-align` 跟随 left/center/right）；**倾斜没有改**。
+- `align.html` 第三组的原文本身就是约 **18° 斜排**（`ink_tilt: ok(18deg,516x209)`），
+  渲染层按 `bubble.rotationDeg`/多边形跟随原图倾角，这是刻意的排版还原，不是对齐错误。
+- 如果希望「斜排原文也强制水平译文」，需要单独开关/策略；否则会与原文倾斜方向不一致，
+  可能压到旁边画面。
 
 ## 69. 用户 2026-11-01：悬浮球位置记忆 + 网页语言检查 + 延迟剖析 + 夹具 + 日漫
 

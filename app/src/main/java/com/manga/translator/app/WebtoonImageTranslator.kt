@@ -408,9 +408,12 @@ class WebtoonImageTranslator(
             edgeWindowPx = edgeWindow,
             maxCrossHeightPx = maxCrossHeight,
             cutAllowancePx = cutAllowance,
-            // 条带边缘的残片（可见高度不足 0.4 行）不认领、不移交 —— 真机实测它们只产出
+            // 条带边缘的残片（可见高度不足 0.4 行）默认不认领、不移交 —— 真机实测它们只产出
             // 「25px 高的假气泡 / 43px 的薄盖板 + 残片译文」（`용살가`）。
-            fragmentHeightPx = SeamTuning.resolveFragmentHeight(medianLineHeight)
+            fragmentHeightPx = SeamTuning.resolveFragmentHeight(medianLineHeight),
+            // 2026-11-01 用户裁定 B：拼接图 OCR 已读到整行、只是两半都薄时，仍认领 cross，
+            // 交给接缝带盖住两半。现场 `seam.html`（`잘라진 대사입니` 上下各一半）。
+            allowCrossFragment = true
         )
         val seamPlan = planSeamOwnership(
             detections = detections,

@@ -482,6 +482,19 @@ class SeamBubbleMergerTest {
     }
 
     @Test
+    fun crossingFragmentIsOwnedWhenAllowCrossFragment() {
+        // 2026-11-01 用户裁定 B：拼接图 OCR 已读到整行（잘라진 대사입니），
+        // 上下两半都薄时不能再两边都丢；本图认领 cross，交给接缝带。
+        val plan = plan(
+            detections = listOf(detection("잘라진 대사입니", 300f, 1185f, 700f, 1215f)),
+            config = config().copy(fragmentHeightPx = 40f, allowCrossFragment = true)
+        )
+        assertEquals(1, plan.owned.size)
+        assertTrue("必须按跨缝认领", plan.owned.single().cross)
+        assertEquals("cross_fragment", plan.verdicts.single())
+    }
+
+    @Test
     fun normalHeightDetectionIsStillOwnedWhenFragmentGuardIsOn() {
         // 守卫不能误伤正常高度：行高阈值 40px 下，80px 高的块照常认领
         val plan = plan(

@@ -171,6 +171,15 @@ internal data class SeamConfig(
      */
     val fragmentHeightPx: Float = 0f,
     /**
+     * 跨下边界的薄片是否仍由本图认领（2026-11-01，用户裁定 B）。
+     *
+     * 默认 false = 老行为：薄片丢弃，留给下一张图看到整行的那侧处理。
+     * true = 拼接图里 OCR 已经读到**整行**，只是当前图可见部分很薄时，也认领 cross，
+     * 由接缝带同时盖住上下两半、只出一份译文。用于「上下两半都薄、两边都丢」的现场
+     * （`seam.html` 的 `잘라진 대사입니`）。风险：如果薄片文本本身只是残片，会画出一句残片译文。
+     */
+    val allowCrossFragment: Boolean = false,
+    /**
      * 跨上边界的块「大半在本页」的下限。
      *
      * ⚠️ **2026-10-03 起不再参与丢弃判定**（保留字段只为不打断既有构造点与单测意图记录）。
@@ -505,11 +514,16 @@ internal fun planSeamOwnership(
                     // 不认领不移交（历史上这里会退化成「区域大框当内容」，错位画一行）。
                     dropped += 1
                     verdicts[index] = "dropped_glyph_outside"
-                } else if (isFragment(clipped.outer.height)) {
+                } else if (isFragment(clipped.outer.height) && !config.allowCrossFragment) {
                     dropped += 1
                     verdicts[index] = "dropped_fragment"
                 } else {
+                    // B（allowCrossFragment）：拼接图 OCR 已经是整行，薄片也认领 cross，
+                    // 让接缝带跨两半盖住并只出一份译文。
                     owned += SeamOwnership(clipped.bubble, cross = true)
+                    if (isFragment(clipped.outer.height)) {
+                        verdicts[index] = "cross_fragment"
+                    }
                 }
             }
         }
