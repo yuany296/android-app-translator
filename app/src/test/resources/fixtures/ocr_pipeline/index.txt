@@ -1,0 +1,7 @@
+01_seam_half_line.json
+02_seam_same_side_merge.json
+03_ocr_near_duplicate.json
+04_same_bubble_offset_segments.json
+05_bubble_outside_continuation.json
+06_two_paragraphs_one_region.json
+07_adjacent_solid_bubbles_stay_separate.json

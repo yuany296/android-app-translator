@@ -1,0 +1,20 @@
+{
+  "name": "07_adjacent_solid_bubbles_stay_separate",
+  "description": "两个相邻但不重叠的实底气泡，即使上一句以逗号收尾，也保持两个气泡（不按相邻位置合并）。",
+  "imageWidth": 1080,
+  "imageHeight": 1200,
+  "mergeWithPaddle": false,
+  "blocks": [
+    { "id": 1, "text": "계속 이어지는 말인데,", "left": 120, "top": 120, "right": 560, "bottom": 180, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "다음 대사입니다.", "left": 120, "top": 240, "right": 560, "bottom": 300, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "regions": [
+    { "id": 51, "left": 100, "top": 100, "right": 600, "bottom": 200, "type": "BUBBLE", "confidence": 0.9, "source": "fixture" },
+    { "id": 52, "left": 100, "top": 220, "right": 600, "bottom": 320, "type": "BUBBLE", "confidence": 0.9, "source": "fixture" }
+  ],
+  "expected": {
+    "bubbleCount": 2,
+    "bubbleTexts": ["계속 이어지는 말인데,", "다음 대사입니다."],
+    "outsideTexts": []
+  }
+}

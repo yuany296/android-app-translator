@@ -1,0 +1,19 @@
+{
+  "name": "06_two_paragraphs_one_region",
+  "description": "同一个 region 里的两段文字（中间空行）应拆成两个气泡，而不是并成一句。",
+  "imageWidth": 720,
+  "imageHeight": 1400,
+  "mergeWithPaddle": false,
+  "blocks": [
+    { "id": 1, "text": "첫 번째 문단입니다", "left": 100, "top": 100, "right": 500, "bottom": 140, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "둘째 문단입니다", "left": 100, "top": 220, "right": 500, "bottom": 260, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "regions": [
+    { "id": 41, "left": 80, "top": 90, "right": 560, "bottom": 400, "type": "BUBBLE", "confidence": 0.95, "source": "fixture" }
+  ],
+  "expected": {
+    "bubbleCount": 2,
+    "bubbleTexts": ["첫 번째 문단입니다", "둘째 문단입니다"],
+    "outsideTexts": []
+  }
+}

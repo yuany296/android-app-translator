@@ -40,20 +40,25 @@
       - 验证通过：`app` 348 条、`core-overlay` 64 条、`core-translate` 234 条，0 失败；
         `:app:assembleDebug` 通过并装机到模拟机。
 
-- [ ] **P1 本地夹具与验证**
+- [x] **P1 本地夹具与验证**
       - 背景：用户暂时找不到稳定的真实问题网页，先不依赖外网。
-      - 图像夹具（`app/src/test/resources/fixtures/` 或 `app/src/androidTest/assets/fixtures/`）：
-        1. 长条漫拼接图：带图像上/下边 + 内部切缝，含贴缝半行；
-        2. 纯色气泡（白底/彩底）与白描边文字；
-        3. 同一个气泡框里**故意错位**的两段（必须保持分开）；
-        4. 气泡内 + 气泡外、上一块以逗号/省略号收尾的续行（必须合并）；
-        5. OCR 近似重复：正确两行版 + 错字单行版（必须只留一份）；
-        6. 日漫竖排 + Ruby（后续日漫用）。
-      - 网页夹具：本地 HTML + 本地图片，模拟网页漫画阅读器（可滚动、可加载大图），
-        用于验证悬浮球位置记忆、网页语言检查、截图/条带链路；优先 `file:///android_asset/`。
-      - 纯逻辑走 JVM 单测；需要 Bitmap/WebView 的走 instrumentation 或手工脚本；
-        `fixtures/README.md` 标明每张夹具对应哪个 bug/需求、期望结果。
-      - 先做 3–5 个最关键场景；找到真实网页 URL 后再补。
+      - **OCR/气泡 JSON 夹具**（`app/src/test/resources/fixtures/ocr_pipeline/`，7 个场景）：
+        切缝半行、切缝同侧合并、OCR 近似重复、同气泡错位两段（两个重叠 region）、
+        气泡+气泡外续行、同 region 两段、相邻实底气泡不合并。
+      - `OcrPipelineFixtureTest` 串起 `PaddleOcrBlockMerger.mergeBlocks` → `BubbleFirstRegionPlanner.route`
+        → `buildBubblesFromAssignment`，断言合并块数/文本、气泡数/文本、outside 块；
+        新增场景只需加 JSON + `index.txt`，不改测试代码。
+      - **纯色气泡 Bitmap 夹具**（`app/src/androidTest/assets/fixtures/solid_bubble.png`）：
+        `BubbleColorFixtureTest` 在模拟机跑真实 `Bitmap` 采样，验证白底、黑字、容器边带样本数、
+        `flatBackground`；已通过。
+      - **网页夹具**（`app/src/debug/assets/fixtures/`）：`web_reader.html` + 1080×3000
+        三格韩漫 PNG（白/浅黄/浅蓝/浅粉气泡）。本机 `python -m http.server` + `adb reverse`
+        打开，模拟机验证页面加载、滚动、悬浮球固定。
+      - 说明：地址栏只接受 http/https，`file:///android_asset` 会被当搜索词，README 已改成
+        本地 HTTP 方式；网页夹具只进 debug APK。
+      - 验证：`app` 349 条、`core-overlay` 64 条、`core-translate` 234 条，0 失败；
+        `BubbleColorFixtureTest` 模拟机通过。
+      - 未做：日漫竖排/Ruby 夹具（随 P4）；找到真实网页 URL 后再补一条真实页回归。
 
 - [ ] **P2 网页语言检查（图片/截图链路）**
       - 现状：网页**文字**翻译已有页面级检查（`EmbeddedBrowserScreen.kt` 约 2055 行：

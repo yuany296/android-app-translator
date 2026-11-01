@@ -1,0 +1,20 @@
+{
+  "name": "04_same_bubble_offset_segments",
+  "description": "同一个气泡框里故意错位的两段，落在两个相互重叠的 region：必须保持两段，不按容器合并。",
+  "imageWidth": 1080,
+  "imageHeight": 1200,
+  "mergeWithPaddle": false,
+  "blocks": [
+    { "id": 1, "text": "첫 번째로 놓인 문장", "left": 120, "top": 120, "right": 380, "bottom": 180, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "두 번째로 놓인 문장", "left": 180, "top": 210, "right": 440, "bottom": 270, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "regions": [
+    { "id": 1, "left": 100, "top": 100, "right": 400, "bottom": 300, "type": "BUBBLE", "confidence": 0.9, "source": "fixture" },
+    { "id": 2, "left": 160, "top": 180, "right": 460, "bottom": 380, "type": "BUBBLE", "confidence": 0.9, "source": "fixture" }
+  ],
+  "expected": {
+    "bubbleCount": 2,
+    "bubbleTexts": ["첫 번째로 놓인 문장", "두 번째로 놓인 문장"],
+    "outsideTexts": []
+  }
+}

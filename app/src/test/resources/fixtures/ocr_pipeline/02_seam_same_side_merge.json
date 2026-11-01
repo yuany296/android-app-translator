@@ -1,0 +1,17 @@
+{
+  "name": "02_seam_same_side_merge",
+  "description": "同一侧的两行仍应合并成一段；不能因为附近有切缝就把整页都拆散。",
+  "imageWidth": 1080,
+  "imageHeight": 1000,
+  "seamTopPx": 0,
+  "seamBottomPx": 900,
+  "mergeWithPaddle": true,
+  "blocks": [
+    { "id": 1, "text": "같은 문장의 앞", "left": 100, "top": 100, "right": 600, "bottom": 160, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "같은 문장의 뒤", "left": 120, "top": 180, "right": 580, "bottom": 240, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "expected": {
+    "mergedTextCount": 1,
+    "mergedTextContains": ["같은 문장의 앞", "같은 문장의 뒤"]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "03_ocr_near_duplicate",
+  "description": "同一句被识别成「正确两行」和「错字单行」两版时，只保留更可信的一份。",
+  "imageWidth": 1080,
+  "imageHeight": 1000,
+  "seamTopPx": 0,
+  "seamBottomPx": 0,
+  "mergeWithPaddle": true,
+  "blocks": [
+    { "id": 1, "text": "지금 물어야겠어?\n조용히 따라오기나 해.", "left": 100, "top": 100, "right": 600, "bottom": 220, "confidence": 0.9, "lineCount": 2 },
+    { "id": 2, "text": "지금 물어아겼어? 조용히 따리오기나 해.", "left": 100, "top": 100, "right": 600, "bottom": 160, "confidence": 0.8, "lineCount": 1 }
+  ],
+  "expected": {
+    "mergedTextCount": 1,
+    "mergedTextContains": ["지금 물어야겠어?", "조용히 따라오기나 해."],
+    "mergedTextNotContains": ["물어아겼어", "따리오기"]
+  }
+}

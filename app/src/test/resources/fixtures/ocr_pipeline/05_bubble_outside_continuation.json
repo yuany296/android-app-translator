@@ -1,0 +1,19 @@
+{
+  "name": "05_bubble_outside_continuation",
+  "description": "气泡内最后一行以逗号收尾，气泡外紧接一行：这是明确的续行，应合回一个气泡。",
+  "imageWidth": 1080,
+  "imageHeight": 1200,
+  "mergeWithPaddle": false,
+  "blocks": [
+    { "id": 1, "text": "시스템이 나의 작명 솜씨를 알았는지,", "left": 110, "top": 110, "right": 250, "bottom": 150, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "작품명 지을 기회를 샘쳐 갔구나.", "left": 170, "top": 160, "right": 300, "bottom": 200, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "regions": [
+    { "id": 9, "left": 100, "top": 100, "right": 260, "bottom": 155, "type": "BUBBLE", "confidence": 0.9, "source": "fixture" }
+  ],
+  "expected": {
+    "bubbleCount": 1,
+    "bubbleTexts": ["시스템이 나의 작명 솜씨를 알았는지, 작품명 지을 기회를 샘쳐 갔구나."],
+    "outsideTexts": []
+  }
+}

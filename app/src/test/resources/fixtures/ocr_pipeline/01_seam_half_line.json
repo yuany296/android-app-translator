@@ -1,0 +1,17 @@
+{
+  "name": "01_seam_half_line",
+  "description": "内部切缝把一行切成两半：Paddle 合并不得跨缝，贴缝半行单独保留。",
+  "imageWidth": 1080,
+  "imageHeight": 1000,
+  "seamTopPx": 0,
+  "seamBottomPx": 600,
+  "mergeWithPaddle": true,
+  "blocks": [
+    { "id": 1, "text": "같은 문장의 앞", "left": 100, "top": 500, "right": 600, "bottom": 590, "confidence": 0.9, "lineCount": 1 },
+    { "id": 2, "text": "같은 문장의 뒤", "left": 100, "top": 595, "right": 600, "bottom": 660, "confidence": 0.9, "lineCount": 1 }
+  ],
+  "expected": {
+    "mergedTextCount": 2,
+    "mergedTextContains": ["같은 문장의 앞", "같은 문장의 뒤"]
+  }
+}
