@@ -1115,6 +1115,21 @@ class WebtoonImageTranslator(
             "bubbles=${finalBubbles.size} incoming=${incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) }} crossOut=${crossOut.size} " +
                 "seam=${seam?.bubbles?.size ?: 0} mode=$renderMode png=${png?.size ?: 0}B"
         )
+        // 页面级耗时汇总（2026-11-01，P3）：先量再优化。
+        // ocr = OCR 检测+归并；translate = 翻译请求；post = 擦字/几何/渲染。
+        run {
+            val ocrAt = timer.elapsedMs("response_ok")
+            val sendAt = timer.elapsedMs("request_send")
+            val translateAt = timer.elapsedMs("translate_response")
+            val totalAt = timer.elapsedMs("render_done")
+            timer.mark(
+                "perf_summary",
+                "ocr_ms=${if (ocrAt != null && sendAt != null) ocrAt - sendAt else -1} " +
+                    "translate_ms=${if (translateAt != null && ocrAt != null) translateAt - ocrAt else -1} " +
+                    "post_ms=${if (totalAt != null && translateAt != null) totalAt - translateAt else -1} " +
+                    "total_ms=${totalAt ?: -1} bubbles=${finalBubbles.size}"
+            )
+        }
         return Outcome(
             bubbleCount = finalBubbles.size + incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) },
             cacheHitCount = cacheStats.hitCount,

@@ -16,6 +16,9 @@ class TranslationTimer(
         Log.d(TAG, "[$traceId] $tag: ${elapsed}ms$suffix")
     }
 
+    /** 某个已打点阶段相对 `start` 的耗时；没打过这个点返回 null。 */
+    fun elapsedMs(tag: String): Long? = marks[tag]?.let { sinceStart(it) }
+
     private fun sinceStart(now: Long): Long {
         val start = marks["start"] ?: now
         return now - start

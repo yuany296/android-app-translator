@@ -110,29 +110,49 @@
         OCR 8 blocks / 6 bubbles。
       - 未做：日漫竖排/Ruby 夹具（随 P4）；找到真实网页 URL 后再补一条真实页回归。
 
-- [ ] **P2 网页语言检查（图片/截图链路）**
-      - 现状：网页**文字**翻译已有页面级检查（`EmbeddedBrowserScreen.kt` 约 2055 行：
-        `SourceScriptDetector.detect(collected.map { it.text })`，语言等于目标语言就整页跳过）；
-        图片/截图/条带链路（`WebtoonImageTranslator`）没有同等检查。
-      - OCR 出结果后、发起翻译前，复用已识别文本做 `SourceScriptDetector.detect(...)`；
-        若 `languageId == settings.targetLanguage`：跳过翻译、不生成盖板，提示
-        “页面语言与目标语言相同，无需翻译”。
-      - **不新增 OCR、不新增模型请求**（只复用 OCR 文本）。
-      - 可选早期提示：页面加载时读 `document.documentElement.lang` / `navigator.language`
-        做日志与快速提示；但 `<html lang>` 经常不准，不能只凭它硬跳过，最终以 OCR 文本判定。
-      - 混合语言按页面级主语言判定；判定失败/空页面不拦截，走原流程。
-      - 日志：`webpage_image_same_lang detected=... target=... blocks=...`。
+- [x] **P2 网页语言检查（图片/截图链路，2026-11-01 已落地）**
+      - 用户裁定：**直接用网页语言，不从图片/OCR 猜**；图片一般跟随网页语言，特殊页面
+        由用户自己调源/目标语言。
+      - `PAGE_LANGUAGE_JS` 读取 `<html lang>`、`<meta http-equiv=content-language>`、
+        `<meta property=og:locale>`；都没有时用 `document.body.innerText` 前 2000 字做
+        脚本体兜底（仍是网页文本，不跑 OCR）。**不用 `navigator.language`**（Pixiv 是
+        英文 UI、日文内容）。
+      - 网页文字链路：`startWebpageTextTranslation` 在收集文本后、翻译前判定；等于目标语言
+        就整页跳过，提示“页面语言与目标语言相同，无需翻译”。
+      - 图片链路：点球 START 时先读页面语言；等于目标语言直接跳过，不启动 session、
+        不跑 OCR。日志 `page_same_lang mode=image lang=... source=... target=...`。
+      - 辅助：`normalizePageLanguageHint`（`zh-Hans/zh-CN/zh-Hant/zh-TW/ja-JP/ko_KR`）
+        + `PageLanguageHintTest`。
+      - 模拟机验证：
+        - `index.html`（`lang=zh-CN`，目标中文）点图片球 → `page_same_lang ...`，
+          状态行“页面语言与目标语言相同，无需翻译”，无 session/OCR；
+        - `webpage-text.html`（英文正文）网页文字翻译 → `lang=en source=body`，正常翻译。
+
+- [x] **P2.1 Pixiv comic-store-viewer 适配（canvas 阅读器）**
+      - 现场：`https://comic-store-viewer.pixiv.net/static/viewer?cid=...`，页图在
+        `<canvas>` 里（5 canvas + 5 个 loading/占位 img），`toDataURL` 受 CDN CORS 限制
+        无法导出像素；旧逻辑点球只显示“没找到可翻译的漫画图”。
+      - 处理：START 时读 `PageProfile`；`shouldUseCanvasScreenshot(canvases, images)`
+        （canvas ≥2 且 img ≤ canvas+3）成立 → 自动改走 WebView 截图链路。
+      - 日志：`canvas_page_fallback canvases=5 images=5 ...`、`shot_start`/`shot_ok`。
+      - 模拟机验证：Pixiv 当前页自动截图翻译，OCR 识别到正文并渲染；`shot_ok mode=dom`。
+      - 测试：`BrowserCanvasFallbackPolicyTest`（Pixiv 5/5 命中；普通图片页不误触发）。
+
+- [x] **P2.2 网页文字翻译悬浮球（可选启用）**
+      - 背景：入口埋在设置弹层里，用户觉得隐蔽、用起来耗时。
+      - `SettingsRepository` 新增独立开关 `browser_webpage_text_ball`（默认 false）和
+        独立位置 pref；设置弹层「网页文字翻译」按钮下新增“网页文字悬浮球”开关。
+      - 开启后页面左侧出现 44dp「文」球：点一下翻译页面文字，已翻译时点一下恢复原文；
+        可拖动、松手吸附左右边缘，位置按比例持久化，重进页面恢复。
+      - 与图片翻译红色球独立：默认一左一右，互不覆盖。
+      - 模拟机验证：开关开启→球出现→点球 `webpage_text_batch applied=3`→球变对勾→
+        再点 `webpage_text_restore restored=3`；`force-stop` 重开球仍在。
 
 - [ ] **P3 延迟剖析与优化**
-      - 现状：用户觉得偏慢但在可接受范围，怀疑 OCR，但没有分段数据。
-      - 先测量，不先改算法：复用 `TranslationPerf` timer，补页面级汇总
-        `perf_summary ocr_ms=... translate_ms=... erase_ms=... render_ms=... total_ms=... blocks=... bubbles=...`；
-        缺成对标记的阶段（尤其翻译请求）补 `start/end`，只按页汇总，不逐气泡刷日志。
-      - 真机冷缓存采样 3–5 页（先“作废本页”），区分单条带/多切片、首次/缓存命中。
-      - 按占比优化，候选：OCR 切片数/重叠、重复检测、空白块跳过、Paddle 输入尺寸/速度档、
-        切片并行度；翻译按气泡 vs 批量、并发数、响应体大小、超时/重试、prompt 长度；
-        擦字/渲染的 inpaint 范围、Bitmap 拷贝、字体加载缓存。
-      - 约束：不增加 OCR 次数、不增加模型请求、不等待邻页、不降低译文质量。
+      - 已加 `TranslationTimer.elapsedMs` 和页面级 `perf_summary`
+        `ocr_ms/translate_ms/post_ms/total_ms`（`WebtoonImageTranslator` 收尾处）。
+      - 待做：真机冷缓存采样 3–5 页（先“作废本页”），区分单条带/多切片、首次/缓存命中；
+        再按占比决定优化项。约束：不增加 OCR 次数、模型请求、不等待邻页。
 
 - [ ] **P4 日漫支持**
       - 竖排/右→左：气泡内文本行序、OCR 行合并方向、阅读顺序按右→左；横排日漫也兼容。

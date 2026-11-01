@@ -281,6 +281,35 @@ class SettingsRepository(context: Context) {
     }
 
     /**
+     * 网页文字翻译悬浮球（2026-11-01 用户要求：默认关闭，用户自己选择启用）。
+     *
+     * 独立于翻译 API 档案；位置也单独存，避免和图片翻译悬浮球互相覆盖。
+     */
+    fun isBrowserWebpageTextBallEnabled(): Boolean {
+        return prefs.getBoolean(KEY_BROWSER_WEBPAGE_TEXT_BALL, false)
+    }
+
+    fun setBrowserWebpageTextBallEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_BROWSER_WEBPAGE_TEXT_BALL, enabled).apply()
+    }
+
+    fun getBrowserWebpageTextBallPosition(): BrowserFloatingBallPosition? {
+        val x = prefs.getFloat(KEY_BROWSER_TEXT_BALL_X_RATIO, Float.NaN)
+        val y = prefs.getFloat(KEY_BROWSER_TEXT_BALL_Y_RATIO, Float.NaN)
+        if (!x.isFinite() || !y.isFinite()) return null
+        if (x !in 0f..1f || y !in 0f..1f) return null
+        return BrowserFloatingBallPosition(xRatio = x, yRatio = y)
+    }
+
+    fun setBrowserWebpageTextBallPosition(xRatio: Float, yRatio: Float) {
+        if (!xRatio.isFinite() || !yRatio.isFinite()) return
+        prefs.edit()
+            .putFloat(KEY_BROWSER_TEXT_BALL_X_RATIO, xRatio.coerceIn(0f, 1f))
+            .putFloat(KEY_BROWSER_TEXT_BALL_Y_RATIO, yRatio.coerceIn(0f, 1f))
+            .apply()
+    }
+
+    /**
      * 单独关掉的站点适配 id 集合。
      *
      * 为什么要「逐站关闭」而不只留总开关：某个站的选择器失效时，用户不该被迫
@@ -490,6 +519,9 @@ class SettingsRepository(context: Context) {
         const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"
         const val KEY_BROWSER_FLOATING_BALL_X_RATIO = "browser_floating_ball_x_ratio"
         const val KEY_BROWSER_FLOATING_BALL_Y_RATIO = "browser_floating_ball_y_ratio"
+        const val KEY_BROWSER_WEBPAGE_TEXT_BALL = "browser_webpage_text_ball"
+        const val KEY_BROWSER_TEXT_BALL_X_RATIO = "browser_webpage_text_ball_x_ratio"
+        const val KEY_BROWSER_TEXT_BALL_Y_RATIO = "browser_webpage_text_ball_y_ratio"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }
