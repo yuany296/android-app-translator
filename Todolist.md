@@ -1,5 +1,101 @@
 # Todolist
 
+## 69. 用户 2026-11-01：悬浮球位置记忆 + 网页语言检查 + 延迟剖析 + 夹具 + 日漫
+
+### 一、背景
+
+用户睡前提出五件事，按“可立即落地 + 风险”排序：
+
+1. **P0** 重新进入网页时悬浮球总回默认位置，要求恢复上次拖动位置；
+2. **P1** 暂时找不到真实问题漫画网页，先用本地夹具做回归验证；
+3. **P2** 网页语言检查（图片/截图链路）；
+4. **P3** 觉得速度偏慢但不知道慢在哪，怀疑 OCR，要求先测再优化；
+5. **P4** 需要翻译日漫；用户 2026-11-02 尝试让 Paddle 使用自己的模型。
+
+本轮先完成 P0，并在模拟机验证；P1–P4 保留为待办。
+
+### 二、实施清单
+
+- [x] **P0 悬浮球位置记忆**
+      - 现状：`EmbeddedBrowserScreen.kt` 的 `rawOffset` 只是 `remember` 状态，
+        `onDragEnd` 只把 `dragging` 置 false，位置没有持久化；离开页面再进入就回到
+        `BrowserFloatingBallPolicy.defaultPosition(...)`。
+      - `BrowserFloatingBallPolicy` 新增 `encodePosition` / `decodePosition`：把像素位置
+        编码为**可移动范围内的比例**（0 = 左/上边缘，1 = 右/下边缘），恢复时按当前容器
+        尺寸换算并 `clamp`；兼容旋转、分屏和不同安全区。
+      - `SettingsRepository` 新增独立 pref（`browser_floating_ball_x_ratio` /
+        `browser_floating_ball_y_ratio`），不放进 `AppSettings`，避免切换翻译配置档案时
+        被连带重置（与 `browser_inpaint_clean` / `browser_dom_overlay` 同一口径）。
+      - 保存时机：拖动结束/取消时写一次；保存「松手后会吸附到的那一侧」，下次进来
+        直接出现在最终位置，不会先停在页面中间再滑过去。恢复时机：容器尺寸首次可用时，
+        有记录就恢复，没有才用默认位置。
+      - 日志：`ball_position_save` / `ball_position_restore`（含比例、像素、容器尺寸），
+        真机排查位置问题时直接过滤 `EmbeddedBrowser`。
+      - 单测：比例编解码往返、边缘 0/1、越界 clamp、无效容器返回 null、坏比例夹紧。
+      - 模拟机验证（`sdk_gphone64_x86_64`，Android 16）：
+        - 拖到左中：`ball_position_save x=0.0055 y=0.5005`；退出网页再进，
+          `ball_position_restore saved=true x=5.25 y=896.94`，球 bounds `[5,1182][131,1308]`；
+        - 拖到右上：`ball_position_save x=0.9945 y=0.1552`；`force-stop` 重开 app 再进，
+          `ball_position_restore saved=true x=948.75 y=278.16`，球 bounds `[949,563][1075,689]`。
+      - 验证通过：`app` 348 条、`core-overlay` 64 条、`core-translate` 234 条，0 失败；
+        `:app:assembleDebug` 通过并装机到模拟机。
+
+- [ ] **P1 本地夹具与验证**
+      - 背景：用户暂时找不到稳定的真实问题网页，先不依赖外网。
+      - 图像夹具（`app/src/test/resources/fixtures/` 或 `app/src/androidTest/assets/fixtures/`）：
+        1. 长条漫拼接图：带图像上/下边 + 内部切缝，含贴缝半行；
+        2. 纯色气泡（白底/彩底）与白描边文字；
+        3. 同一个气泡框里**故意错位**的两段（必须保持分开）；
+        4. 气泡内 + 气泡外、上一块以逗号/省略号收尾的续行（必须合并）；
+        5. OCR 近似重复：正确两行版 + 错字单行版（必须只留一份）；
+        6. 日漫竖排 + Ruby（后续日漫用）。
+      - 网页夹具：本地 HTML + 本地图片，模拟网页漫画阅读器（可滚动、可加载大图），
+        用于验证悬浮球位置记忆、网页语言检查、截图/条带链路；优先 `file:///android_asset/`。
+      - 纯逻辑走 JVM 单测；需要 Bitmap/WebView 的走 instrumentation 或手工脚本；
+        `fixtures/README.md` 标明每张夹具对应哪个 bug/需求、期望结果。
+      - 先做 3–5 个最关键场景；找到真实网页 URL 后再补。
+
+- [ ] **P2 网页语言检查（图片/截图链路）**
+      - 现状：网页**文字**翻译已有页面级检查（`EmbeddedBrowserScreen.kt` 约 2055 行：
+        `SourceScriptDetector.detect(collected.map { it.text })`，语言等于目标语言就整页跳过）；
+        图片/截图/条带链路（`WebtoonImageTranslator`）没有同等检查。
+      - OCR 出结果后、发起翻译前，复用已识别文本做 `SourceScriptDetector.detect(...)`；
+        若 `languageId == settings.targetLanguage`：跳过翻译、不生成盖板，提示
+        “页面语言与目标语言相同，无需翻译”。
+      - **不新增 OCR、不新增模型请求**（只复用 OCR 文本）。
+      - 可选早期提示：页面加载时读 `document.documentElement.lang` / `navigator.language`
+        做日志与快速提示；但 `<html lang>` 经常不准，不能只凭它硬跳过，最终以 OCR 文本判定。
+      - 混合语言按页面级主语言判定；判定失败/空页面不拦截，走原流程。
+      - 日志：`webpage_image_same_lang detected=... target=... blocks=...`。
+
+- [ ] **P3 延迟剖析与优化**
+      - 现状：用户觉得偏慢但在可接受范围，怀疑 OCR，但没有分段数据。
+      - 先测量，不先改算法：复用 `TranslationPerf` timer，补页面级汇总
+        `perf_summary ocr_ms=... translate_ms=... erase_ms=... render_ms=... total_ms=... blocks=... bubbles=...`；
+        缺成对标记的阶段（尤其翻译请求）补 `start/end`，只按页汇总，不逐气泡刷日志。
+      - 真机冷缓存采样 3–5 页（先“作废本页”），区分单条带/多切片、首次/缓存命中。
+      - 按占比优化，候选：OCR 切片数/重叠、重复检测、空白块跳过、Paddle 输入尺寸/速度档、
+        切片并行度；翻译按气泡 vs 批量、并发数、响应体大小、超时/重试、prompt 长度；
+        擦字/渲染的 inpaint 范围、Bitmap 拷贝、字体加载缓存。
+      - 约束：不增加 OCR 次数、不增加模型请求、不等待邻页、不降低译文质量。
+
+- [ ] **P4 日漫支持**
+      - 竖排/右→左：气泡内文本行序、OCR 行合并方向、阅读顺序按右→左；横排日漫也兼容。
+      - Ruby/注音过滤：识别正文旁的小号假名，避免把注音当正文重复翻译；纯几何/字号规则，
+        零额外请求。
+      - 日文语言配置：OCR 语言、翻译源语言可选日文；翻译 prompt 适配日漫口语与拟声词。
+      - 拟声词/特效字：先不翻译或单独标记，避免破坏画面。
+      - Paddle 自定义模型：等用户 2026-11-02 验证后接入；保留现有默认模型回退，
+        记录模型路径/格式、检测/识别输入输出对齐、CPU/内存/首帧耗时；失败自动回退。
+      - 夹具：竖排气泡、Ruby、拟声词各一份。
+
+### 三、边界
+
+- 悬浮球位置全局保存，不按 URL 区分；首次无记录才用默认位置。
+- 语言检查不做逐节点/逐气泡混合语言判定（先页面级）。
+- 延迟优化不以降低译文质量为代价；没有数据支持前不换 OCR 引擎/不改模型。
+- 日漫拟声词暂不翻译；Paddle 自定义模型未验证前不设为默认。
+
 ## 68. 用户 2026-11-01：零/低延迟质量补强（接缝切线 + 实时底色来源 + 颜色采样诊断）
 
 ### 一、背景

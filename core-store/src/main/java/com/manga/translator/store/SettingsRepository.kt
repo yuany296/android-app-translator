@@ -256,6 +256,31 @@ class SettingsRepository(context: Context) {
     }
 
     /**
+     * 内嵌浏览器悬浮球的最后位置（2026-11-01 用户反馈「重新进入网页总是回到默认位置」）。
+     *
+     * 存的是**可移动范围内的比例**而不是像素：0 = 左/上边缘，1 = 右/下边缘。
+     * 旋转屏幕、分屏、换设备后仍落在相同的相对位置，恢复时再按当前容器夹紧。
+     *
+     * 独立于 [AppSettings]：悬浮球位置不属于翻译 API 档案，不能跟着配置档案切换被重置
+     * （与 [isBrowserInpaintCleanEnabled] / [isBrowserDomOverlayEnabled] 同一口径）。
+     */
+    fun getBrowserFloatingBallPosition(): BrowserFloatingBallPosition? {
+        val x = prefs.getFloat(KEY_BROWSER_FLOATING_BALL_X_RATIO, Float.NaN)
+        val y = prefs.getFloat(KEY_BROWSER_FLOATING_BALL_Y_RATIO, Float.NaN)
+        if (!x.isFinite() || !y.isFinite()) return null
+        if (x !in 0f..1f || y !in 0f..1f) return null
+        return BrowserFloatingBallPosition(xRatio = x, yRatio = y)
+    }
+
+    fun setBrowserFloatingBallPosition(xRatio: Float, yRatio: Float) {
+        if (!xRatio.isFinite() || !yRatio.isFinite()) return
+        prefs.edit()
+            .putFloat(KEY_BROWSER_FLOATING_BALL_X_RATIO, xRatio.coerceIn(0f, 1f))
+            .putFloat(KEY_BROWSER_FLOATING_BALL_Y_RATIO, yRatio.coerceIn(0f, 1f))
+            .apply()
+    }
+
+    /**
      * 单独关掉的站点适配 id 集合。
      *
      * 为什么要「逐站关闭」而不只留总开关：某个站的选择器失效时，用户不该被迫
@@ -463,6 +488,8 @@ class SettingsRepository(context: Context) {
         const val KEY_BROWSER_SEARCH_ENGINE = "browser_search_engine"
         const val KEY_BROWSER_SITE_ADAPTER = "browser_site_adapter"
         const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"
+        const val KEY_BROWSER_FLOATING_BALL_X_RATIO = "browser_floating_ball_x_ratio"
+        const val KEY_BROWSER_FLOATING_BALL_Y_RATIO = "browser_floating_ball_y_ratio"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }
@@ -482,3 +509,13 @@ data class MonthlyQuotaUsage(
 ) {
     val remaining: Int get() = (limit - used).coerceAtLeast(0)
 }
+
+/**
+ * 悬浮球在可移动范围内的归一化位置。
+ *
+ * `0f` = 左/上边缘，`1f` = 右/下边缘；恢复时按当前容器尺寸换算回像素并夹紧。
+ */
+data class BrowserFloatingBallPosition(
+    val xRatio: Float,
+    val yRatio: Float
+)

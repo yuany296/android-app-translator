@@ -3,6 +3,7 @@ package com.manga.translator.app
 import androidx.compose.ui.geometry.Offset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -178,5 +179,70 @@ class BrowserFloatingBallPolicyTest {
         // 球心正好在正中偏右一格 → 视为停靠右侧。
         assertTrue(BrowserFloatingBallPolicy.isDockedRight(183f, ball, 412f))
         assertFalse(BrowserFloatingBallPolicy.isDockedRight(1f, ball, 412f))
+    }
+
+    // ---- 位置持久化：比例编解码 ----
+
+    @Test
+    fun encodePosition_roundTripsInsideMovableRange() {
+        val encoded = BrowserFloatingBallPolicy.encodePosition(
+            raw = Offset(100f, 200f),
+            sizePx = ball,
+            containerWidthPx = 412f,
+            containerHeightPx = 800f
+        )
+        requireNotNull(encoded)
+        assertEquals(100f / (412f - ball), encoded.x, 0.0001f)
+        assertEquals(200f / (800f - ball), encoded.y, 0.0001f)
+
+        val decoded = BrowserFloatingBallPolicy.decodePosition(encoded, ball, 412f, 800f)
+        assertEquals(100f, decoded.x, 0.01f)
+        assertEquals(200f, decoded.y, 0.01f)
+    }
+
+    @Test
+    fun encodePosition_mapsEdgesToZeroAndOne() {
+        val topLeft = BrowserFloatingBallPolicy.encodePosition(Offset(0f, 0f), ball, 412f, 800f)
+        requireNotNull(topLeft)
+        assertEquals(0f, topLeft.x, 0.0001f)
+        assertEquals(0f, topLeft.y, 0.0001f)
+
+        val bottomRight = BrowserFloatingBallPolicy.encodePosition(
+            Offset(412f - ball, 800f - ball), ball, 412f, 800f
+        )
+        requireNotNull(bottomRight)
+        assertEquals(1f, bottomRight.x, 0.0001f)
+        assertEquals(1f, bottomRight.y, 0.0001f)
+    }
+
+    @Test
+    fun encodePosition_clampsOutOfBoundsAndRejectsInvalidContainer() {
+        val encoded = BrowserFloatingBallPolicy.encodePosition(
+            Offset(-100f, 9999f), ball, 412f, 800f
+        )
+        requireNotNull(encoded)
+        assertEquals(0f, encoded.x, 0.0001f)
+        assertEquals(1f, encoded.y, 0.0001f)
+
+        assertNull(BrowserFloatingBallPolicy.encodePosition(Offset(1f, 1f), ball, 0f, 800f))
+        assertNull(BrowserFloatingBallPolicy.encodePosition(Offset(1f, 1f), 0f, 412f, 800f))
+    }
+
+    @Test
+    fun decodePosition_scalesToNewContainerAndClampsBadRatios() {
+        // 同一比例在更窄/更矮的容器里换算成新的像素位置，而不是沿用旧像素。
+        val decoded = BrowserFloatingBallPolicy.decodePosition(Offset(1f, 1f), ball, 300f, 600f)
+        assertEquals(300f - ball, decoded.x, 0.01f)
+        assertEquals(600f - ball, decoded.y, 0.01f)
+
+        // 坏数据（负数/大于 1）夹回合法范围，不能把球画到屏幕外。
+        assertEquals(
+            Offset(0f, 0f),
+            BrowserFloatingBallPolicy.decodePosition(Offset(-1f, -1f), ball, 412f, 800f)
+        )
+        assertEquals(
+            Offset(412f - ball, 800f - ball),
+            BrowserFloatingBallPolicy.decodePosition(Offset(2f, 2f), ball, 412f, 800f)
+        )
     }
 }

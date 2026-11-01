@@ -74,6 +74,49 @@ object BrowserFloatingBallPolicy {
     }
 
     /**
+     * 把像素位置编码成**可移动范围内的比例**：0 = 左/上边缘，1 = 右/下边缘。
+     *
+     * 持久化用比例而不是像素：旋转屏幕、分屏、换设备后仍落在相同的相对位置；
+     * 容器无效（还没量出尺寸）时返回 null，调用方不要覆盖已存的位置。
+     */
+    fun encodePosition(
+        raw: Offset,
+        sizePx: Float,
+        containerWidthPx: Float,
+        containerHeightPx: Float
+    ): Offset? {
+        if (sizePx <= 0f || containerWidthPx <= 0f || containerHeightPx <= 0f) return null
+        val clamped = clamp(raw, sizePx, containerWidthPx, containerHeightPx)
+        val maxX = (containerWidthPx - sizePx).coerceAtLeast(0f)
+        val maxY = (containerHeightPx - sizePx).coerceAtLeast(0f)
+        return Offset(
+            if (maxX <= 0f) 0f else (clamped.x / maxX).coerceIn(0f, 1f),
+            if (maxY <= 0f) 0f else (clamped.y / maxY).coerceIn(0f, 1f)
+        )
+    }
+
+    /** [encodePosition] 的逆运算：按当前容器尺寸还原，并夹紧到球完整可见。 */
+    fun decodePosition(
+        ratio: Offset,
+        sizePx: Float,
+        containerWidthPx: Float,
+        containerHeightPx: Float
+    ): Offset {
+        if (sizePx <= 0f || containerWidthPx <= 0f || containerHeightPx <= 0f) return Offset.Zero
+        val maxX = (containerWidthPx - sizePx).coerceAtLeast(0f)
+        val maxY = (containerHeightPx - sizePx).coerceAtLeast(0f)
+        return clamp(
+            Offset(
+                ratio.x.coerceIn(0f, 1f) * maxX,
+                ratio.y.coerceIn(0f, 1f) * maxY
+            ),
+            sizePx,
+            containerWidthPx,
+            containerHeightPx
+        )
+    }
+
+    /**
      * 松手吸附：球心落在容器右半 → 靠右，否则靠左（与 [isDockedRight] 同一判据）。
      * 吸附只改横向位置，纵向保持用户拖到的高度。
      */

@@ -136,9 +136,10 @@ import com.manga.translator.store.AiProvider
 import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.AppSettings
 import com.manga.translator.translate.Bubble
-import com.manga.translator.store.BrowserHistoryEntry
 import com.manga.translator.store.BrowserFavorite
 import com.manga.translator.store.BrowserFavoriteRepository
+import com.manga.translator.store.BrowserFloatingBallPosition
+import com.manga.translator.store.BrowserHistoryEntry
 import com.manga.translator.store.BrowserHistoryRepository
 import com.manga.translator.store.BrowserSearchEngine
 import com.manga.translator.store.BrowserSiteAdapter
@@ -1293,6 +1294,8 @@ fun EmbeddedBrowserScreen(
     var inpaintClean by remember { mutableStateOf(settingsRepository.isBrowserInpaintCleanEnabled()) }
     // 覆盖层渲染（默认开）：译文画在 DOM 覆盖层上；关 = 旧的整图替换。
     var domOverlay by remember { mutableStateOf(settingsRepository.isBrowserDomOverlayEnabled()) }
+    // 悬浮球的最后位置（2026-11-01）：每次进入网页按它恢复，不再回到默认右下角。
+    val savedBallPosition = remember { settingsRepository.getBrowserFloatingBallPosition() }
     // 网页文字翻译（2026-10-14）：与漫画图链路独立 —— 只翻译 DOM 文本节点。
     var webpageTextBusy by remember { mutableStateOf(false) }
     var webpageTextApplied by remember { mutableStateOf(false) }
@@ -2656,7 +2659,11 @@ fun EmbeddedBrowserScreen(
                             BrowserViewMode.TRANSLATED -> showTranslations()
                         }
                     },
-                    onScreenshotTranslate = { startScreenshotTranslation() }
+                    onScreenshotTranslate = { startScreenshotTranslation() },
+                    savedPosition = savedBallPosition,
+                    onPositionChanged = { xRatio, yRatio ->
+                        settingsRepository.setBrowserFloatingBallPosition(xRatio, yRatio)
+                    }
                 )
             }
 
@@ -5350,7 +5357,9 @@ private fun BrowserTranslateFloatingBall(
     modeToggleDisabledReason: String?,
     onPrimaryTap: () -> Unit,
     onSelectViewMode: (BrowserViewMode) -> Unit,
-    onScreenshotTranslate: () -> Unit
+    onScreenshotTranslate: () -> Unit,
+    savedPosition: BrowserFloatingBallPosition?,
+    onPositionChanged: (Float, Float) -> Unit
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
@@ -5384,16 +5393,63 @@ private fun BrowserTranslateFloatingBall(
     val capsuleHeightPx = with(density) { capsuleHeight.toPx() }
     val capsuleGapPx = with(density) { BrowserFloatingBallPolicy.CAPSULE_GAP_DP.dp.toPx() }
 
+    // pointerInput(Unit) 的手势 lambda 只创建一次：用它读取「最新的」尺寸/回调和位置，
+    // 避免密度或容器变化后保存到旧尺寸（与上面 running/busy 的 rememberUpdatedState 同一原因）。
+    val latestBallSizePx by rememberUpdatedState(ballSizePx)
+    val latestDockMarginPx by rememberUpdatedState(dockMarginPx)
+    val latestOnPositionChanged by rememberUpdatedState(onPositionChanged)
+
+    /**
+     * 拖动结束时落盘。
+     *
+     * 保存「松手后会吸附到的那一侧」而不是手指离开时的原始 x：下次进来球直接出现在边缘，
+     * 不会先停在页面中间再滑过去；纵向保存用户拖到的比例。容器尺寸无效时不覆盖旧值。
+     */
+    fun persistBallPosition() {
+        val current = rawOffset ?: return
+        val size = containerSize.value
+        if (size.width <= 0 || size.height <= 0) return
+        val width = size.width.toFloat()
+        val height = size.height.toFloat()
+        val dockedX = BrowserFloatingBallPolicy.dockX(
+            current.x, latestBallSizePx, width, latestDockMarginPx
+        )
+        val ratio = BrowserFloatingBallPolicy.encodePosition(
+            Offset(dockedX, current.y), latestBallSizePx, width, height
+        ) ?: return
+        latestOnPositionChanged(ratio.x, ratio.y)
+        Log.d(
+            TAG,
+            "ball_position_save x=${ratio.x} y=${ratio.y} " +
+                "rawX=${current.x} rawY=${current.y} container=${size.width}x${size.height}"
+        )
+    }
+
     Box(modifier = Modifier.fillMaxSize().onSizeChanged { containerSize.value = it }) {
-        // 首次布局：给一个默认停靠点（右边缘、30% 高度）。之后位置完全由用户拖动决定。
-        LaunchedEffect(containerSize.value) {
+        // 首次布局：优先恢复上次位置；没有记录才给默认停靠点（右边缘、贴内容区底）。
+        LaunchedEffect(containerSize.value, savedPosition) {
             if (rawOffset == null && containerSize.value.width > 0 && containerSize.value.height > 0) {
-                rawOffset = BrowserFloatingBallPolicy.defaultPosition(
-                    containerSize.value.width.toFloat(),
-                    containerSize.value.height.toFloat(),
+                val width = containerSize.value.width.toFloat()
+                val height = containerSize.value.height.toFloat()
+                rawOffset = savedPosition?.let { saved ->
+                    BrowserFloatingBallPolicy.decodePosition(
+                        ratio = Offset(saved.xRatio, saved.yRatio),
+                        sizePx = ballSizePx,
+                        containerWidthPx = width,
+                        containerHeightPx = height
+                    )
+                } ?: BrowserFloatingBallPolicy.defaultPosition(
+                    width,
+                    height,
                     ballSizePx,
                     dockMarginPx,
                     bottomMarginPx
+                )
+                Log.d(
+                    TAG,
+                    "ball_position_restore saved=${savedPosition != null} " +
+                        "x=${rawOffset?.x} y=${rawOffset?.y} " +
+                        "container=${containerSize.value.width}x${containerSize.value.height}"
                 )
             }
         }
@@ -5582,8 +5638,14 @@ private fun BrowserTranslateFloatingBall(
                 .pointerInput(Unit) {
                     detectDragGestures(
                         onDragStart = { dragging = true },
-                        onDragEnd = { dragging = false },
-                        onDragCancel = { dragging = false }
+                        onDragEnd = {
+                            dragging = false
+                            persistBallPosition()
+                        },
+                        onDragCancel = {
+                            dragging = false
+                            persistBallPosition()
+                        }
                     ) { change, dragAmount ->
                         change.consume()
                         rawOffset = (rawOffset ?: Offset.Zero) + dragAmount
