@@ -218,7 +218,7 @@ object BrowserOverlayImageStore {
 }
 
 /** 漫画图下载器：带 WebView 的 Cookie / Referer / UA，尽量贴近页面自身的取图行为。 */
-class BrowserImageDownloader {
+class BrowserImageDownloader(private val context: Context) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -233,6 +233,24 @@ class BrowserImageDownloader {
         .build()
 
     fun download(url: String, referer: String?, userAgent: String?): ByteArray? {
+        // Debug 本地夹具：图片不走 OkHttp，直接从 APK 的 assets/fixtures/ 读。
+        // WebView 的 shouldInterceptRequest 只管页面自身；漫画链路是 Kotlin 侧另外下载图片，
+        // 不补这一条会表现为「页面能开、图是空的、点翻译读取图片…」。
+        if (BuildConfig.DEBUG && url.startsWith("https://$LOCAL_FIXTURE_HOST/")) {
+            val relative = url.removePrefix("https://$LOCAL_FIXTURE_HOST/")
+                .substringBefore('?')
+                .substringBefore('#')
+            if (relative.isEmpty() || relative.contains("..")) return null
+            return runCatching {
+                context.assets.open("fixtures/$relative").use { it.readBytes() }
+            }.onFailure { err ->
+                Log.w(
+                    TAG,
+                    "fixture_asset_fail reason=${err.javaClass.simpleName}:${err.message?.take(60)} " +
+                        "path=fixtures/$relative"
+                )
+            }.getOrNull()
+        }
         return runCatching {
             val builder = Request.Builder().url(url)
                 .header("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
@@ -1090,6 +1108,28 @@ private const val TAG = "EmbeddedBrowser"
 private const val IDLE_POLL_INTERVAL_MS = 1200L
 
 /**
+ * Debug 专用本地夹具通道（2026-11-01，P1）。
+ *
+ * 地址栏只接受 http/https，`file:///android_asset` 会被当搜索词；这里用一个虚拟 https
+ * 域名，由 `shouldInterceptRequest` 直接从 APK 的 `assets/fixtures/` 返回文件。
+ * 只在 `BuildConfig.DEBUG` 生效，release 不暴露。
+ */
+private const val LOCAL_FIXTURE_HOST = "mtlocal.fixture"
+private const val LOCAL_FIXTURE_URL = "https://mtlocal.fixture/web_reader.html"
+
+private fun fixtureMimeType(assetPath: String): String =
+    when (assetPath.substringAfterLast('.', "").lowercase()) {
+        "html", "htm" -> "text/html"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "webp" -> "image/webp"
+        "css" -> "text/css"
+        "js" -> "application/javascript"
+        else -> "application/octet-stream"
+    }
+
+
+/**
  * 「阅读位置优先」调度的锚点比例（2026-10-15）：视口高度 35% 处为「正在读的位置」，
  * 与参考项目 `scheduler.js` 的 `viewportAnchor = innerHeight * 0.35` 同口径 ——
  * 长条漫通常上下各露出半张，35% 线穿过的是用户视线的落点。
@@ -1350,7 +1390,7 @@ fun EmbeddedBrowserScreen(
     val seamBySrc = remember { LinkedHashMap<String, PendingSeam>() }
     val session = remember { TranslationSession() }
     val translator = remember { WebtoonImageTranslator() }
-    val downloader = remember { BrowserImageDownloader() }
+    val downloader = remember { BrowserImageDownloader(context) }
 
     fun refreshHistory() {
         historyEntries = runCatching { historyRepository.all() }.getOrDefault(emptyList())
@@ -1482,6 +1522,23 @@ fun EmbeddedBrowserScreen(
                     view: WebView,
                     request: WebResourceRequest
                 ): WebResourceResponse? {
+                    // Debug 本地夹具：虚拟 https 域名 → APK 内的 assets/fixtures/。
+                    if (BuildConfig.DEBUG && request.url.host == LOCAL_FIXTURE_HOST) {
+                        val relative = request.url.path.orEmpty().trimStart('/')
+                        if (relative.isEmpty() || relative.contains("..")) return null
+                        val assetPath = "fixtures/$relative"
+                        val mime = fixtureMimeType(assetPath)
+                        return runCatching {
+                            WebResourceResponse(
+                                mime,
+                                if (mime.startsWith("text/")) "UTF-8" else null,
+                                200,
+                                "OK",
+                                mapOf("Cache-Control" to "no-store"),
+                                context.assets.open(assetPath)
+                            )
+                        }.getOrNull()
+                    }
                     if (request.url.host == "mtlocal.overlay") {
                         val token = request.url.lastPathSegment?.substringBeforeLast('.') ?: return null
                         val bytes = BrowserOverlayImageStore.get(token) ?: return null
@@ -2392,6 +2449,7 @@ fun EmbeddedBrowserScreen(
             onSubmit = { submitUrl() },
             searchEngine = searchEngine,
             onSelectSearchEngine = { engine -> selectSearchEngine(engine) },
+            fixtureUrl = if (BuildConfig.DEBUG) LOCAL_FIXTURE_URL else null,
             // 有打开的网页时给一条「马上回网页」的路（2026-09-28 用户要求）。
             showBackToPage = pageUrl.isNotBlank() && pageUrl != "about:blank",
             onBackToPage = {
@@ -4701,6 +4759,8 @@ private fun BrowserNewTabPage(
     onSubmit: () -> Unit,
     searchEngine: BrowserSearchEngine,
     onSelectSearchEngine: (BrowserSearchEngine) -> Unit,
+    /** debug 包才非空：本地测试夹具入口（release 传 null）。 */
+    fixtureUrl: String?,
     /** 有打开的网页时显示「返回网页」按钮（用户要求：一键马上回到浏览器界面）。 */
     showBackToPage: Boolean,
     onBackToPage: () -> Unit,
@@ -4839,6 +4899,42 @@ private fun BrowserNewTabPage(
                         engine = candidate,
                         selected = candidate == searchEngine,
                         onClick = { onSelectSearchEngine(candidate) }
+                    )
+                }
+            }
+
+            // Debug 本地夹具入口（2026-11-01，P1）：点一下直接打开 APK 内的三格韩漫，
+            // 不用记虚拟 URL、也不依赖外网。release 传 null，整块不渲染。
+            if (fixtureUrl != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(MtColors.BrandTint)
+                        .clickable { onOpenUrl(fixtureUrl) }
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "本地测试夹具",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MtColors.TextPrimary
+                        )
+                        Text(
+                            text = "三格韩漫 · 验证悬浮球 / 网页语言 / OCR",
+                            fontSize = 12.sp,
+                            color = MtColors.TextSecondary,
+                            maxLines = 1
+                        )
+                    }
+                    Text(
+                        text = "打开",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MtColors.BrandInk
                     )
                 }
             }
