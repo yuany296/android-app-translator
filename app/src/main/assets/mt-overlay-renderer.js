@@ -2131,9 +2131,11 @@
         var contentNode = document.createElement("div");
         contentNode.className = "mt-bubble-content";
         contentNode.textContent = displayText;
-        // 气泡专用文字排版兜底：文字统一由内层节点居中显示并保留换行。
+        // 对齐必须跟随 bubble.alignment（2026-11-01 修）：这里以前硬编码 center，
+        // 而 `.mt-align-*` 类又没有对应 CSS，导致左/右对齐的原文一律被译成居中。
+        // 对齐只影响**行内**排版，文字块本身的宽度/位置仍由 bubble 框决定。
         contentNode.style.width = "100%";
-        contentNode.style.textAlign = "center";
+        contentNode.style.textAlign = normalizeAlignment(bubble.alignment);
         contentNode.style.whiteSpace = "pre-line";
         textNode.appendChild(contentNode);
         // 字号兜底撑开时，实底遮罩必须同步撑满（否则译文张到框外、原文露在外面）。

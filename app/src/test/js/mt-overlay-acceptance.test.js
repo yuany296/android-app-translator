@@ -139,6 +139,22 @@ const TILTED_POLYGON = [
 })();
 
 // ---------------------------------------------------------------------------
+// §? 对齐：bubble.alignment 必须落到 .mt-bubble-content 的 text-align
+// （2026-11-01：这里曾硬编码 center，左/右对齐的原文全被译成居中）
+// ---------------------------------------------------------------------------
+(function textAlignmentFollowsBubble() {
+  ["left", "center", "right"].forEach(function (alignment) {
+    const page = freshPage();
+    apply(page, scene(page, [bubble({ alignment: alignment })]));
+    const textNode = page.document.querySelector(".__mt_scene_root").querySelector(".mt-text-layer");
+    const content = textNode && textNode.querySelector(".mt-bubble-content");
+    check("content text-align follows " + alignment,
+      !!content && content.style.textAlign === alignment,
+      content && content.style.textAlign);
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // §10 稳定性：相同场景签名只同步位置，绝不重建节点
 // ---------------------------------------------------------------------------
 (function signatureIdempotence() {

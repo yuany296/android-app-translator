@@ -2854,6 +2854,16 @@ class WebtoonImageTranslator(
                     "@${bubble.x.toInt()},${bubble.y.toInt()}"
             }
         )
+        // 对齐诊断（2026-11-01）：左/中/右推断是否正确，直接看这一行。
+        // `boxes` = 逐行框数；为 0 时对齐只能按块几何推断，右侧错位先查这里。
+        timer.mark(
+            "bubble_alignment",
+            bubbles.take(8).joinToString(" ˌ ") { bubble ->
+                "${bubble.alignment}/${bubble.layout}" +
+                    " lines=${bubble.sourceLineCount} boxes=${bubble.lineBoxes?.size ?: 0}" +
+                    " ${bubble.originalText.replace('\n', '⏎').take(12)}"
+            }
+        )
         // 竖排判定原因（2026-09-30 用户反馈「横排三行韩文被排成竖排」）。
         //
         // 为什么在这里打而不是在 planner 里：planner 是纯 Kotlin、被 JVM 单测直接调用，

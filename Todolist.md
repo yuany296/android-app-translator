@@ -1,5 +1,39 @@
 # Todolist
 
+## 70. 用户 2026-11-01：旧夹具回归（左/中/右对齐 + 截断台词）
+
+### 一、对齐（已修）
+
+- 现象：`align.html` 里左对齐、右对齐的原文，译文都被渲染成居中；
+  用户追加「其实左排版也有问题」。
+- 根因：DOM 渲染层 `mt-overlay-renderer.js` 的 `createBubbleLayers` 把
+  `.mt-bubble-content` 的 `text-align` **硬编码成 `center`**；`mt-align-left/right`
+  类只有 class、没有任何 CSS 规则，所以 `Bubble.alignment` 一路传到了渲染层也没生效。
+- 修复：`contentNode.style.textAlign = normalizeAlignment(bubble.alignment)`。
+- 单测：`mt-overlay-acceptance.test.js` 新增 left/center/right 三条断言；
+  `node app/src/test/js/mt-overlay-acceptance.test.js` → `ALL_OK 243/243`。
+- 模拟机验证（CDP 读取真实 DOM）：
+  - 左：`text-align:left`，文字块 `left=40 right=270`；
+  - 中：`text-align:center`，`left=63 right=283`；
+  - 右：`text-align:right`，`left=110 right=374`。
+- 诊断日志：`bubble_alignment`（每页最多 8 个气泡，打印 `left/center/right`、
+  行数、逐行框数、原文前 12 字），后续对齐问题先看这一行。
+
+### 二、截断台词（已定位，待定修法）
+
+- 夹具：`.verify/web/seam.html`（`seamA.png` + `seamB.png`），
+  缝上有一句被切成两半的 `잘라진 대사입니`。
+- 日志：`seam_pair_state status=failed ... error=no_match`、
+  `seam_race_skip ... prev[y+h=34.9] cur[y=52.0] best=0.80`。
+- 原因：**上半截在上一张图里没有被 OCR 检成候选**（只有下半截进了 scene），
+  `SeamRaceBand.findGeometricMatch` 要求上下贴边候选合计 ≥3，直接 `no_match`；
+  下半截于是被当成独立气泡翻译，上页残留的半截原文留在缝上。
+- 两种修法（需要用户裁定）：
+  - **A 保守**：贴顶/贴底的半句在无配对时**不单独翻译**（宁可不翻，也不出半句错译）；
+  - **B 合成**：用下半截反推上页底边同宽短框，强行建跨缝带 + 不透明 flat cover，
+    把两半盖住并只出一份译文；风险是可能盖到上页底部无关内容。
+- 本轮未改截断逻辑：先保留原行为，避免在没确认像素证据前引入误盖。
+
 ## 69. 用户 2026-11-01：悬浮球位置记忆 + 网页语言检查 + 延迟剖析 + 夹具 + 日漫
 
 ### 一、背景
