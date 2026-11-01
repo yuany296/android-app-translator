@@ -51,19 +51,16 @@
       - **纯色气泡 Bitmap 夹具**（`app/src/androidTest/assets/fixtures/solid_bubble.png`）：
         `BubbleColorFixtureTest` 在模拟机跑真实 `Bitmap` 采样，验证白底、黑字、容器边带样本数、
         `flatBackground`；已通过。
-      - **网页夹具 + Debug 入口**（`app/src/debug/assets/fixtures/`）：`web_reader.html` +
-        1080×3000 三格韩漫 PNG（白/浅黄/浅蓝/浅粉气泡）。
-      - 新标签页在 `BuildConfig.DEBUG` 下显示「本地测试夹具」卡片，点击直接打开
-        `https://mtlocal.fixture/web_reader.html`；WebView 的 `shouldInterceptRequest`
-        和 `BrowserImageDownloader` 都从 APK 的 `assets/fixtures/` 读，**不需要本地 HTTP 服务
-        或 `adb reverse`**。release 不渲染卡片、拦截分支也不生效。
-      - 说明：地址栏只接受 http/https，`file:///android_asset` 会被当搜索词；调试入口走虚拟
-        https 域名绕开这个限制，网页夹具只进 debug APK。
-      - 模拟机验证：新标签页卡片可见 → 点击后页面和图片正常加载 → 点球翻译
-        OCR 8 blocks / 6 bubbles、翻译请求 HTTP 200，无 `image_fail` /
-        `fixture_asset_fail`；滚动时悬浮球位置不变。
+      - **网页夹具**（`app/src/debug/assets/fixtures/`）：`web_reader.html` + 1080×3000
+        三格韩漫 PNG（白/浅黄/浅蓝/浅粉气泡）。本机 `python -m http.server` + `adb reverse`
+        打开，模拟机验证页面加载、滚动、悬浮球固定。
+      - 说明：地址栏只接受 http/https，`file:///android_asset` 会被当搜索词；夹具用
+        `python -m http.server 8765 --bind 0.0.0.0 --directory app/src/debug/assets`
+        + `adb reverse tcp:8765 tcp:8765` 打开。2026-11-01 用户裁定：**不内置 debug
+        卡片/虚拟域名**，只保留这套本地 HTTP 方式。
       - 验证：`app` 349 条、`core-overlay` 64 条、`core-translate` 234 条，0 失败；
-        `BubbleColorFixtureTest` 模拟机通过。
+        `BubbleColorFixtureTest` 模拟机通过；网页夹具已用上述 HTTP 方式跑通
+        OCR 8 blocks / 6 bubbles。
       - 未做：日漫竖排/Ruby 夹具（随 P4）；找到真实网页 URL 后再补一条真实页回归。
 
 - [ ] **P2 网页语言检查（图片/截图链路）**
