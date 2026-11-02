@@ -2035,6 +2035,7 @@ class OpenAiVisionClient(
 
     /** 语言 id 的英文名（提示词里用；与 AppLanguage 无依赖，core-translate 内自持一份）。 */
     internal fun languageDisplayName(languageId: String): String = when (languageId.lowercase()) {
+        "auto" -> "the source language (auto-detected)"
         "zh-cn", "zh" -> "Simplified Chinese"
         "zh-tw" -> "Traditional Chinese"
         "en" -> "English"

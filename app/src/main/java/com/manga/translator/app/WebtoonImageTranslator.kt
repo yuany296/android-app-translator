@@ -264,7 +264,13 @@ class WebtoonImageTranslator(
          * ⚠️ 回调可能在 **IO 线程**被调用（`translateStitched` 里并发跑擦字与翻译请求），
          * 调用方若要碰 WebView（线程受限）必须自己切回主线程。
          */
-        onPhase: (String) -> Unit = {}
+        onPhase: (String) -> Unit = {},
+        /**
+         * 浏览器链路解析后的源语言（2026-11-01）：网页可以「自动检测」，但 OCR/翻译
+         * 必须拿到具体语言。调用方在会话开始前按页面语言解析好，这里覆盖全局设置；
+         * 非浏览器调用方不传（null）时保持原行为。
+         */
+        sourceLanguageOverride: String? = null
     ): Outcome {
         val timer = TranslationTimer()
         try {
@@ -286,7 +292,8 @@ class WebtoonImageTranslator(
                     timer,
                     renderMode,
                     allowIncomingMerge,
-                    onPhase
+                    onPhase,
+                    sourceLanguageOverride
                 )
             } finally {
                 if (stitched !== source && !stitched.isRecycled) stitched.recycle()
@@ -312,22 +319,46 @@ class WebtoonImageTranslator(
         timer: TranslationTimer,
         renderMode: BrowserRenderMode,
         allowIncomingMerge: Boolean,
-        onPhase: (String) -> Unit = {}
+        onPhase: (String) -> Unit = {},
+        sourceLanguageOverride: String? = null
     ): Outcome {
-        val settings = ServiceLocator.settingsRepository.getSettings()
+        val configuredSettings = ServiceLocator.settingsRepository.getSettings()
+        // 网页「自动检测」解析出的具体语言优先于全局设置；非浏览器链路 null = 原行为。
+        val settings = if (sourceLanguageOverride.isNullOrBlank()) {
+            configuredSettings
+        } else {
+            configuredSettings.copy(sourceLanguage = sourceLanguageOverride)
+        }
+        if (settings.sourceLanguage != configuredSettings.sourceLanguage) {
+            Log.d(
+                TAG,
+                "translate_source configured=${configuredSettings.sourceLanguage} " +
+                    "effective=${settings.sourceLanguage} override=true"
+            )
+        }
         // 「inpaint 清理图」选项（浏览器设置，默认开）：整页 inpaint 出的背景连续一致，
         // 观感比逐气泡贴片好；代价是多一次整页 inpaint，故做成可关的选项。
         val inpaintClean = ServiceLocator.settingsRepository.isBrowserInpaintCleanEnabled()
         // loading 框的阶段文案（单一来源在这里，见 WebtoonPhase）：UI 只负责显示。
         onPhase(WebtoonPhase.RECOGNIZING)
-        val ocrResult = try {
-            detectBubbles(
-                stitched,
-                settings,
-                timer,
-                bottomLimit = (topH + source.height).toFloat(),
-                topLimit = topH.toFloat()
-            )
+        val (ocrResult, pageHash) = try {
+            coroutineScope {
+                // 页面指纹只用于缓存键/擦字缓存，和 OCR 完全独立：并行计算，
+                // 把旧实现串行等待的 ~300ms 藏进 OCR 窗口（2026-11-02，P3）。
+                val pageHashDeferred = async(ioDispatcher) {
+                    val hash = ServiceLocator.eraseProcessor.buildPageHash(stitched)
+                    timer.mark("page_hash_done", "hash=${hash.take(8)}")
+                    hash
+                }
+                val result = detectBubbles(
+                    stitched,
+                    settings,
+                    timer,
+                    bottomLimit = (topH + source.height).toFloat(),
+                    topLimit = topH.toFloat()
+                )
+                result to pageHashDeferred.await()
+            }
         } catch (err: Throwable) {
             timer.mark("response_fail", "stage=ocr reason=${err.message?.take(80)}")
             incomingRaw.forEach { part -> runCatching { part.patchBitmap.recycle() } }
@@ -662,7 +693,6 @@ class WebtoonImageTranslator(
             }
         )
 
-        val pageHash = withContext(ioDispatcher) { ServiceLocator.eraseProcessor.buildPageHash(stitched) }
         // OCR 已经出结果，接下来是「翻译 + 擦字/颜色预处理」（两者并行）。
         onPhase(WebtoonPhase.TRANSLATING)
 
@@ -694,6 +724,7 @@ class WebtoonImageTranslator(
             }
             timer.mark("cross_prep", "incoming=$incomingTextCount added=${crossPrepBubbles.size} px=$detail")
         }
+        timer.mark("cross_prep_done", "count=${crossPrepBubbles.size}")
         coroutineScope {
             // 擦字/颜色/内容框与翻译请求并行（与悬浮球链路同策略，减少总等待）。
             val prepDeferred = async(ioDispatcher) {
@@ -705,7 +736,11 @@ class WebtoonImageTranslator(
                     includeSolidInpaint = inpaintClean
                 )
             }
-            val glossaryEntries = ServiceLocator.glossaryRepository.activeGlossaryEntries()
+            // 术语表读取也可能要解析大 JSON；从主线程挪到 IO，并和擦字/内容框准备并行。
+            val glossaryDeferred = async(ioDispatcher) {
+                val repo = ServiceLocator.glossaryRepository
+                repo.activeGlossaryEntries() to repo.activeRevision()
+            }
             // 翻译请求 = owned 的原文 + 相邻行并回的合并原文（追加在尾部，结果按下标切回；
             // `resolveTranslations` 按列表顺序逐条返回，顺序/条数都与入参一致）。
             val requestBubbles = owned.map { it.bubble } + mergedRequests.map { request ->
@@ -739,10 +774,11 @@ class WebtoonImageTranslator(
                     }
                 )
             }
+            val (glossaryEntries, glossaryRevision) = glossaryDeferred.await()
             val translateKey = translationResolver.buildTranslateKey(
                 texts = requestBubbles.map { it.originalText },
                 settings = settings,
-                glossaryRevision = ServiceLocator.glossaryRepository.activeRevision()
+                glossaryRevision = glossaryRevision
             )
             if (missingCloudConfig && !useLocalEngine) {
                 warning = "仅OCR（未配置翻译API）"
@@ -1115,19 +1151,52 @@ class WebtoonImageTranslator(
             "bubbles=${finalBubbles.size} incoming=${incomingFinal.count { SeamTextPixels.contributesText(it.hasTextPixels) }} crossOut=${crossOut.size} " +
                 "seam=${seam?.bubbles?.size ?: 0} mode=$renderMode png=${png?.size ?: 0}B"
         )
-        // 页面级耗时汇总（2026-11-01，P3）：先量再优化。
-        // ocr = OCR 检测+归并；translate = 翻译请求；post = 擦字/几何/渲染。
+        // 页面级耗时汇总（2026-11-01，P3；2026-11-02 修正阶段 tag 冲突）。
+        // pre  = 取图/解码/扫描到 OCR 开始；
+        // ocr  = OCR 检测 + 气泡归并；
+        // cache= 句子缓存查找（含 compact/fuzzy）；
+        // translate = 真正调用翻译引擎；
+        // post = 擦字/几何/渲染。
         run {
-            val ocrAt = timer.elapsedMs("response_ok")
-            val sendAt = timer.elapsedMs("request_send")
-            val translateAt = timer.elapsedMs("translate_response")
+            val preAt = timer.elapsedMs("ocr_request")
+            val ocrAt = timer.elapsedMs("ocr_response")
+            val cacheStartAt = timer.elapsedMs("cache_lookup_start")
+            val cacheAt = timer.elapsedMs("sentence_cache")
+            val translateStartAt = timer.elapsedMs("translate_start")
+            val translateEndAt = timer.elapsedMs("translate_response")
+            val storeStartAt = timer.elapsedMs("translate_store_start")
+            val storeDoneAt = timer.elapsedMs("translate_store_done")
             val totalAt = timer.elapsedMs("render_done")
+            val ocrMs = if (ocrAt != null && preAt != null) ocrAt - preAt else -1
+            val prepMs = if (cacheStartAt != null && ocrAt != null) cacheStartAt - ocrAt else -1
+            val cacheMs = if (cacheAt != null && cacheStartAt != null) cacheAt - cacheStartAt else -1
+            val translateMs = if (translateEndAt != null && translateStartAt != null) {
+                translateEndAt - translateStartAt
+            } else if (translateEndAt != null && cacheAt != null) {
+                0L
+            } else {
+                -1L
+            }
+            val postStartAt = translateEndAt ?: cacheAt
+            val postMs = if (totalAt != null && postStartAt != null) totalAt - postStartAt else -1
+            val storeMs = if (storeDoneAt != null && storeStartAt != null) {
+                storeDoneAt - storeStartAt
+            } else {
+                0L
+            }
+            val renderStartAt = storeDoneAt ?: translateEndAt ?: cacheAt
+            val renderMs = if (totalAt != null && renderStartAt != null) {
+                totalAt - renderStartAt
+            } else {
+                -1L
+            }
+            val preMs = preAt ?: -1
             timer.mark(
                 "perf_summary",
-                "ocr_ms=${if (ocrAt != null && sendAt != null) ocrAt - sendAt else -1} " +
-                    "translate_ms=${if (translateAt != null && ocrAt != null) translateAt - ocrAt else -1} " +
-                    "post_ms=${if (totalAt != null && translateAt != null) totalAt - translateAt else -1} " +
-                    "total_ms=${totalAt ?: -1} bubbles=${finalBubbles.size}"
+                "pre_ms=$preMs ocr_ms=$ocrMs prep_ms=$prepMs cache_ms=$cacheMs " +
+                    "translate_ms=$translateMs post_ms=$postMs store_ms=$storeMs " +
+                    "render_ms=$renderMs total_ms=${totalAt ?: -1} " +
+                    "cache=${cacheStats.hitCount}/${cacheStats.total} bubbles=${finalBubbles.size}"
             )
         }
         return Outcome(
@@ -2763,6 +2832,9 @@ class WebtoonImageTranslator(
          */
         topLimit: Float = 0f
     ): TranslationResult {
+        timer.mark("ocr_request", "stage=ocr mode=bubble_first_webtoon provider=local")
+        // 保留旧 tag，兼容现有日志检索；新 summary 用 ocr_request/ocr_response 这一对，
+        // 避免与翻译阶段同样使用的 request_send/response_ok 互相覆盖（2026-11-02）。
         timer.mark("request_send", "stage=ocr mode=bubble_first_webtoon provider=local")
         val (bubbleRegions, structureBlocks) = coroutineScope {
             val regions = async(ioDispatcher) {
@@ -2902,6 +2974,7 @@ class WebtoonImageTranslator(
             timer.mark("ocr_texts_nobubble", "blocks=${structureBlocks.size} :: $ocrBlockDigest")
             return groupLocalBlocks(structureBlocks, bitmap.width, bitmap.height, timer)
         }
+        timer.mark("ocr_response", "stage=ocr bubbles=${bubbles.size}")
         timer.mark("response_ok", "stage=ocr bubbles=${bubbles.size}")
         // 「纯色底就当 solid 处理」（2026-10-13 用户：「这个截页处的气泡框是纯色背景，但是它用的是
         // 清理图。希望处理为 solid」）：
@@ -3101,7 +3174,9 @@ class WebtoonImageTranslator(
         /** 「清理图」是否真的用上了（未用上要显式告诉用户，不能静默回退）。 */
         val cleanedAvailable: Boolean = false,
         val patchCount: Int = 0,
-        val cleanedPatchedCount: Int = 0
+        val cleanedPatchedCount: Int = 0,
+        /** 全部擦字目标都是纯色气泡：跳过整页 cleaned image 是速度优化，不是失败。 */
+        val allSolid: Boolean = false
     ) {
         /** 贴片列表可能因空文本/失败而缺项，用 bubbleId 取，避免按下标错位贴错图。 */
         fun patchFor(index: Int): ErasePatch? = patchesByBubbleId[index]
@@ -3146,7 +3221,11 @@ class WebtoonImageTranslator(
         // 只要显示出来译文就行」）：一张清理图都不建 —— 整页 inpaint 与整页 JPEG 导出全省掉
         // （实测 273–700ms/张），旁白/透明块改用**逐气泡擦字贴片**当盖板背景（渲染层既有的
         // 旁白/透明块改用**不透明实底盖板**把原文盖死（`flat_cover`）。因此「关闭」是真的完全不跑 inpaint。
-        val needsCleanedImage = includeSolidInpaint
+        // 全纯色气泡：整页 inpaint 只是为了给 solid 气泡取纹理，实际上 flat/local patch
+        // 就能盖住；跳过整页 Mat 转换 + inpaint + JPEG 导出，直接走快速贴片（2026-11-02，P3）。
+        val allSolid = eraseTargets.isNotEmpty() &&
+            eraseTargets.all { it.bgType.equals("solid", ignoreCase = true) }
+        val needsCleanedImage = includeSolidInpaint && !allSolid
         val cleanedImage = if (needsCleanedImage) {
             ServiceLocator.cleanedImageProcessor.buildCleanedImage(
                 source = source,
@@ -3163,13 +3242,14 @@ class WebtoonImageTranslator(
                 cleanedImage != null ->
                     "built=${cleanedImage.width}x${cleanedImage.height} include_solid=$includeSolidInpaint"
 
+                allSolid -> "skipped=all_solid include_solid=$includeSolidInpaint"
                 needsCleanedImage -> "skipped=build_failed include_solid=$includeSolidInpaint"
                 // 关闭「精细擦字」= 速度优先：整页清理图**完全不建**（不跑整页 inpaint、不导出
                 // 整页 JPEG）。旁白/透明块的盖板改用不透明实底（场景下发的 flat_cover）。
                 else -> "skipped=fast_mode"
             }
         )
-        val erasePolicy = if (includeSolidInpaint) {
+        val erasePolicy = if (needsCleanedImage) {
             com.manga.translator.overlay.EraseStrategyPolicy.OPENCV_WHEN_AVAILABLE
         } else {
             com.manga.translator.overlay.EraseStrategyPolicy.FAST_ONLY
@@ -3266,7 +3346,8 @@ class WebtoonImageTranslator(
             cleanedImage = cleanedImage,
             cleanedAvailable = cleanedImage != null,
             patchCount = patches.size,
-            cleanedPatchedCount = patches.count { it.fromCleanedImage }
+            cleanedPatchedCount = patches.count { it.fromCleanedImage },
+            allSolid = allSolid
         )
     }
 
@@ -3275,7 +3356,8 @@ class WebtoonImageTranslator(
      * 以前是静默回退到逐气泡贴片，用户只看到效果变差、不知道为什么）。
      */
     private fun describeCleanupIssue(includeSolid: Boolean, prep: ImageVisualPrep): String? {
-        if (!includeSolid || prep.patchCount == 0) return null
+        // 全纯色气泡主动跳过整页 inpaint，属于速度优化，不是「清理图不可用」。
+        if (!includeSolid || prep.patchCount == 0 || prep.allSolid) return null
         return when {
             !prep.cleanedAvailable -> "精细擦字不可用，已改用快速贴片"
             prep.cleanedPatchedCount == 0 -> "精细擦字未命中，已改用快速贴片"

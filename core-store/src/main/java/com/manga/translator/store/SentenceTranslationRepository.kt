@@ -53,6 +53,21 @@ data class SentenceCacheKey(
     val originalText: String
 )
 
+/**
+ * 一条待写入的句子缓存（2026-11-02，P3）。
+ *
+ * [PageTranslationResolver] 一页会产出十几条新译文。旧实现逐条 `put()`，每条都把
+ * 整个 JSON 全量落盘；`putAll` 让这批更新只在末尾写一次。
+ */
+data class SentenceTranslationUpdate(
+    val sourceLanguage: String,
+    val targetLanguage: String,
+    val originalText: String,
+    val translatedText: String,
+    val originLabel: String = "",
+    val originPageHash: String = ""
+)
+
 data class SentenceCacheLookup(
     val translatedText: String?,
     val matchKind: SentenceCacheMatchKind?
@@ -80,7 +95,9 @@ class SentenceTranslationRepository(context: Context) {
     private var loaded = false
     private val index = linkedMapOf<String, SentenceTranslation>()
     private var compactDirty = true
-    private val compactIndex = hashMapOf<String, MutableList<String>>()
+    // langKey -> compactKey -> raw keys。按语言对分桶：模糊匹配只扫当前语言对，
+    // 同时避免同一原文在不同语言对之间串译文（2026-11-02）。
+    private val compactIndex = hashMapOf<String, HashMap<String, MutableList<String>>>()
     private var lastStatsPersistMs = 0L
 
     fun lookup(sourceLanguage: String, targetLanguage: String, originalText: String): SentenceCacheLookup {
@@ -101,7 +118,8 @@ class SentenceTranslationRepository(context: Context) {
             val compact = compactKey(normalized)
             if (compact.isNotEmpty()) {
                 ensureCompactIndex()
-                val compactCandidates = compactIndex[compact].orEmpty()
+                val langIndex = compactIndex[langKey]
+                val compactCandidates = langIndex?.get(compact).orEmpty()
                 if (compactCandidates.isNotEmpty()) {
                     compactCandidates.firstOrNull()?.let { rawKey ->
                         index[rawKey]?.let { entry ->
@@ -114,11 +132,11 @@ class SentenceTranslationRepository(context: Context) {
                     }
                 }
 
-                if (compact.length >= MIN_FUZZY_COMPACT_LEN) {
+                if (compact.length >= MIN_FUZZY_COMPACT_LEN && langIndex != null) {
                     val tolerance = fuzzyTolerance(compact.length)
                     var bestRawKey: String? = null
                     var bestDist = Int.MAX_VALUE
-                    for ((candidateCompact, rawKeys) in compactIndex) {
+                    for ((candidateCompact, rawKeys) in langIndex) {
                         if (!fuzzyMatchAllowed(compact, candidateCompact)) continue
                         if (abs(candidateCompact.length - compact.length) > tolerance) continue
                         val dist = boundedEditDistance(compact, candidateCompact, tolerance)
@@ -156,36 +174,86 @@ class SentenceTranslationRepository(context: Context) {
         originLabel: String = "",
         originPageHash: String = ""
     ) {
-        val normalized = normalize(originalText)
-        val value = normalize(translatedText)
-        if (normalized.isEmpty() || value.isEmpty()) return
-        if (value == normalized) {
-            // 译文等于原文：视为翻译未生效（本地引擎失败回退、模型原样返回等），不入缓存，
-            // 否则会形成"原文当译文"的毒化条目，后续全部命中显示原文。
-            Log.d(TAG, "put skip_noop lang=$sourceLanguage|$targetLanguage text=${truncate(originalText)}")
-            return
-        }
+        putAll(
+            listOf(
+                SentenceTranslationUpdate(
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    originalText = originalText,
+                    translatedText = translatedText,
+                    originLabel = originLabel,
+                    originPageHash = originPageHash
+                )
+            )
+        )
+    }
+
+    /**
+     * 批量写入（2026-11-02，P3）：一页十几条新译文只落盘一次。
+     *
+     * 旧实现每条 `put()` 都 `persist()` 整个 JSON；真机一张图 10+ 句时会连续写
+     * 10+ 次 400KB 文件，直接体现在 `post_ms` 里。
+     */
+    fun putAll(updates: List<SentenceTranslationUpdate>) {
+        if (updates.isEmpty()) return
         synchronized(lock) {
             ensureLoaded()
-            val key = keyOf(sourceLanguage, targetLanguage, normalized)
-            val previous = index.remove(key)
-            val now = System.currentTimeMillis()
-            index[key] = SentenceTranslation(
-                sourceLanguage = sourceLanguage,
-                targetLanguage = targetLanguage,
-                originalText = normalized,
-                translatedText = value,
-                originLabel = originLabel.trim().ifBlank { previous?.originLabel.orEmpty() },
-                originPageHash = originPageHash.trim().ifBlank { previous?.originPageHash.orEmpty() },
-                // 首次写入时间沿用旧值，避免改一次译文就把「什么时候开始的」冲掉。
-                createdAtMs = previous?.createdAtMs?.takeIf { it > 0L } ?: now,
-                lastHitAtMs = previous?.lastHitAtMs ?: 0L,
-                hitCount = previous?.hitCount ?: 0
-            )
-            compactDirty = true
+            // 先建好索引，再增量更新；旧实现每次 put 都把 compactDirty 置真，下一次 lookup
+            // 重建 5000 条全量索引（真机每张图多花 200–350ms，2026-11-02）。
+            ensureCompactIndex()
+            var changed = false
+            updates.forEach { update ->
+                val normalized = normalize(update.originalText)
+                val value = normalize(update.translatedText)
+                if (normalized.isEmpty() || value.isEmpty()) return@forEach
+                if (value == normalized) {
+                    // 译文等于原文：视为翻译未生效（本地引擎失败回退、模型原样返回等），不入缓存，
+                    // 否则会形成"原文当译文"的毒化条目，后续全部命中显示原文。
+                    Log.d(
+                        TAG,
+                        "put skip_noop lang=${update.sourceLanguage}|${update.targetLanguage} " +
+                            "text=${truncate(update.originalText)}"
+                    )
+                    return@forEach
+                }
+                applyPutLocked(update, normalized, value)
+                changed = true
+            }
+            if (!changed) return
             trimIfNeeded()
             persist()
         }
+    }
+
+    private fun applyPutLocked(
+        update: SentenceTranslationUpdate,
+        normalized: String,
+        value: String
+    ) {
+        val key = keyOf(update.sourceLanguage, update.targetLanguage, normalized)
+        val previous = index.remove(key)
+        if (previous != null) {
+            removeCompactEntry(
+                langKey = compactLangKey(previous.sourceLanguage, previous.targetLanguage),
+                originalText = previous.originalText,
+                rawKey = key
+            )
+        }
+        val now = System.currentTimeMillis()
+        val entry = SentenceTranslation(
+            sourceLanguage = update.sourceLanguage,
+            targetLanguage = update.targetLanguage,
+            originalText = normalized,
+            translatedText = value,
+            originLabel = update.originLabel.trim().ifBlank { previous?.originLabel.orEmpty() },
+            originPageHash = update.originPageHash.trim().ifBlank { previous?.originPageHash.orEmpty() },
+            // 首次写入时间沿用旧值，避免改一次译文就把「什么时候开始的」冲掉。
+            createdAtMs = previous?.createdAtMs?.takeIf { it > 0L } ?: now,
+            lastHitAtMs = previous?.lastHitAtMs ?: 0L,
+            hitCount = previous?.hitCount ?: 0
+        )
+        index[key] = entry
+        addCompactEntry(entry, key)
     }
 
     /** 全量快照，按「最近用过」倒序；句子历史页的数据源。 */
@@ -277,12 +345,18 @@ class SentenceTranslationRepository(context: Context) {
             keys.forEach { key ->
                 val normalized = normalize(key.originalText)
                 if (normalized.isEmpty()) return@forEach
-                if (index.remove(keyOf(key.sourceLanguage, key.targetLanguage, normalized)) != null) {
+                val rawKey = keyOf(key.sourceLanguage, key.targetLanguage, normalized)
+                val removedEntry = index.remove(rawKey)
+                if (removedEntry != null) {
+                    removeCompactEntry(
+                        langKey = compactLangKey(removedEntry.sourceLanguage, removedEntry.targetLanguage),
+                        originalText = removedEntry.originalText,
+                        rawKey = rawKey
+                    )
                     removed += 1
                 }
             }
             if (removed > 0) {
-                compactDirty = true
                 persist()
             }
             return removed
@@ -358,19 +432,46 @@ class SentenceTranslationRepository(context: Context) {
         compactDirty = false
         compactIndex.clear()
         index.forEach { (rawKey, entry) ->
-            val compact = compactKey(entry.originalText)
-            if (compact.isNotEmpty()) {
-                compactIndex.getOrPut(compact) { mutableListOf() }.add(rawKey)
-            }
+            addCompactEntry(entry, rawKey)
         }
+    }
+
+    /** 增量往 compactIndex 加一条；调用方必须持有 lock。 */
+    private fun addCompactEntry(entry: SentenceTranslation, rawKey: String) {
+        val compact = compactKey(entry.originalText)
+        if (compact.isEmpty()) return
+        val langKey = compactLangKey(entry.sourceLanguage, entry.targetLanguage)
+        compactIndex
+            .getOrPut(langKey) { hashMapOf() }
+            .getOrPut(compact) { mutableListOf() }
+            .add(rawKey)
+    }
+
+    /** 增量从 compactIndex 删一条；列表空时删桶，避免长期累积空键。 */
+    private fun removeCompactEntry(langKey: String, originalText: String, rawKey: String) {
+        val compact = compactKey(originalText)
+        if (compact.isEmpty()) return
+        val langIndex = compactIndex[langKey] ?: return
+        val keys = langIndex[compact] ?: return
+        keys.remove(rawKey)
+        if (keys.isEmpty()) langIndex.remove(compact)
+        if (langIndex.isEmpty()) compactIndex.remove(langKey)
+    }
+
+    private fun compactLangKey(sourceLanguage: String, targetLanguage: String): String {
+        return "${sourceLanguage.trim()}|${targetLanguage.trim()}"
     }
 
     private fun trimIfNeeded() {
         while (index.size > MAX_ENTRIES) {
             val firstKey = index.keys.firstOrNull() ?: break
-            index.remove(firstKey)
+            val removed = index.remove(firstKey) ?: break
+            removeCompactEntry(
+                langKey = compactLangKey(removed.sourceLanguage, removed.targetLanguage),
+                originalText = removed.originalText,
+                rawKey = firstKey
+            )
         }
-        compactDirty = true
     }
 
     private fun persist() {

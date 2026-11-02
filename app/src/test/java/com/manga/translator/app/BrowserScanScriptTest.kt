@@ -258,6 +258,22 @@ class BrowserScanScriptTest {
     }
 
     @Test
+    fun extractorSupportsAsyncCssBackgroundImages() {
+        // Pixiv comic.pixiv.net 的页图是 div#page-N 的 background-image: url(blob:…)，
+        // 不是 <img>/<canvas>。提取器必须能从背景图异步取 blob，并在加载期间回 loading。
+        val js = BrowserScanScript.EXTRACTOR_JS
+        assertTrue(js.contains("backgroundImage"))
+        assertTrue(js.contains("FileReader"))
+        assertTrue(js.contains("bg_fetch_failed"))
+        assertTrue(js.contains("reason: \"loading\""))
+    }
+
+    @Test
+    fun scanScriptIncludesCssBackgroundCandidates() {
+        assertTrue(BrowserScanScript.SCAN_JS.contains("[style*='background-image']"))
+    }
+
+    @Test
     fun extractDataUrlJsEmbedsRequestAsEscapedLiteral() {
         val js = BrowserScanScript.extractDataUrlJs("mt7", 0, 1000)
         assertTrue(js.contains("window.__mtExtract"))

@@ -56,6 +56,11 @@ data class GlossaryMergeReport(
 class GlossaryRepository(context: Context) {
     private val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
     private val lock = Any()
+    // 术语表 JSON 在翻译热路径上被多次读取（active collections + entries + revision）。
+    // 旧实现每个 getter 都重新 JSON.parse 整份 SharedPreferences；大术语表会在主线程
+    // 多花几百毫秒。这里缓存原始字符串和已解析对象，save() 时同步更新（2026-11-02，P3）。
+    private var cachedRaw: String? = null
+    private var cachedRoot: JSONObject? = null
 
     fun listCollections(): List<String> {
         synchronized(lock) {
@@ -571,8 +576,14 @@ class GlossaryRepository(context: Context) {
 
     private fun loadJson(): JSONObject {
         val raw = prefs.getString(KEY_STORE, "{}").orEmpty()
+        val cached = cachedRoot
+        if (cached != null && raw == cachedRaw) return cached
         val parsed = runCatching { JSONObject(raw) }.getOrElse { JSONObject() }
-        return migrateLegacy(parsed)
+        val migrated = migrateLegacy(parsed)
+        cachedRoot = migrated
+        // migrateLegacy 可能刚 save 过（写入新结构）；重新读一次 raw，避免缓存旧串。
+        cachedRaw = prefs.getString(KEY_STORE, "{}").orEmpty()
+        return migrated
     }
 
     private fun migrateLegacy(root: JSONObject): JSONObject {
@@ -617,7 +628,10 @@ class GlossaryRepository(context: Context) {
     }
 
     private fun save(root: JSONObject) {
-        prefs.edit().putString(KEY_STORE, root.toString()).apply()
+        val raw = root.toString()
+        prefs.edit().putString(KEY_STORE, raw).apply()
+        cachedRaw = raw
+        cachedRoot = root
     }
 
     internal object GlossaryCsv {

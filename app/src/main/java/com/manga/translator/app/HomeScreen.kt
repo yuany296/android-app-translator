@@ -3,6 +3,7 @@ package com.manga.translator.app
 import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -154,8 +155,8 @@ fun LauncherScreen(
     var profileSheetTarget by remember { mutableStateOf(ProfileTarget.TRANSLATE) }
     var baiduSheetOpen by remember { mutableStateOf(false) }
     // OCR 低质量回退多模态（2026-10-14，独立 pref，不属于 API 档案）。
-    // 源语言没有「自动识别」：语言完全按用户配置走（2026-10-15 用户裁定移除「语言可能选错了」
-    // 提示 —— 韩漫夹汉字/英文是常态，按脚本族判「选错了」误报太多）。
+    // 首页源语言没有「自动识别」：网页里的 auto 是浏览器独立 pref（2026-11-01），
+    // 不改写首页设置；首页/悬浮球仍然只按用户选择的具体语言。
     var lowQualityVisionOcr by remember { mutableStateOf(repo.isLowQualityVisionOcrEnabled()) }
     // 多模态重读的档案选择（2026-10-14 深夜定稿）：空 = 跟随翻译配置；选了就用那个档案的
     // 厂商 / Base URL / Key —— 翻译选 ML Kit 时也能单独选一个云端档案给重读用。
@@ -867,6 +868,18 @@ private fun ProfileSheet(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Bottom
         ) {
+            // 弹层以上的灰色区域：点一下关闭。Dialog 自带遮罩只负责变暗，
+            // 内容撑满全屏时点不到「窗外」，所以这里自己补一层可点击空白。
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1131,6 +1144,17 @@ private fun BaiduConfigSheet(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.Bottom
         ) {
+            // 弹层以上的灰色区域：点一下关闭（与档案弹层一致）。
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss
+                    )
+            )
             Column(
                 modifier = Modifier
                     .fillMaxWidth()

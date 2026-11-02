@@ -208,6 +208,121 @@ val MtBrowserIcon: ImageVector by lazy {
 }
 
 /**
+ * 漫画翻译悬浮球：漫画分页（页面 + 一大两小三格 + 顶格对话气泡）。
+ *
+ * 2026-11-01 用户要求把「译」字换成图形：漫画球用漫画页、网页文字球用浏览器窗口，
+ * 两球并排时不再靠文字区分。风格与 [MtScanIcon] 一致（24 视口、圆头、1.7 描边），
+ * 颜色交给 `Icon` 的 tint（球上是白色）。分格留一大两小，是为了在 26dp 下仍能
+ * 读成「漫画页」而不是普通表格；顶格气泡是漫画语义。
+ */
+val MtComicBallIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtComicBall",
+        defaultWidth = 26.dp,
+        defaultHeight = 26.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.7f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            // 页面外框
+            moveTo(6.6f, 3.2f)
+            horizontalLineTo(17.4f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, 2.4f, 2.4f)
+            verticalLineTo(18.4f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, -2.4f, 2.4f)
+            horizontalLineTo(6.6f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, -2.4f, -2.4f)
+            verticalLineTo(5.6f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, 2.4f, -2.4f)
+            close()
+            // 分格：上格 + 下方左右两格
+            moveTo(4.2f, 11.7f)
+            horizontalLineTo(19.8f)
+            moveTo(12f, 11.7f)
+            verticalLineTo(20.8f)
+        }
+        // 顶格对话气泡：高度 = 2×圆角，左右为半圆，底部带一个小尾巴
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.4f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            moveTo(8.7f, 4.7f)
+            horizontalLineTo(12.3f)
+            arcToRelative(1.7f, 1.7f, 0f, false, true, 0f, 3.4f)
+            horizontalLineTo(10.5f)
+            lineTo(8.45f, 9.35f)
+            lineTo(9.2f, 8.1f)
+            horizontalLineTo(8.7f)
+            arcToRelative(1.7f, 1.7f, 0f, false, true, 0f, -3.4f)
+            close()
+        }
+    }.build()
+}
+
+/**
+ * 网页文字翻译悬浮球：浏览器窗口（圆角外框 + 顶栏三点 + 标题栏分隔线）。
+ *
+ * 造型对齐用户 2026-11-01 提供的参考图；三点是浏览器标题栏的通用符号，
+ * 和漫画球的分页面板区分开。同样交给 `Icon` tint 成白色。
+ */
+val MtWebpageBallIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MtWebpageBall",
+        defaultWidth = 26.dp,
+        defaultHeight = 26.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(
+            fill = null,
+            stroke = SolidColor(Color.Black),
+            strokeLineWidth = 1.7f,
+            strokeLineCap = StrokeCap.Round,
+            strokeLineJoin = StrokeJoin.Round
+        ) {
+            // 窗口外框
+            moveTo(5.8f, 4.2f)
+            horizontalLineTo(18.2f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, 2.4f, 2.4f)
+            verticalLineTo(17.4f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, -2.4f, 2.4f)
+            horizontalLineTo(5.8f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, -2.4f, -2.4f)
+            verticalLineTo(6.6f)
+            arcToRelative(2.4f, 2.4f, 0f, false, true, 2.4f, -2.4f)
+            close()
+            // 标题栏分隔线
+            moveTo(3.4f, 8.6f)
+            horizontalLineTo(20.6f)
+        }
+        // 顶栏三点
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(5.68f, 6.4f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, 1.84f, 0f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, -1.84f, 0f)
+            close()
+            moveTo(7.98f, 6.4f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, 1.84f, 0f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, -1.84f, 0f)
+            close()
+            moveTo(10.28f, 6.4f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, 1.84f, 0f)
+            arcToRelative(0.92f, 0.92f, 0f, true, true, -1.84f, 0f)
+            close()
+        }
+    }.build()
+}
+
+/**
  * 离开当前页（内嵌浏览器顶栏右侧的「回到浏览器界面」按钮，2026-10-12 用户指定形状）。
  *
  * 形状 =「圆角门框（右侧开口）+ 向右箭头」，两笔画一起说明动作：

@@ -11,30 +11,43 @@ import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.min
 
 class MlKitLocalTextDetector : LocalTextDetector {
+    /**
+     * 按语言复用 ML Kit recognizer（2026-11-02，P3）。
+     *
+     * 旧实现每次 detect 都 `getClient(...)` 然后在 finally 里 `close()`：长页每张图
+     * 都要重新初始化识别器，ML Kit 的模型/执行器初始化就落在每张图的 OCR 时间里。
+     * 识别器本身支持同一 client 并发提交（分块检测已经这样用），所以这里只按语言
+     * 缓存，不再每张图创建/销毁。
+     */
+    private val recognizers = ConcurrentHashMap<String, TextRecognizer>()
+
     override fun detect(bitmap: Bitmap, sourceLanguageId: String): List<TextBlock> {
-        val recognizer = createRecognizer(sourceLanguageId)
-        return try {
-            // 长条图分块检测（2026-10-16）：§54-B 只接了 Paddle，ML Kit 仍把整图缩到
-            // 长边 1280 —— 600×2544 的切图缩到 300×1272，单字 chip / 句尾符号直接落进
-            // 检测阈下（用户在 ML Kit 模式下持续看到「有的字没被处理」）。闸门与切块
-            // 复用 [PaddleDetectionTiling]（普通切图不满足闸门 → 单趟，行为不变）。
-            if (PaddleDetectionTiling.shouldTile(bitmap.width, bitmap.height, MAX_EDGE.toFloat())) {
-                detectTiled(recognizer, bitmap)
-            } else {
-                // 单趟也过一遍同一个合并器（2026-11-01）：短图没有分块，但同一句仍可能
-                // 被 ML Kit 拆成「完整多行块 + 近似单行块」；不合并就会在后续段落合并里
-                // 拼成两遍（真机 pageHash ca9603cd…）。
-                mergeSinglePass(detectScaled(recognizer, bitmap, offsetX = 0f, offsetY = 0f))
-            }
-        } finally {
-            runCatching { recognizer.close() }
+        val recognizer = recognizerFor(sourceLanguageId)
+        // 长条图分块检测（2026-10-16）：§54-B 只接了 Paddle，ML Kit 仍把整图缩到
+        // 长边 1280 —— 600×2544 的切图缩到 300×1272，单字 chip / 句尾符号直接落进
+        // 检测阈下（用户在 ML Kit 模式下持续看到「有的字没被处理」）。闸门与切块
+        // 复用 [PaddleDetectionTiling]（普通切图不满足闸门 → 单趟，行为不变）。
+        return if (PaddleDetectionTiling.shouldTile(bitmap.width, bitmap.height, MAX_EDGE.toFloat())) {
+            detectTiled(recognizer, bitmap)
+        } else {
+            // 单趟也过一遍同一个合并器（2026-11-01）：短图没有分块，但同一句仍可能
+            // 被 ML Kit 拆成「完整多行块 + 近似单行块」；不合并就会在后续段落合并里
+            // 拼成两遍（真机 pageHash ca9603cd…）。
+            mergeSinglePass(detectScaled(recognizer, bitmap, offsetX = 0f, offsetY = 0f))
         }
+    }
+
+    /** 释放所有语言的 recognizer；仅在应用真正结束识别器生命周期时调用。 */
+    fun close() {
+        recognizers.values.forEach { recognizer -> runCatching { recognizer.close() } }
+        recognizers.clear()
     }
 
     override fun detect(bitmap: Bitmap, sourceLanguageId: String, seamTopPx: Int, seamBottomPx: Int): List<TextBlock> {
@@ -245,6 +258,11 @@ class MlKitLocalTextDetector : LocalTextDetector {
                 work.recycle()
             }
         }
+    }
+
+    private fun recognizerFor(sourceLanguageId: String): TextRecognizer {
+        val key = sourceLanguageId.trim().lowercase().ifBlank { "en" }
+        return recognizers.computeIfAbsent(key) { createRecognizer(it) }
     }
 
     private fun createRecognizer(sourceLanguageId: String): TextRecognizer {

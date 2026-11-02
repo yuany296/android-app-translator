@@ -472,7 +472,8 @@ class MainActivity : ComponentActivity() {
                             MainTab.BROWSER.ordinal -> {
                                 EmbeddedBrowserScreen(
                                     onClose = { pageIndex = MainTab.HOME.ordinal },
-                                    onSelectTab = { pageIndex = it }
+                                    onSelectTab = { pageIndex = it },
+                                    onSettingsChanged = { settings = it }
                                 )
                                 // 浏览器是自足的翻译入口（悬浮球 + ⋮ 菜单「截图翻译」只截 WebView
                                 // 视口，免 MediaProjection / 悬浮窗授权），不再接首页的 startCaptureFlow。

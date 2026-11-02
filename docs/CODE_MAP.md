@@ -105,6 +105,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `core-translate/BaiduTranslateClient.kt` | 百度翻译专用接口（整页多句一次请求 + 签名） | `translate` | `mode=baidu` |
 | `core-translate/OpenAiVisionClient.kt` | OpenAI 兼容客户端：**现在只用于翻译**（+设置页拉模型列表）；术语表以 `buildGlossaryLine` 注入提示词 | `translateTexts` / `fetchAvailableModels` / `buildGlossaryLine` | `mode=cloud`；**原文回退三件套**（2026-10-14）：瞬时错误退避重试 `request_retry_transient`、解析失败/截断拆批 `translate_split_retry`/`translate_parse_retry`/`translate_parse_giveup`、单句重试 `sentence_retry`；返回 `TextTranslationOutcome`（`failedIndices` → 上层提示）；单测 `GlossaryPromptTest`/`OpenAiVisionClientTest`；⚠️ OCR 方法已无调用方（见 §7） |
 | `core-translate/BalancedLineBreaker.kt` | **像素感知均衡断行**（词边界 + 标点禁则 + 行宽约束）：三条渲染链路同权重 | `breakLines` / `countGreedyLines` / `segmentWithIcu` | 纯逻辑 + 单测；与 JS `breakBalancedLines` 同代价函数（悬浮球/整图 PNG/网页 DOM 断行一致） |
+| `core-translate/PageLanguageDetector.kt` | 网页语言判定 + 自动源语言解析：正文强脚本 > ML Kit 候选 > 声明语言 > 首页回退 | `detect` / `resolveSource` | `page_language`、`page_language_state`、`auto_source`；纯逻辑可单测 |
+| `core-translate/MlKitLanguageIdentifier.kt` | bundled ML Kit `language-id`：页面正文候选 + confidence | `identify` | `lang_id`；1s 超时/失败返回空 |
 
 ### 3.3 悬浮球链路（`app`）
 
@@ -123,6 +125,8 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 |---|---|---|---|
 | `MainActivity.kt` | Compose 外壳（底栏 tab：首页/浏览器/术语表/翻译历史）、权限引导、服务启停 | `MainTab` | 浏览器 tab → `EmbeddedBrowserScreen`（不再传截图入口，见下行） |
 | `EmbeddedBrowserScreen.kt` | **浏览器会话编排**（扫描轮 → 每张图 → 下发 → 接缝）+ 界面 + **截图翻译**（悬浮球 ⋮ 菜单 → WebView 视口自截，免授权） | `startSession` / `runTranslationSession` / `startScreenshotTranslation`；同文件内 `BrowserScreenshotTranslate`（几何采集/锚点/贴图 JS）、`tryLateSeamBand`（晚邻接竞态补带） | `session_start`、`scan pending=… capped=…`、`scan_capped`（扫描安全阀命中警告）、`band_pair`、`scene_ok`、`image_ok/no_text/no_bubbles/fail`、`shot_*`、`session_stop … cooperative=true`（停止是协作式：不 cancel，避免取消异常触发 ART/SIGABRT，见 `Todolist.md` §38）、`seam_race_band / seam_race_skip`（§42）、`batch_reanchor`（批处理中检测到翻页 → 立即重扫重排，§60）；场景缓存上限 600 + `renderedSrcs`（已产出结果不随缓存淘汰，防长章节无限重翻，§48） |
+| `PixivViewerSupport.kt` | Pixiv 阅读器像素通道：probe 阅读器状态、裁当前页/下一页（`renderNextLeft` 写隐藏 `o5x`）、页图区域锚点、分片 dataURL 读取 | `isViewerUrl` / `probe` / `captureCurrent` / `captureNext` / `anchorJs` | `pixiv_probe`（成功 V 级）、`pixiv_capture mode=current|next`；不逆向 32px 打乱，只让阅读器自己画 |
+| `PixivViewerSession.kt` | Pixiv 页会话调度（纯队列 + 双协程）：当前页优先、下一页预取、翻页贴缓存、换章节清缓存 | `PixivViewerQueue` / `PixivViewerSession` | `pixiv_page`、`pixiv_translate_ok`、`pixiv_apply source=live|cache`、`pixiv_content_change`；单测 `PixivViewerQueueTest` |
 | `SeamRaceBand.kt` | 晚邻接竞态「接缝带补建」的纯逻辑：文本+几何匹配跨缝明的两半、给出带几何与待摘 id、盖板避让同图其它气泡 | `findMatch` / `findGeometricMatch` | 纯逻辑 + 单测 `SeamRaceBandTest` / `SeamEdgeFallbackTest`；日志 `seam_race_band`（会话侧）、`seam_pair_state` |
 | `SeamPairState.kt` | 接缝配对状态机：两页内容指纹 + 邻接 token、revision 变化标 stale；几何回退只消费 completed 状态 | `buildKey` / `complete` / `markStale` / `isUsable` | 纯逻辑 + 单测 `SeamPairStateTest`；日志 `seam_pair_state status=…` |
 | `BrowserImageOrder.kt` | 「阅读位置优先」调度：把扫描列表**旋转**到视口锚点（视口高 35%）那张图起、已读部分轮转到末尾（只旋转、不重排）；批处理中判定是否因翻页提前重扫 | `rotateToReadingAnchor` / `shouldReanchor` | 纯逻辑 + 单测 `BrowserImageOrderTest`；会话日志 `scan … anchor= first_vy=`（2026-10-15）、`batch_reanchor`（§60） |
@@ -184,6 +188,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `SettingsRepository.kt` | 加密 SharedPreferences 读写全部设置与配置档案 | `getSettings` / `saveSettings` / `getProfile` / `saveProfile` | 几乎所有 app 类都依赖它；`ocrMode`/`baiduOcrLanguage` **没有**对应的 prefs 键 |
 | `AiProvider.kt` | 各 AI 服务商默认地址/模型/思考开关 | `fromId` / `supportsThinking` | 与 `ThinkingSupport` 有跨模块一致性测试 |
 | `AppLanguage.kt` | 源/目标语言枚举与 id 归一 | `fromId` | 设置页/历史页用 |
+| `BrowserSourceLanguage.kt` | 浏览器源语言归一（`auto` + 具体语言） | `normalize` | 独立 pref `browser_source_language`；首页/悬浮球不出现 auto |
 | `TranslateEngine.kt` | 翻译引擎枚举（云端 / 百度 / ML Kit） | `fromId` | 对应日志 `mode=cloud|baidu`、`translate_local` |
 | `OcrEngine.kt` | OCR 引擎枚举（ML Kit / Paddle） | `fromId` | 在 `EngineSelectingTextDetector` 分流 |
 | `OcrSpeedMode.kt` | Paddle 速度/质量模式 | `fromId` | 体现在 `paddle_total_ms` 的 `speed_mode=` |
@@ -342,6 +347,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `app/.../SeamBandGeometryTest.kt` | 接缝带几何与盖板外扩 |
 | `app/.../BrowserSceneBuilderTest.kt` / `BrowserScanScriptTest.kt` | Kotlin↔JS 契约 |
 | `app/.../BrowserScreenshotTranslateTest.kt` | 截图翻译的几何采集/锚点/贴图 JS 契约（免授权链路）+ 收起覆盖层的定向摘除与"解除一次性点屏监听"契约（§56） |
+| `app/.../PixivViewerSupportTest.kt` / `PixivViewerQueueTest.kt` | Pixiv 页会话：URL/probe 解析、绘制区域→锚点换算、JS 抓图契约；当前页优先/翻页缓存/LRU/换章节清空 |
 | `app/.../EraseTargetsTest.kt` | 「读不出就别动」判据 |
 | `app/.../BubbleFontRulesTest.kt` | 译文字号规则 |
 | `app/.../CaptureSession*Test.kt` / `OverlayAccessibilityPolicyTest.kt` / `BrowserTranslateUiPolicyTest.kt` / `BrowserLayerPolicyTest.kt` / `GlossaryAddPolicyTest.kt` | 会话/无障碍/球与开关状态表/显示来源切换/新增术语提交判定 |

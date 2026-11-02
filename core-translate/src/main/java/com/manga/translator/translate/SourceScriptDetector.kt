@@ -1,20 +1,20 @@
 package com.manga.translator.translate
 
 /**
- * 源语言脚本检测（2026-10-14 引入；2026-10-15 收敛）。
+ * 源语言脚本检测（2026-10-14 引入；2026-10-15 收敛；2026-11-01 扩展到页面语言检测）。
  *
  * 判据对齐参考项目 `C:\homework\translator` 的 `shared/languages.js#resolveSourceLanguage`：
  * 谚文 → ko、假名 → ja、汉字 → zh-cn/zh-tw（按繁体专用字区分）、拉丁 → en；
  * 优先级 **ko > ja > zh > en**（韩文页里偶尔的汉字、日文页里的汉字不抢判）。
  *
- * 唯一的生产用途（2026-10-15）：**网页文字翻译**的「页面语言 == 目标语言 → 整页跳过」
- * （`EmbeddedBrowserScreen.startWebpageTextTranslation`）。
+ * 生产用途：
+ * - 网页文字翻译的「页面语言 == 目标语言 → 整页跳过」；
+ * - [PageLanguageDetector] 在 ML Kit 候选不可用/低置信时用脚本计数兜底；
+ * - 页面语言识别里区分简体/繁体。
  *
- * 曾经的两个用途都已按用户裁定移除，别再按旧文档加回来：
- * - ❌ 「识别不符 → 换模型重跑 OCR / 翻译源语言跟随」：2026-10-14 砍掉（翻译始终按用户配置）；
- * - ❌ 「识别不符 → 提示语言可能选错了」：2026-10-15 砍掉 —— 韩漫里夹汉字/英文是常态，
- *   按脚本族判「选错了」误报太多（用户原话「不应该加上这个提示」）。`recognitionFamily` /
- *   姊妹模型探测 / 底栏提示与 Toast 全部删除。
+ * 2026-11-01 用户重新要求「网页自动检测源语言」：这里不再承担“跟随翻译语言”的决定，
+ * 只负责给出脚本证据；实际是否采用由 [PageLanguageDetector.resolveSource] 按
+ * 「浏览器源语言设置 + 页面语言 + 首页兜底语言」决定。
  *
  * 纯 Kotlin、无 Android 依赖，可 JVM 单测。
  */
@@ -22,6 +22,17 @@ object SourceScriptDetector {
 
     /** 识别结果：语言 id（[com.manga.translator.store.AppLanguage] 口径）+ 命中该脚本的字符数。 */
     data class Detected(val languageId: String, val scriptChars: Int)
+
+    /** 一次文本扫描的脚本计数；[traditionalOnlySeen] 只用于区分简/繁。 */
+    data class ScriptCounts(
+        val hangul: Int,
+        val kana: Int,
+        val han: Int,
+        val latin: Int,
+        val traditionalOnlySeen: Boolean
+    ) {
+        val total: Int get() = hangul + kana + han + latin
+    }
 
     /** 谚文出现 ≥ 这个数才判 ko（单字符容易是噪声）。 */
     const val HANGUL_MIN = 2
@@ -50,7 +61,21 @@ object SourceScriptDetector {
      * 决定要不要采信。
      */
     fun detect(texts: List<String>): Detected? {
-        if (texts.isEmpty()) return null
+        val counts = countScripts(texts)
+        return when {
+            counts.hangul >= HANGUL_MIN -> Detected("ko", counts.hangul)
+            counts.kana >= KANA_MIN -> Detected("ja", counts.kana)
+            counts.han >= HAN_MIN -> Detected(
+                if (counts.traditionalOnlySeen) "zh-tw" else "zh-cn",
+                counts.han
+            )
+            counts.latin >= LATIN_MIN -> Detected("en", counts.latin)
+            else -> null
+        }
+    }
+
+    /** 统计一段/多段文本里的脚本字符数；页面语言检测用它做占比判据。 */
+    fun countScripts(texts: Iterable<String>): ScriptCounts {
         var hangul = 0
         var kana = 0
         var han = 0
@@ -69,14 +94,20 @@ object SourceScriptDetector {
                 }
             }
         }
-        return when {
-            hangul >= HANGUL_MIN -> Detected("ko", hangul)
-            kana >= KANA_MIN -> Detected("ja", kana)
-            han >= HAN_MIN -> Detected(if (traditionalOnlySeen) "zh-tw" else "zh-cn", han)
-            latin >= LATIN_MIN -> Detected("en", latin)
-            else -> null
-        }
+        return ScriptCounts(
+            hangul = hangul,
+            kana = kana,
+            han = han,
+            latin = latin,
+            traditionalOnlySeen = traditionalOnlySeen
+        )
     }
+
+    /** 中文页面的简/繁判定：命中任一繁体专用字即 zh-tw，否则 zh-cn。 */
+    fun chineseVariant(text: String): String =
+        if (text.any { it in traditionalOnly }) "zh-tw" else "zh-cn"
+
+    fun hasTraditionalOnlyChar(text: String): Boolean = text.any { it in traditionalOnly }
 
     private fun Char.isHangul(): Boolean =
         this in '\uAC00'..'\uD7A3' || this in '\u1100'..'\u11FF' || this in '\u3130'..'\u318F'

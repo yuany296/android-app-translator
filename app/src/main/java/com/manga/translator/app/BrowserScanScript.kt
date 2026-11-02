@@ -823,8 +823,51 @@ object BrowserScanScript {
     var store = window.__mtExtractCache || (window.__mtExtractCache = {});
     var entry = store[cacheKey];
 
+    // 背景图路径是异步的（fetch blob → FileReader），第一次调用只启动加载。
+    if (entry && entry.loading) return JSON.stringify({ ok: false, reason: "loading" });
+    if (entry && entry.error) {
+      return JSON.stringify({ ok: false, reason: entry.error, message: entry.message || "" });
+    }
+
     if (!entry) {
       var tag = (el.tagName || "").toLowerCase();
+      // `<img>` / `<canvas>` 之外的候选只可能是 CSS 背景图（Pixiv comic.pixiv.net
+      // 的 `div#page-N { background-image: url(blob:…) }` 就是这种形态）。
+      // 页图字节已经在页面里（blob URL），用 fetch + FileReader 直接取 base64，
+      // 不走 canvas，避免跨域污染；加载完成前返回 loading，Kotlin 侧会短轮询。
+      if (tag !== "canvas" && tag !== "img") {
+        var bgValue = "";
+        try { bgValue = getComputedStyle(el).backgroundImage || ""; } catch (e) { bgValue = ""; }
+        var bgMatch = /url\((['"]?)([^'")]+)\1\)/.exec(bgValue);
+        if (!bgMatch || !bgMatch[2]) {
+          return JSON.stringify({ ok: false, reason: "no_background_image" });
+        }
+        store[cacheKey] = { loading: true };
+        fetch(bgMatch[2]).then(function (resp) {
+          if (!resp.ok) throw new Error("http " + resp.status);
+          return resp.blob();
+        }).then(function (blob) {
+          return new Promise(function (resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function () { resolve(String(reader.result || "")); };
+            reader.onerror = function () { reject(new Error("read_failed")); };
+            reader.readAsDataURL(blob);
+          });
+        }).then(function (dataUrl) {
+          var comma = dataUrl.indexOf(",");
+          if (comma < 0) throw new Error("bad_data_url");
+          store[cacheKey] = {
+            base64: dataUrl.substring(comma + 1),
+            mime: dataUrl.substring(5, comma).split(";")[0]
+          };
+        }).catch(function (err) {
+          store[cacheKey] = {
+            error: "bg_fetch_failed",
+            message: String(err && err.message || err)
+          };
+        });
+        return JSON.stringify({ ok: false, reason: "loading" });
+      }
       var width = 0;
       var height = 0;
       if (tag === "canvas") {

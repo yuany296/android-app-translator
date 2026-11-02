@@ -142,15 +142,15 @@ class BrowserTranslateUiPolicyTest {
             pageLoaded: Boolean = true
         ) = BrowserTranslateUiPolicy.idleHint(mode, running, shown, pageLoaded)
 
-        assertEquals("打开漫画网页后点球翻译", hint(pageLoaded = false))
-        assertEquals("点球自动翻完整页", hint())
+        assertEquals("打开漫画网页后点「译」球翻译", hint(pageLoaded = false))
+        assertEquals("点「译」球自动翻完整页", hint())
         assertEquals("译文显示中", hint(shown = BrowserShownLayer.LIVE))
-        assertEquals("译文显示中 · 点球可停止", hint(running = true, shown = BrowserShownLayer.LIVE))
+        assertEquals("译文显示中 · 点「译」球可停止", hint(running = true, shown = BrowserShownLayer.LIVE))
         assertEquals(
-            "原文显示中 · 球上菜单切译文",
+            "原文显示中 · ⋮ 菜单切译文",
             hint(mode = BrowserViewMode.ORIGINAL, running = true)
         )
-        assertEquals("原文显示中 · 点球翻译", hint(mode = BrowserViewMode.ORIGINAL))
+        assertEquals("原文显示中 · 点「译」球翻译", hint(mode = BrowserViewMode.ORIGINAL))
         assertEquals(
             "截图译文显示中 · 点屏幕恢复原文",
             hint(shown = BrowserShownLayer.SNAPSHOT)

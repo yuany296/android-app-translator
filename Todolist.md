@@ -1,5 +1,127 @@
 # Todolist
 
+## 71. 用户 2026-11-01：网页文字球与漫画球合并为一组（参考 translator）
+
+### 一、需求
+
+- 用户要求把网页文字悬浮球和漫画悬浮球放在一起，参考 `C:\homework\translator` 的浮动动作组；
+- 外观改为「漫画分页 + 浏览器窗口」图标；参考项目主题是绿色、本项目是蓝色，因此不照搬薄荷绿成品图，改为白色线稿；
+- ⋮ 白卡里不放「网页文字翻译」：网页文字球自己点一下即可，菜单不重复入口。
+
+### 二、实现
+
+- 新增 `BrowserFloatingBallGroup.kt`：竖排两球（上 = 网页文字 / 下 = 漫画），48dp + 6dp 间距，整组拖动/吸附/只存一份位置；
+  - 位置编码仍以**下方漫画球**为锚点，旧 `browser_floating_ball_x/y_ratio` 直接复用，升级无需迁移；
+  - 停靠余量 2dp → 6dp：状态角标向球外探出 3dp，贴边 2dp 时在模拟机上被屏幕裁掉一半；
+  - ⋮ 胶囊保留；菜单仍只有「截图翻译 / 原文｜译文」两项，宽 120dp、高 102dp。
+- 新增 `BrowserFloatingBallPresentation.kt`：图标常驻，状态走外圈/角标 —— 忙碌白色转圈、运行红色外圈 + 右下停止角标、截图在屏右上蓝 ✕、网页文字已翻译右上绿 ✓。
+- `ui/MtUi.kt` 新增两个 24 视口白色线稿图标：`MtComicBallIcon`（页面 + 三格 + 顶格气泡）、`MtWebpageBallIcon`（浏览器窗口 + 顶栏三点）。
+- `core-store/SettingsRepository`：删除网页文字球独立开关/位置读写；「文」球常驻，设置弹层只保留「网页文字翻译」动作按钮。
+- 文案统一：`BrowserTranslateUiPolicy.idleHint` 以及「页面已跳转，点「翻译」继续」「点「翻译」重新翻译」等全部改成「点「译」球」。
+
+### 三、验证
+
+- `:app:testDebugUnitTest` **382 条**、`:core-store:testDebugUnitTest` **164 条**，0 失败；
+- `:app:assembleDebug` 通过，装模拟机 `emulator-5554`（1080×2400 / 420dpi）；
+- 模拟机实测（夹具 `127.0.0.1:8766/fixtures/web_reader.html` + Pixiv canvas 页）：
+  - 空闲组：上「文」（浏览器窗口）/ 下「译」（漫画分页），⋮ 在组上方；组贴顶时胶囊自动翻到组下方；
+  - 点「文」球：`text_ball_tap` → 页面文字翻译（夹具 1 段）→ 右上角绿 ✓ 完整可见；再点恢复原文；
+  - 点「译」球：`ball_primary_tap action=START` + `session_start`，下球红圈 + 右下红停止角标（图标保留），再点停止；
+  - ⋮ 菜单：只有「截图翻译 / 原文｜译文」两行，120dp，不再出现网页文字行；
+  - 位置：旧漫画球位置直接恢复为组位置；组底边距内容区底 16dp。
+- 临时本地验证服务：`python -m http.server 8766 --directory app/src/debug/assets` + `adb reverse tcp:8766`，验证后已停止。
+
+### 四、边界
+
+- 组贴顶时 ⋮ 胶囊翻到组下方（保证完整可见），这是刻意行为；
+- 网页文字球常驻显示，没有「隐藏」开关（按用户 2026-11-01 决定）；
+- 菜单仍只服务漫画链路；网页文字入口只在「文」球上（用户明确要求白卡里不要重复）；
+- 旧网页文字球独立位置 pref 不再读取，已存值留在 SharedPreferences 中（不迁移、不清理）。
+
+## 71. 用户 2026-11-01：网页自动检测源语言 + 底栏语言对
+
+### 一、需求与交互定稿
+
+- 首页**不出现**「自动检测」：源语言仍然只选具体语言，悬浮球截图/覆盖层全部按首页配置。
+- 网页里**默认自动检测**页面语言；源语言使用浏览器独立 pref，不改写首页/全局源语言。
+- 浏览器底栏改成两行：
+  1. 源语言下拉 + 交换 + 译文语言下拉（用户给的图）；
+  2. 后退 / 前进 / 刷新 + 状态文字。
+- 译文语言与首页**共用全局设置**（用户 2026-11-01 确认）；改底栏目标语言会同步首页。
+- 设置弹层里的语言对删除，避免和底栏重复。
+- 自动检测显示：`日文（自动检测）` / `自动检测（识别中…）` / `自动检测（无法判断）`；
+  手动选择时只显示语言名。
+
+### 二、实现
+
+- `core-store/BrowserSourceLanguage.kt`（新增）：`auto` + 具体语言归一，纯 Kotlin 可测。
+- `SettingsRepository` 新增独立 pref `browser_source_language`（默认 auto）。
+  不写进 `AppSettings.sourceLanguage`，否则首页/悬浮球也会出现 auto。
+- `core-translate/PageLanguageDetector.kt`（新增，纯逻辑）：
+  - 正文脚本强证据（谚文→ko、假名→ja）优先于 ML Kit；
+  - ML Kit 候选取支持语言，置信度 ≥0.5、top1 与次优差距 ≥0.1 才 reliable；
+  - 正文不足/候选不可用时用 `<html lang>` 等声明兜底（declared 永远不 reliable）；
+  - `resolveSource`：浏览器具体语言 > 页面语言 > 首页源语言回退。
+- `core-translate/MlKitLanguageIdentifier.kt`（新增）：
+  bundled `com.google.mlkit:language-id:17.0.6`（约 +900KB，不联网），
+  `identifyPossibleLanguages` + 1s 超时，失败返回空由声明/脚本兜底。
+- `SourceScriptDetector` 增加 `countScripts` / `chineseVariant`，供页面级占比判据和简繁区分。
+- `PAGE_LANGUAGE_JS` 改为**主内容优先**：`main/article/[role=main]` 采样，过滤
+  `nav/footer/aside`、隐藏节点、自身覆盖层；不足 40 字才退回 `body`；声明语言只作 hint。
+- 只有 `reliable = true` 的正文检测才允许「页面语言 == 目标语言 → 跳过翻译」；
+  `<html lang="en">` 的 Pixiv 日文页不会被声明语言误跳过。
+- `WebtoonImageTranslator.translateImage(..., sourceLanguageOverride)`：
+  网页自动检测解析出的具体语言覆盖全局源语言；OCR/翻译/缓存/历史都按具体语言。
+- `EmbeddedBrowserScreen`：
+  - 底栏语言对 + 页面语言状态缓存；
+  - 页面加载 / SPA 切换 / 点球前采样；
+  - `webpage_text`、截图翻译、连续图片翻译统一走 `resolveBrowserSource`；
+  - `onSettingsChanged` 同步目标语言给 MainActivity，切回首页立即看到新目标语言。
+
+### 三、网页文字翻译后源语言被带成目标语言（用户 2026-11-01 追加）
+
+- 现场日志：网页文字翻译后点球，
+  `page_language mode=image lang=zh-cn chars=22 hints=ko` → `auto_source effective=zh-cn`。
+- 根因：网页文字回填直接替换 `nodeValue`，DOM 已经是中文；再次采样就会把译文当页面语言。
+- 修复：`pageLanguageLocked` 冻结页面语言：
+  - 开始回填前锁定检测结果（含 null）；回填后点球/截图/切视图不再重采样；
+  - 一条都没回填时解锁；恢复原文成功后解锁并重新检测；
+  - SPA 换页先按网页文字注册表恢复原文，再解锁重采样；
+  - 整页导航（onPageStarted）解锁；
+  - 部分批次回填后异常也标记 `webpageTextApplied`，下一次点文字球先恢复，避免继续污染。
+- 验证日志：
+  - 翻译后点球：`page_language_locked mode=image lang=ja source=CONTENT`、
+    `auto_source mode=image effective=ja`（不再出现 zh-cn）；
+  - 恢复后：`webpage_text_restore restored=4 locked=false`。
+
+### 四、验证
+
+- 单测：
+  - `PageLanguageDetectorTest`：内容优先、声明兜底、简繁、ML Kit 置信度/差距、
+    未支持语言不硬猜英文、auto 解析顺序、同语言归一；
+  - `SourceScriptDetectorTest`：脚本计数、简繁；
+  - `BrowserSourceLanguageTest`：auto/具体语言/未知值回退；
+  - `TranslatePromptTest`：auto 源语言提示词不写成中文；
+  - `MlKitLanguageIdentifierProbeTest`（androidTest）：ja/ko/en/zh 真机识别候选。
+- 模拟机验证（sdk_gphone64_x86_64）：
+  - `.verify/web/page-language-mismatch.html`（`lang="en"` + 日文正文）：
+    `page_language mode=page_load lang=ja source=CONTENT reliable=true chars=106
+    candidates=ja:1.00 hints=en`，底部显示「日文 / 自动检测」；
+  - 网页文字翻译后点漫画球：`page_language_locked mode=image lang=ja`，
+    底部仍是「日文 / 自动检测」，源语言没有被译文带成简体中文；
+  - 韩文夹具：底部显示「韩文 / 自动检测」；
+  - 404 英文页：底部显示「英文 / 自动检测」。
+- 构建：`:app:assembleDebug` 通过并安装模拟机。
+
+### 五、边界
+
+- 首页/悬浮球仍没有 auto；网页 auto 失败回退首页源语言，不改写首页设置。
+- 声明语言（`<html lang>`）只用于选源语言，不触发「同语言跳过」。
+- ML Kit 判成 App 不支持的语言时不用脚本硬猜，直接回退首页源语言。
+- 底栏语言对占用 52dp，网页可视高度相应减少；语言下拉的菜单由 DropdownMenu 自动避让屏幕。
+- 网页文字翻译后又恢复原文：解锁并重新检测；如果恢复 0 条（页面自己改过/节点已移除），
+  保持冻结，避免用残留译文污染检测。
+
 ## 70. 用户 2026-11-01：旧夹具回归（左/中/右对齐 + 截断台词）
 
 ### 一、对齐（已修）
@@ -130,12 +252,15 @@
 
 - [x] **P2.1 Pixiv comic-store-viewer 适配（canvas 阅读器）**
       - 现场：`https://comic-store-viewer.pixiv.net/static/viewer?cid=...`，页图在
-        `<canvas>` 里（5 canvas + 5 个 loading/占位 img），`toDataURL` 受 CDN CORS 限制
-        无法导出像素；旧逻辑点球只显示“没找到可翻译的漫画图”。
-      - 处理：START 时读 `PageProfile`；`shouldUseCanvasScreenshot(canvases, images)`
-        （canvas ≥2 且 img ≤ canvas+3）成立 → 自动改走 WebView 截图链路。
+        `<canvas>` 里（5 canvas + 5 个 loading/占位 img），旧逻辑点球只显示
+        “没找到可翻译的漫画图”。
+      - 2026-11-01 复核修正：**CDN 返回的 JPEG 是 32px 块打乱的拼图，不能直接 OCR**；
+        但阅读器 `currentScreen.canvas` 里的像素是**已还原**的，`toDataURL` 可导出。
+        旧结论“canvas 无法导出像素”只适用于被站点污染的画布，不适用于 Pixiv。
+      - 处理：START 时读 `PageProfile`；其他 canvas 阅读器仍走
+        `shouldUseCanvasScreenshot(canvases, images)` 截图兜底；Pixiv viewer 优先走
+        P2.3 的页会话。
       - 日志：`canvas_page_fallback canvases=5 images=5 ...`、`shot_start`/`shot_ok`。
-      - 模拟机验证：Pixiv 当前页自动截图翻译，OCR 识别到正文并渲染；`shot_ok mode=dom`。
       - 测试：`BrowserCanvasFallbackPolicyTest`（Pixiv 5/5 命中；普通图片页不误触发）。
 
 - [x] **P2.2 网页文字翻译悬浮球（可选启用）**
@@ -148,14 +273,81 @@
       - 模拟机验证：开关开启→球出现→点球 `webpage_text_batch applied=3`→球变对勾→
         再点 `webpage_text_restore restored=3`；`force-stop` 重开球仍在。
 
-- [x] **P3 延迟剖析（工具已落地，优化待数据）**
-      - 已加 `TranslationTimer.elapsedMs` 和页面级 `perf_summary`
-        `ocr_ms/translate_ms/post_ms/total_ms`（`WebtoonImageTranslator` 收尾处）。
-      - 模拟机 Pixiv 截图链路样本（`shot_ok`）：
-        `ocr_ms=5502 translate_ms=0 post_ms=381 total_ms=7343 bubbles=10`。
-        OCR 是当前大头；翻译 0 是命中缓存/无缺失，post 为擦字+几何+渲染。
-      - 待做：真机冷缓存采样 3–5 页（先“作废本页”），区分单条带/多切片、首次/缓存命中；
-        再按占比决定 OCR 速度档/切片并行/缓存优化。约束：不增加 OCR 次数、模型请求、不等待邻页。
+- [x] **P2.3 Pixiv 页会话：预翻译下一页（2026-11-01）**
+      - 用户诉求：Pixiv 是翻页阅读器，不要每翻一页都重新截图/等 OCR；像韩漫那样
+        提前把后面的内容翻好。
+      - 现场机制：阅读器把当前页画在 `currentScreen.canvas`，把下一页画在隐藏的
+        `o5x` 缓冲；`rendererObj.renderNextLeft()` 只画隐藏缓冲，**不改可见页**。
+        实测真实翻页后可见 canvas 与预抓缓冲**逐字节一致**。
+      - 新建 `PixivViewerSupport`：probe 读 `viewerPage`/总页数/`leftDrawnRect`/
+        `viewportId`/`contentId`；按绘制区域裁当前页/下一页，PNG base64 分片回传。
+      - 新建 `PixivViewerSession`：watcher 每 ~300ms 读页号，处理翻页/原文译文切换；
+        worker 串行抓图 → `translateImage` → 缓存；当前页优先，下一页预取；
+        翻页直接贴缓存（`pixiv_apply source=cache`），不再截图/OCR。
+      - 缓存：当前页 + 下一页 + 一页余量，LRU 淘汰；淘汰时释放
+        `BrowserOverlayImageStore` 的清理图/贴片 token；`cid` 变化时整批作废。
+      - 覆盖层：锚点挂在当前 `viewportId` 的页图绘制区域（不是整个视口），
+        场景百分比坐标直接对齐页图；支持 `currentScreen` 在 viewport0/1 之间切换。
+      - 译文过滤：`translatedText == originalText` 的气泡不画盖板（云端/本地对短标题、
+        专有名词可能原样返回；不滤会在 TOC/扉页留下一排灰块）。日志
+        `pixiv_scene_filter kept/total`。
+      - 纯白/纯黑页（封面、扉页）标 `blank`，写空场景，不重试 OCR。
+      - loading：当前页抓图/OCR 期间在页图区域挂 `MtOverlay` loading 胶囊
+        （`预翻译中…` → `识别文字…` / `翻译文字…` / `擦字渲染…`）；译文贴上、
+        页面无字、切原文或停止时收起。日志 `pixiv_loading_show`。
+      - 日志：`pixiv_session_start`、`pixiv_probe`、`pixiv_capture mode=current|next`、
+        `pixiv_translate_ok`、`pixiv_apply source=live|cache`、`pixiv_content_change`。
+      - 模拟机验证：当前页 OCR 4 bubbles → `pixiv_scene_show`；下一页 11 bubbles
+        预取完成；翻页 `pixiv_apply page=11 source=cache`，无截图、无等待。
+      - 测试：`PixivViewerSupportTest`（URL/probe/几何/JS 契约）、
+        `PixivViewerQueueTest`（当前页优先、翻页缓存命中、LRU、换章节清空）。
+      - 边界：只预取 1 页（连续调用 `renderNextLeft` 仍是同一页）；双页模式回退截图；
+        `renderNextLeft` 是阅读器内部 API，改版时 probe 失败自动回退截图链路。
+
+- [x] **P2.4 Pixiv Comic 网页阅读器（`comic.pixiv.net`，2026-11-02）**
+      - 现场：`https://comic.pixiv.net/viewer/stories/...`，页图不是 `<img>`/`<canvas>`，
+        而是 `div#page-N { background-image: url("blob:https://comic.pixiv.net/...") }`，
+        共 10–30 个纵向排列的页图；旧扫描能命中背景图候选，但提取器只认
+        `<img>`/`<canvas>`，对 `div` 走 `naturalWidth` 得到 0 → `zero_size`，
+        表现为「点球一直在读取图片，一张都翻不出来」。
+      - 处理：`BrowserScanScript.EXTRACTOR_JS` 对非 img/canvas 元素读取
+        `getComputedStyle(...).backgroundImage`，用 `fetch(blobURL) + FileReader`
+        异步取 base64；加载期间返回 `reason=loading`，`extractPagePixels` 每 50ms
+        短轮询（最多 2s）。
+      - 模拟机验证（`comic.pixiv.net/viewer/stories/237108`）：
+        `scan pending=10 scanned=10 adapter=pixiv` →
+        `scene_ok bubbles=9/1/8/9` → 页面中文译文覆盖；状态
+        `已显示 11 张 · 缓存1句 · 监听新图中…`。
+      - 测试：`BrowserScanScriptTest.extractorSupportsAsyncCssBackgroundImages` /
+        `scanScriptIncludesCssBackgroundCandidates`。
+
+- [x] **P3 延迟剖析与第一轮优化（2026-11-02）**
+      - 修正 `perf_summary` 阶段 tag 冲突：OCR/翻译共用 `request_send/response_ok` 会把
+        OCR 时间覆盖，旧 `translate_ms` 永远为 0；现在拆成
+        `pre_ms / ocr_ms / prep_ms / cache_ms / translate_ms / post_ms / store_ms / render_ms / total_ms`。
+      - ML Kit `TextRecognizer` 按语言复用（不再每张图 create/close）；分块并行逻辑不变。
+      - 句子缓存索引改为**增量维护 + 按语言对分桶**；旧实现每次 `put` 标记 dirty，
+        下一张图重建最多 5000 条索引（真机 `cache_ms` 曾 200–350ms）。
+      - 新译文改为 `putAll` 一页只落盘一次；旧实现每句重写整份 JSON。
+      - 术语表 JSON 解析结果加内存缓存，并把 `activeGlossaryEntries/activeRevision`
+        移到 IO、与擦字准备并行：大术语表不再在主线程重复 parse 多次。
+      - 整页 `inpaint` 增加“全纯色气泡”快速路径：所有擦字目标都是 `solid` 时跳过整页
+        Mat 转换/inpaint/JPEG 导出，直接走逐气泡快速贴片（不影响非纯色/旁白页）。
+      - `planSeamOwnership` 增加无接缝快速路径：无上下条带、无移交、无碎片组时直接
+        认领全部检测，跳过归属/配对/裁剪规则（成组逻辑保留）。
+      - `buildPageHash` 改为逐行 `getPixels` 采样，并与 OCR 并行计算：`page_hash_done`
+        实测 **10ms**，不再占串行主链；此前串行的 `prep_ms` 约 300–390ms，
+        其中还叠着术语表读取和接缝几何。
+      - 模拟机截图链路（ML Kit OCR + ML Kit 本地翻译，`align.html`）：
+        - 冷缓存首跑：`ocr_ms=1019 prep_ms=390 cache_ms=18 translate_ms=0 render_ms=1278 total_ms=2715`
+          （首次 OpenCV/字体初始化偏高）；
+        - 热缓存复跑：`ocr_ms=423 prep_ms=299 cache_ms=4 post_ms=475 total_ms=1210`；
+        - 句子缓存从全量重建的 200–350ms 降到 **4–21ms**；`store_ms` 0–3ms。
+      - 说明：ML Kit 冷启动仍会有 1–2.4s 的首次 OCR（模型初始化），热起来后约 0.4–1s；
+        页面指纹/缓存/落盘已不再是主要耗时。
+      - 下一步候选（需真机多页数据决定优先级）：截图只裁正文/canvas 区域、网页文字多批并行、
+        当前图翻译与下一张 OCR 流水线重叠、按需降低 OCR 输入长边。约束仍是不增加 OCR 次数、
+        不增加模型请求、不等待邻页。
 
 - [ ] **P4 日漫支持**
       - 竖排/右→左：气泡内文本行序、OCR 行合并方向、阅读顺序按右→左；横排日漫也兼容。

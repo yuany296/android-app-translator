@@ -42,11 +42,16 @@ class TieredEraseProcessor(
         val digest = MessageDigest.getInstance("SHA-256")
         val sampleStepX = max(1, bitmap.width / 48)
         val sampleStepY = max(1, bitmap.height / 48)
+        // 逐行 getPixels（2026-11-02，P3）：旧实现每个采样点一次 getPixel，
+        // 1080×1783 的图约 2300 次 JNI 调用；改成每采样行一次批量拷贝，
+        // 只保留同样的 48×48 采样值，哈希结果不变。
+        val row = IntArray(bitmap.width)
         var y = 0
         while (y < bitmap.height) {
+            bitmap.getPixels(row, 0, bitmap.width, 0, y, bitmap.width, 1)
             var x = 0
             while (x < bitmap.width) {
-                val p = bitmap.getPixel(x, y)
+                val p = row[x]
                 digest.update((p and 0xFF).toByte())
                 digest.update(((p shr 8) and 0xFF).toByte())
                 digest.update(((p shr 16) and 0xFF).toByte())

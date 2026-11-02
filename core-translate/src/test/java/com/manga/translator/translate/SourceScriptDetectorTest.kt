@@ -55,4 +55,21 @@ class SourceScriptDetectorTest {
         // 单个谚文字符不够（噪声线）。
         assertNull(SourceScriptDetector.detect(listOf("큭")))
     }
+
+    @Test
+    fun countsScriptCharactersForPageLanguage() {
+        val counts = SourceScriptDetector.countScripts(listOf("한국어 にほんご 漢字 English 123"))
+        assertEquals(3, counts.hangul)
+        assertEquals(4, counts.kana)
+        assertEquals(2, counts.han)
+        assertEquals(7, counts.latin)
+        assertEquals(16, counts.total)
+    }
+
+    @Test
+    fun chineseVariantUsesTraditionalOnlyChars() {
+        assertEquals("zh-cn", SourceScriptDetector.chineseVariant("这是简体中文"))
+        assertEquals("zh-tw", SourceScriptDetector.chineseVariant("這是繁體中文"))
+        assertEquals("zh-cn", SourceScriptDetector.chineseVariant(""))
+    }
 }

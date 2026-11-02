@@ -126,7 +126,16 @@ class TranslatePromptTest {
         assertEquals("English", client.languageDisplayName("en"))
         assertEquals("Korean", client.languageDisplayName("ko"))
         assertEquals("Japanese", client.languageDisplayName("ja"))
+        // 自动检测（网页 auto 兜底到云端时不能把源语言误写成中文）
+        assertEquals("the source language (auto-detected)", client.languageDisplayName("auto"))
         // 未知 id 兜底到默认目标语言，不能抛异常
         assertEquals("Simplified Chinese", client.languageDisplayName("fr"))
+    }
+
+    @Test
+    fun systemPrompt_autoSourceDoesNotClaimChinese() {
+        val prompt = client.buildTranslateSystemPrompt("auto", "zh-cn")
+        assertTrue(prompt.contains("Translate from the source language (auto-detected)"))
+        assertFalse(prompt.contains("Translate from Simplified Chinese"))
     }
 }

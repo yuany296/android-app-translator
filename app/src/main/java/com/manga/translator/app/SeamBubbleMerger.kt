@@ -404,6 +404,19 @@ internal fun planSeamOwnership(
     }
     val groupedWorking = BooleanArray(working.size) { groupKinds[it] != null }
 
+    // 无上/下接缝、无上一张移交、且没有需要成组的碎片：不需要跑归属/配对/裁剪规则。
+    // 这是普通单图/单页最常见的路径；直接全部认领，避免 O(detections²) 的接缝判定。
+    // 成组逻辑保留在上面：同一气泡内被 OCR 拆开的碎片仍要先合并（2026-11-02，P3）。
+    if (!config.hasTopBand && !config.hasBottomBand &&
+        incomingCrossBoxes.isEmpty() && fragmentGroups.isEmpty()
+    ) {
+        return SeamPlan(
+            owned = working.map { SeamOwnership(it.bubble, cross = false) },
+            detected = detections.size,
+            verdicts = List(working.size) { "owned" }
+        )
+    }
+
     val used = BooleanArray(working.size)
     val owned = mutableListOf<SeamOwnership>()
     var pairedTop = 0

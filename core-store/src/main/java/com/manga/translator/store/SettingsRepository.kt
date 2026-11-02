@@ -256,7 +256,10 @@ class SettingsRepository(context: Context) {
     }
 
     /**
-     * 内嵌浏览器悬浮球的最后位置（2026-11-01 用户反馈「重新进入网页总是回到默认位置」）。
+     * 内嵌浏览器悬浮**组**的最后位置（2026-11-01 用户反馈「重新进入网页总是回到默认位置」）。
+     *
+     * 2026-11-01 起网页文字球与漫画球合成一组，只存一份位置；编码的是**下方漫画球的锚点**，
+     * 旧版本存的也是漫画球位置，因此升级后不需要迁移。
      *
      * 存的是**可移动范围内的比例**而不是像素：0 = 左/上边缘，1 = 右/下边缘。
      * 旋转屏幕、分屏、换设备后仍落在相同的相对位置，恢复时再按当前容器夹紧。
@@ -281,31 +284,21 @@ class SettingsRepository(context: Context) {
     }
 
     /**
-     * 网页文字翻译悬浮球（2026-11-01 用户要求：默认关闭，用户自己选择启用）。
+     * 浏览器源语言（2026-11-01 用户定稿：首页没有自动检测，网页里默认自动检测）。
      *
-     * 独立于翻译 API 档案；位置也单独存，避免和图片翻译悬浮球互相覆盖。
+     * 独立 pref：网页里选 `auto` 不能写进 [AppSettings.sourceLanguage]，
+     * 否则首页/悬浮球截图会跟着变成“自动检测”，而截图链路没有页面可读。
+     * 默认 `auto`；具体语言值只接受 [AppLanguage] 的 id。
      */
-    fun isBrowserWebpageTextBallEnabled(): Boolean {
-        return prefs.getBoolean(KEY_BROWSER_WEBPAGE_TEXT_BALL, false)
+    fun getBrowserSourceLanguage(): String {
+        return BrowserSourceLanguage.normalize(
+            prefs.getString(KEY_BROWSER_SOURCE_LANGUAGE, BrowserSourceLanguage.AUTO).orEmpty()
+        )
     }
 
-    fun setBrowserWebpageTextBallEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean(KEY_BROWSER_WEBPAGE_TEXT_BALL, enabled).apply()
-    }
-
-    fun getBrowserWebpageTextBallPosition(): BrowserFloatingBallPosition? {
-        val x = prefs.getFloat(KEY_BROWSER_TEXT_BALL_X_RATIO, Float.NaN)
-        val y = prefs.getFloat(KEY_BROWSER_TEXT_BALL_Y_RATIO, Float.NaN)
-        if (!x.isFinite() || !y.isFinite()) return null
-        if (x !in 0f..1f || y !in 0f..1f) return null
-        return BrowserFloatingBallPosition(xRatio = x, yRatio = y)
-    }
-
-    fun setBrowserWebpageTextBallPosition(xRatio: Float, yRatio: Float) {
-        if (!xRatio.isFinite() || !yRatio.isFinite()) return
+    fun setBrowserSourceLanguage(languageId: String) {
         prefs.edit()
-            .putFloat(KEY_BROWSER_TEXT_BALL_X_RATIO, xRatio.coerceIn(0f, 1f))
-            .putFloat(KEY_BROWSER_TEXT_BALL_Y_RATIO, yRatio.coerceIn(0f, 1f))
+            .putString(KEY_BROWSER_SOURCE_LANGUAGE, BrowserSourceLanguage.normalize(languageId))
             .apply()
     }
 
@@ -519,9 +512,7 @@ class SettingsRepository(context: Context) {
         const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"
         const val KEY_BROWSER_FLOATING_BALL_X_RATIO = "browser_floating_ball_x_ratio"
         const val KEY_BROWSER_FLOATING_BALL_Y_RATIO = "browser_floating_ball_y_ratio"
-        const val KEY_BROWSER_WEBPAGE_TEXT_BALL = "browser_webpage_text_ball"
-        const val KEY_BROWSER_TEXT_BALL_X_RATIO = "browser_webpage_text_ball_x_ratio"
-        const val KEY_BROWSER_TEXT_BALL_Y_RATIO = "browser_webpage_text_ball_y_ratio"
+        const val KEY_BROWSER_SOURCE_LANGUAGE = "browser_source_language"
         const val DEFAULT_THINKING_BUDGET = 8192
         const val BAIDU_OCR_MONTHLY_LIMIT = 500
     }

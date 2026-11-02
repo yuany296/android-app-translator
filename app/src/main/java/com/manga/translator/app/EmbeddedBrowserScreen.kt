@@ -135,8 +135,10 @@ import com.manga.translator.app.ui.theme.MtColors
 import com.manga.translator.store.AiProvider
 import com.manga.translator.store.AppLanguage
 import com.manga.translator.store.AppSettings
+import com.manga.translator.store.BrowserSourceLanguage
 import com.manga.translator.translate.Bubble
-import com.manga.translator.translate.SourceScriptDetector
+import com.manga.translator.translate.MlKitLanguageIdentifier
+import com.manga.translator.translate.PageLanguageDetector
 import com.manga.translator.store.BrowserFavorite
 import com.manga.translator.store.BrowserFavoriteRepository
 import com.manga.translator.store.BrowserFloatingBallPosition
@@ -175,6 +177,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
@@ -209,6 +212,19 @@ object BrowserOverlayImageStore {
     fun get(token: String): ByteArray? = synchronized(lock) { entries[token]?.bytes }
 
     fun mimeOf(token: String): String? = synchronized(lock) { entries[token]?.mime }
+
+    /**
+     * 定向删除一条内存图（2026-11-01，Pixiv 预翻译缓存淘汰用）。
+     *
+     * 为什么不能只靠 [put] 的 96MB 上限自动淘汰：Pixiv 页会话只缓存当前页 + 下一页，
+     * 但长章节里每一页都会产出清理图；不主动删就会把仓挤到上限，最后被淘汰的可能是
+     * **当前页正在用的**清理图，画面直接变成透明盖板。
+     */
+    fun remove(token: String) {
+        synchronized(lock) {
+            entries.remove(token)?.let { totalBytes -= it.bytes.size }
+        }
+    }
 
     fun clear() {
         synchronized(lock) {
@@ -407,6 +423,14 @@ private fun installSiteConfigJs(adapter: BrowserSiteAdapter, siteRulesEnabled: B
  * 名字抄错一次就会留下摘不掉的孤儿节点（2026-10-16 重设计时统一到这里）。
  */
 private const val SHOT_ANCHOR_ID = "mt-shot"
+
+/**
+ * Pixiv 阅读器页会话的覆盖层锚点（2026-11-01）。
+ *
+ * 与截图链路不同：它不是整个视口，而是**当前页图实际绘制区域**（`leftDrawnRect`），
+ * 这样场景里的百分比坐标可以直接落在页图上，不包含上下黑边。
+ */
+private const val PIXIV_ANCHOR_ID = "mt-pixiv-page"
 
 /**
  * 解除「点一下恢复原文」的一次性监听（2026-10-16，Todolist §56）。
@@ -700,7 +724,7 @@ private fun jsStringLiteral(value: String): String {
 }
 
 /** `evaluateJavascriptSuspend` 的结果 → JSONObject（外层 JSON 字符串被 WebView 再引号包裹过一层）。 */
-private fun decodeJsJsonResult(raw: String?): JSONObject? {
+internal fun decodeJsJsonResult(raw: String?): JSONObject? {
     val decoded = runCatching {
         if (raw != null && raw.length >= 2 && raw.first() == '"' && raw.last() == '"') {
             JSONObject("{\"v\":$raw}").optString("v")
@@ -981,7 +1005,7 @@ internal object BrowserScreenshotTranslate {
  * 扫描脚本返回值 → [ScanResult]。
  *
  * 兼容两种形态：新的对象 `{"items":[…],…}` 与旧的裸数组 `[…]`。
- * 为什么要兼容旧的：`onPageFinished` 之前用户就可能点「翻译」，
+ * 为什么要兼容旧的：`onPageFinished` 之前用户就可能点「译」球，
  * 那一刻注入的还是页面里残留的旧脚本，直接当空结果会让这次会话白跑一轮。
  */
 private fun parseScannedImages(raw: String?): ScanResult {
@@ -1057,7 +1081,7 @@ private fun parseScannedImages(raw: String?): ScanResult {
  * 超时不是「掩盖问题」：调用方本来就把 `null` 当作「这次拿不到」，会走重试/下一轮；
  * 而且这里会打**一次**警告日志，把「谁卡住了」记下来（避免又变成无线索排查）。
  */
-private suspend fun WebView.evaluateJavascriptSuspend(
+internal suspend fun WebView.evaluateJavascriptSuspend(
     script: String,
     timeoutMs: Long = JS_EVAL_TIMEOUT_MS,
     what: String = "eval"
@@ -1178,6 +1202,14 @@ private enum class BrowserPage {
     HISTORY
 }
 
+/** 页面语言检测状态：底部语言条据此显示「识别中… / 自动检测 / 无法判断」。 */
+private enum class PageLanguageStatus {
+    IDLE,
+    DETECTING,
+    READY,
+    UNKNOWN
+}
+
 /** 新标签页收藏格的「添加」占位格标识（末尾固定一格）。 */
 private val ADD_FAVORITE_TILE = Any()
 
@@ -1229,7 +1261,14 @@ private fun historyTimeLabel(entry: BrowserHistoryEntry, today: LocalDate, group
 @Composable
 fun EmbeddedBrowserScreen(
     onClose: () -> Unit,
-    onSelectTab: (Int) -> Unit
+    onSelectTab: (Int) -> Unit,
+    /**
+     * 浏览器里改了语言/引擎等全局设置时同步给外层（2026-11-01）。
+     *
+     * 底栏的「译文语言」与首页共用同一份 `AppSettings`；不同步的话，切回首页
+     * 仍显示旧目标语言，用户会以为没生效。
+     */
+    onSettingsChanged: (AppSettings) -> Unit = {}
 ) {
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
@@ -1276,6 +1315,21 @@ fun EmbeddedBrowserScreen(
     // 弹层里的语言对 / 识别引擎 / 翻译配置要读写同一份设置，所以在页面里持一份可变的副本。
     // 切到别的 tab 再回来会重新 remember → 重新读盘，不会看到首页改过的旧值。
     var appSettings by remember { mutableStateOf(settingsRepository.getSettings()) }
+    // 网页源语言（2026-11-01）：与首页分离；默认 auto，首页/悬浮球不受影响。
+    var browserSourceLanguage by remember {
+        mutableStateOf(settingsRepository.getBrowserSourceLanguage())
+    }
+    // 页面语言识别状态：底部语言条显示「日文（自动检测）/识别中/无法判断」。
+    var pageLanguageStatus by remember { mutableStateOf(PageLanguageStatus.IDLE) }
+    var pageLanguage by remember { mutableStateOf<PageLanguageDetector.Detected?>(null) }
+    var pageLanguageUrl by remember { mutableStateOf("") }
+    // 每次检测递增；旧请求回来时丢弃，避免快速跳页/SPA 切换后旧结果覆盖新页面。
+    var pageLanguageRequest by remember { mutableIntStateOf(0) }
+    // 网页文字回填会改写 DOM：冻结页面语言，后续不再从“已变成目标语言”的正文重采样。
+    // 恢复原文 / 页面跳转 / SPA 切换时解锁。
+    var pageLanguageLocked by remember { mutableStateOf(false) }
+    // 点球后的语言识别窗口：防止连点球同时起两次会话。
+    var autoDetectBusy by remember { mutableStateOf(false) }
     var profileNames by remember { mutableStateOf(settingsRepository.getProfileNames()) }
     // 当前生效的翻译配置名。口径与首页一致：上次选过的那个，否则第一个（都没有就是空）。
     var activeProfile by remember {
@@ -1295,15 +1349,8 @@ fun EmbeddedBrowserScreen(
     var inpaintClean by remember { mutableStateOf(settingsRepository.isBrowserInpaintCleanEnabled()) }
     // 覆盖层渲染（默认开）：译文画在 DOM 覆盖层上；关 = 旧的整图替换。
     var domOverlay by remember { mutableStateOf(settingsRepository.isBrowserDomOverlayEnabled()) }
-    // 悬浮球的最后位置（2026-11-01）：每次进入网页按它恢复，不再回到默认右下角。
+    // 悬浮球组（2026-11-01）：网页文字球 + 漫画球共用一个位置；沿用旧版漫画球的位置记录。
     val savedBallPosition = remember { settingsRepository.getBrowserFloatingBallPosition() }
-    // 网页文字翻译悬浮球：默认关闭，用户在设置里开启（2026-11-01 用户要求）。
-    var webpageTextBallEnabled by remember {
-        mutableStateOf(settingsRepository.isBrowserWebpageTextBallEnabled())
-    }
-    val savedTextBallPosition = remember {
-        settingsRepository.getBrowserWebpageTextBallPosition()
-    }
     // 网页文字翻译（2026-10-14）：与漫画图链路独立 —— 只翻译 DOM 文本节点。
     var webpageTextBusy by remember { mutableStateOf(false) }
     var webpageTextApplied by remember { mutableStateOf(false) }
@@ -1423,6 +1470,7 @@ fun EmbeddedBrowserScreen(
         val next = block(appSettings)
         settingsRepository.saveSettings(next)
         appSettings = next
+        onSettingsChanged(next)
     }
 
     /**
@@ -1460,6 +1508,45 @@ fun EmbeddedBrowserScreen(
         val adapter = BrowserSiteAdapterRegistry.resolveUrl(url)
         matchedAdapter = adapter
         return adapter
+    }
+
+    /**
+     * 把一次页面语言检测结果落到 UI 状态。
+     *
+     * [request] 是发起时的序号：页面跳转/SPA 切换会递增 `pageLanguageRequest` 让旧结果失效。
+     * 定义在 WebView 之前，`onPageFinished` / `doUpdateVisitedHistory` 回调里直接复用。
+     */
+    fun applyPageLanguageResult(
+        request: Int,
+        url: String,
+        detected: PageLanguageDetector.Detected?
+    ) {
+        if (request != pageLanguageRequest) return
+        pageLanguageUrl = url
+        pageLanguage = detected
+        pageLanguageStatus = if (detected != null) PageLanguageStatus.READY else PageLanguageStatus.UNKNOWN
+        Log.d(
+            TAG,
+            "page_language_state url=${BrowserHistoryRepository.urlWithoutScheme(url)} " +
+                "lang=${detected?.languageId ?: "none"} source=${detected?.source ?: "none"} " +
+                "reliable=${detected?.reliable == true} chars=${detected?.sampleChars ?: 0}"
+        )
+    }
+
+    /** 底部语言条左框：手动语言显示语言名；auto 显示检测结果/识别中/无法判断。 */
+    fun browserBottomSourceDisplay(): Pair<String, String?> {
+        if (browserSourceLanguage != BrowserSourceLanguage.AUTO) {
+            return AppLanguage.fromId(browserSourceLanguage).label to null
+        }
+        return when (pageLanguageStatus) {
+            PageLanguageStatus.DETECTING -> "自动检测" to "识别中…"
+            PageLanguageStatus.READY -> {
+                val label = pageLanguage?.let { AppLanguage.fromId(it.languageId).label } ?: "自动检测"
+                label to "自动检测"
+            }
+            PageLanguageStatus.UNKNOWN -> "自动检测" to "无法判断"
+            PageLanguageStatus.IDLE -> "自动检测" to null
+        }
     }
 
     val webView = remember {
@@ -1534,8 +1621,31 @@ fun EmbeddedBrowserScreen(
                     // SPA 站内跳转换的是**同一份文档**里的另一页，onPageStarted 不会来 ——
                     // 上一页的网页文字翻译状态必须在这里一起清掉，否则新页面还没翻过，
                     // 弹层按钮却已经写着「恢复页面原文」（用户 2026-10-15 报）。
+                    val hadWebpageText = webpageTextApplied || pageLanguageLocked
                     webpageTextBusy = false
                     webpageTextApplied = false
+                    // SPA 换页不触发 onPageFinished：页面语言也要重新采样；延迟一点等新 DOM 挂完。
+                    // 如果上一页做过网页文字翻译，先按注册表恢复原文，否则新采样会把译文当源语言。
+                    pageLanguageRequest += 1
+                    val request = pageLanguageRequest
+                    pageLanguageStatus = PageLanguageStatus.DETECTING
+                    sessionScope.launch {
+                        if (hadWebpageText) {
+                            runCatching {
+                                view.evaluateJavascriptSuspend(
+                                    BrowserWebpageTextScript.restoreJs(),
+                                    what = "webpage_restore_spa"
+                                )
+                            }.onFailure { err ->
+                                Log.w(TAG, "webpage_restore_spa_fail reason=${err.message?.take(80)}")
+                            }
+                            pageLanguageLocked = false
+                        }
+                        delay(250)
+                        if (request != pageLanguageRequest) return@launch
+                        val detected = view.readPageLanguage("spa")
+                        applyPageLanguageResult(request, url, detected)
+                    }
                     Log.d(TAG, "url_updated source=doUpdateVisitedHistory url=${BrowserHistoryRepository.urlWithoutScheme(url)}")
                 }
 
@@ -1556,13 +1666,19 @@ fun EmbeddedBrowserScreen(
                     // 注册表失效自动返回 applied=0，不用专门取消）。
                     webpageTextBusy = false
                     webpageTextApplied = false
+                    // 页面语言随旧文档失效：递增请求号让在途检测作废，底部先回到「自动检测」。
+                    pageLanguageRequest += 1
+                    pageLanguageStatus = PageLanguageStatus.IDLE
+                    pageLanguage = null
+                    pageLanguageUrl = ""
+                    pageLanguageLocked = false
                     // 站点适配器按新 URL 重算（跨站跳转必须换规则）。
                     matchedAdapter = BrowserSiteAdapterRegistry.resolveUrl(url)
                     // 真的开始导航了：地址栏退出编辑态（地址显示为实际 URL）。
                     addressEditing = false
                     // 跳转即终止当前连续翻译：旧页面的图不应该再贴到新页面上。
                     if (session.job != null) {
-                        stopSession("页面已跳转，点「翻译」继续")
+                        stopSession("页面已跳转，点「译」球继续")
                     } else if (statusText.startsWith("翻译中") || statusText.startsWith("扫描")) {
                         statusText = ""
                     }
@@ -1590,6 +1706,18 @@ fun EmbeddedBrowserScreen(
                                 "adapter=${adapter.id} rules=${siteRulesActive(adapter)}"
                         )
                     }
+                    // 页面语言：内容优先（main/article/body），声明语言只作兜底；
+                    // 结果驱动底部语言条和「自动检测源语言」。
+                    // 网页文字已回填时不能重采样（DOM 已是目标语言），保留冻结值。
+                    if (!pageLanguageLocked) {
+                        pageLanguageRequest += 1
+                        val request = pageLanguageRequest
+                        pageLanguageStatus = PageLanguageStatus.DETECTING
+                        sessionScope.launch {
+                            val detected = view.readPageLanguage("page_load")
+                            applyPageLanguageResult(request, url, detected)
+                        }
+                    }
                 }
             }
             webChromeClient = object : WebChromeClient() {
@@ -1598,6 +1726,111 @@ fun EmbeddedBrowserScreen(
                 }
             }
         }
+    }
+
+    /**
+     * 读一次页面语言；[force] = true 时忽略缓存。
+     *
+     * 页面语言只做正文采样 + ML Kit，不跑 OCR/翻译。返回值可能为 null（页面没文字、
+     * 识别失败），调用方用 [resolveBrowserSource] 回退首页源语言。
+     */
+    suspend fun ensurePageLanguage(
+        force: Boolean = false,
+        mode: String = "action"
+    ): PageLanguageDetector.Detected? {
+        // 网页文字已回填：DOM 已经是目标语言，任何重采样都会把源语言误判成目标语言。
+        // 直接返回冻结结果（可能为 null，调用方回退首页源语言）。
+        if (pageLanguageLocked) {
+            Log.d(
+                TAG,
+                "page_language_locked mode=$mode lang=${pageLanguage?.languageId ?: "none"} " +
+                    "source=${pageLanguage?.source ?: "none"}"
+            )
+            return pageLanguage
+        }
+        val url = webView.url.orEmpty()
+        if (!force && url.isNotBlank() && url == pageLanguageUrl) {
+            when (pageLanguageStatus) {
+                PageLanguageStatus.READY -> return pageLanguage
+                PageLanguageStatus.UNKNOWN -> return null
+                else -> Unit
+            }
+        }
+        pageLanguageRequest += 1
+        val request = pageLanguageRequest
+        pageLanguageStatus = PageLanguageStatus.DETECTING
+        val detected = webView.readPageLanguage(mode)
+        if (request != pageLanguageRequest || webView.url.orEmpty() != url) return null
+        applyPageLanguageResult(request, url, detected)
+        return detected
+    }
+
+    /**
+     * 网页文字翻译的兜底检测：主内容采样失败时，用实际收集到的可翻译文本再判一次。
+     * 文本来自页面 DOM，不是 OCR，不会增加识别耗时。
+     */
+    suspend fun detectPageLanguageFromText(
+        text: String,
+        mode: String
+    ): PageLanguageDetector.Detected? {
+        val sample = text.take(PageLanguageDetector.MAX_SAMPLE_CHARS)
+        if (sample.trim().length < PageLanguageDetector.MIN_SAMPLE_CHARS) return null
+        val candidates = MlKitLanguageIdentifier.identify(sample)
+        val detected = PageLanguageDetector.detect(sample, emptyList(), candidates)
+        Log.d(
+            TAG,
+            "page_language_text mode=$mode lang=${detected?.languageId ?: "none"} " +
+                "source=${detected?.source ?: "none"} reliable=${detected?.reliable == true} " +
+                "chars=${sample.trim().length} " +
+                "candidates=" + candidates.take(3).joinToString(separator = ",") { candidate ->
+                    String.format(Locale.US, "%s:%.2f", candidate.languageTag, candidate.confidence)
+                }
+        )
+        return detected
+    }
+
+    /** 浏览器实际使用的源语言：具体语言直接用；auto 用页面语言，失败回退首页源语言。 */
+    fun resolveBrowserSource(
+        detected: PageLanguageDetector.Detected?,
+        mode: String
+    ): String {
+        val resolved = PageLanguageDetector.resolveSource(
+            configuredLanguageId = browserSourceLanguage,
+            pageLanguage = detected,
+            fallbackLanguageId = appSettings.sourceLanguage
+        )
+        if (browserSourceLanguage == BrowserSourceLanguage.AUTO) {
+            Log.d(
+                TAG,
+                "auto_source mode=$mode effective=${resolved.languageId} origin=${resolved.origin} " +
+                    "detected=${detected?.languageId ?: "none"} fallback=${appSettings.sourceLanguage}"
+            )
+        }
+        return resolved.languageId
+    }
+
+    /**
+     * 页面语言 == 目标语言时跳过翻译。
+     *
+     * 只认 **reliable = true 的正文检测**：`<html lang="en">` 这种声明语言不触发跳过，
+     * 否则 Pixiv（英文 UI + 日文正文）会被整页跳过。
+     */
+    fun shouldSkipSameLanguage(
+        detected: PageLanguageDetector.Detected?,
+        mode: String
+    ): Boolean {
+        val reliablePage = detected?.takeIf { it.reliable }
+        val same = reliablePage != null &&
+            PageLanguageDetector.sameLanguage(reliablePage.languageId, appSettings.targetLanguage)
+        if (same) {
+            statusText = "页面语言与目标语言相同，无需翻译"
+        }
+        Log.d(
+            TAG,
+            "page_same_lang mode=$mode skip=$same lang=${detected?.languageId ?: "none"} " +
+                "reliable=${detected?.reliable == true} target=${appSettings.targetLanguage}"
+        )
+        return same
     }
 
     /**
@@ -1666,7 +1899,52 @@ fun EmbeddedBrowserScreen(
      */
     fun invalidateRenderedResults(reason: String) {
         clearRenderedOverlays()
-        stopSession("$reason，点「翻译」重新翻译")
+        stopSession("$reason，点「译」球重新翻译")
+    }
+
+    /** 底栏源语言：具体语言写浏览器 pref；auto 立即重新识别页面。 */
+    fun pickBrowserSourceLanguage(languageId: String) {
+        val value = BrowserSourceLanguage.normalize(languageId)
+        if (value == browserSourceLanguage) return
+        browserSourceLanguage = value
+        settingsRepository.setBrowserSourceLanguage(value)
+        invalidateRenderedResults("已切换源语言")
+        if (value == BrowserSourceLanguage.AUTO) {
+            sessionScope.launch {
+                ensurePageLanguage(force = true, mode = "source_set")
+            }
+        }
+        Log.d(TAG, "browser_source_set source=$value auto=${value == BrowserSourceLanguage.AUTO}")
+    }
+
+    /** 底栏译文语言：与首页共用同一份 AppSettings（用户 2026-11-01 确认）。 */
+    fun pickBrowserTargetLanguage(language: AppLanguage) {
+        if (language.id == appSettings.targetLanguage) return
+        updateSettings { it.copy(targetLanguage = language.id) }
+        invalidateRenderedResults("已切换目标语言")
+        Log.d(TAG, "browser_target_set target=${language.id}")
+    }
+
+    /**
+     * 底栏交换：auto 时用「当前实际生效的源语言」参与交换。
+     *
+     * 交换后源语言变成具体语言（auto 关闭），目标语言写回全局设置；
+     * 这样用户点一次交换就能在「日文 → 中文」和「中文 → 日文」之间来回。
+     */
+    fun swapBrowserLanguages() {
+        val effectiveSource = resolveBrowserSource(pageLanguage, "swap")
+        val nextSource = appSettings.targetLanguage
+        val nextTarget = effectiveSource
+        if (nextSource == nextTarget) {
+            statusText = "源语言与目标语言相同，无法交换"
+            Log.d(TAG, "browser_language_swap skip=same source=$nextSource")
+            return
+        }
+        browserSourceLanguage = nextSource
+        settingsRepository.setBrowserSourceLanguage(nextSource)
+        updateSettings { it.copy(targetLanguage = nextTarget) }
+        invalidateRenderedResults("已交换语言")
+        Log.d(TAG, "browser_language_swap source=$nextSource target=$nextTarget auto=false")
     }
 
     // 视图切换（showOriginal / showTranslations）定义在 startSession 之后 ——
@@ -1781,7 +2059,11 @@ fun EmbeddedBrowserScreen(
      * 它是「译文」视图开关的实现方式，不再借用「翻译」按钮（改造前两者是同一个入口，
      * 用户读不出区别，这是 2026-10-02 反馈的核心）。
      */
-    fun startSession(mode: BrowserSessionMode = BrowserSessionMode.TRANSLATE) {
+    fun startSession(
+        mode: BrowserSessionMode = BrowserSessionMode.TRANSLATE,
+        pageLanguage: PageLanguageDetector.Detected? = null,
+        sourceLanguage: String = appSettings.sourceLanguage
+    ) {
         if (running) {
             stopSession("已停止 · 译文保留")
             return
@@ -1818,7 +2100,9 @@ fun EmbeddedBrowserScreen(
         Log.d(
             TAG,
             "session_start token=$myToken mode=$mode inpaint_clean=$inpaintClean dom_overlay=$domOverlay " +
-                "adapter=${adapter.id} site_rules=$rulesOn"
+                "adapter=${adapter.id} site_rules=$rulesOn " +
+                "browser_source=$browserSourceLanguage lang=$sourceLanguage " +
+                "page_lang=${pageLanguage?.languageId ?: "none"}"
         )
         val job = sessionScope.launch {
             runTranslationSession(
@@ -1832,6 +2116,7 @@ fun EmbeddedBrowserScreen(
                 placedIds = placedIds,
                 seamBySrc = seamBySrc,
                 useDomOverlay = domOverlay,
+                sourceLanguage = sourceLanguage,
                 rendererScript = OverlayRendererScript.load(context),
                 ensureRenderer = {
                     if (!rendererInjected) {
@@ -2009,7 +2294,7 @@ fun EmbeddedBrowserScreen(
      * 流程：量几何（滚动宿主 + 偏移）→ 截图 → 共用管线（OCR→翻译→擦字）→
      * 按捕获时的文档位置回贴（DOM 场景走视口锚点；整图走 mtlocal 贴图）。
      *
-     * 与连续会话互斥：会话在跑就先停（译文保留）；截图进行中点「翻译」会被
+     * 与连续会话互斥：会话在跑就先停（译文保留）；截图进行中点「译」球会被
      * [startSession] 里的守卫挡下并提示。
      */
     /**
@@ -2060,29 +2345,46 @@ fun EmbeddedBrowserScreen(
                     Log.d(TAG, "webpage_text_empty")
                     return@launch
                 }
-                // 2) 页面语言 == 目标语言 → 整页跳过（2026-11-01 用户裁定：
-                //    直接用网页声明语言，不从图片/OCR 猜；图片一般跟随网页语言）。
-                val settings = settingsRepository.getSettings()
-                val pageLanguage = webView.readPageLanguage()
-                if (pageLanguage?.id == settings.targetLanguage) {
-                    statusText = "页面语言与目标语言相同，无需翻译"
-                    Log.d(
-                        TAG,
-                        "webpage_text_same_lang lang=${pageLanguage.id} " +
-                            "source=${pageLanguage.source}"
-                    )
-                    return@launch
+                // 2) 页面语言 == 目标语言 → 整页跳过。只认正文可靠检测；声明语言不触发跳过
+                //    （Pixiv 这类英文 UI + 日文正文的页面不能因为 <html lang> 被整页跳过）。
+                //    auto 源语言在下面解析成具体语言，缓存/历史都按具体语言记。
+                val baseSettings = settingsRepository.getSettings()
+                var pageLanguage = ensurePageLanguage(force = false, mode = "webpage_text")
+                // 主内容采样可能太短/只有声明语言：用实际收集到的可翻译文本再判一次，
+                // 仍判不出才保留原结果（通常是 declared，只用于选源语言，不触发跳过）。
+                if (pageLanguage?.reliable != true) {
+                    pageLanguage = detectPageLanguageFromText(
+                        collected.joinToString(separator = "\n") { it.text },
+                        mode = "webpage_text_fallback"
+                    ) ?: pageLanguage
                 }
+                if (shouldSkipSameLanguage(pageLanguage, "webpage_text")) return@launch
+                val sourceLanguage = resolveBrowserSource(pageLanguage, "webpage_text")
+                val settings = baseSettings.copy(sourceLanguage = sourceLanguage)
+                // 回填会把 DOM 改成目标语言：先冻结当前页面语言，后续点球/切视图不再重采样。
+                pageLanguageLocked = true
+                Log.d(
+                    TAG,
+                    "webpage_text_language_lock lang=${pageLanguage?.languageId ?: "none"} " +
+                        "source=${pageLanguage?.source ?: "none"} effective=$sourceLanguage"
+                )
                 // 3) 逐批翻译 → 回填。句级解析器复用：句子缓存 / 术语表 / 历史 / 引擎分发
                 //    与漫画链路同源，同一句话在两条链路之间还能共享缓存。
-                val glossaryEntries = ServiceLocator.glossaryRepository.activeGlossaryEntries()
+                // 术语表读取放到 IO 并只读一次：不要在主线程 parse 大 JSON，也不要每个 batch
+                // 重复计算 revision（2026-11-02，P3）。
+                val (glossaryEntries, glossaryRevision) = withContext(Dispatchers.IO) {
+                    val repo = ServiceLocator.glossaryRepository
+                    repo.activeGlossaryEntries() to repo.activeRevision()
+                }
                 val resolver = PageTranslationResolver()
                 val batches = BrowserWebpageTextScript.buildBatches(collected)
                 Log.d(
                     TAG,
                     "webpage_text_plan collected=${collected.size} batches=${batches.size} " +
-                        "lang=${pageLanguage?.id ?: "auto"} " +
-                        "source=${pageLanguage?.source ?: "none"} target=${settings.targetLanguage}"
+                        "lang=${pageLanguage?.languageId ?: "none"} " +
+                        "source=${pageLanguage?.source ?: "none"} " +
+                        "effective=$sourceLanguage target=${settings.targetLanguage} " +
+                        "browser_source=$browserSourceLanguage"
                 )
                 batches.forEachIndexed { batchIndex, batch ->
                     if (!isActive) return@forEachIndexed
@@ -2098,7 +2400,7 @@ fun EmbeddedBrowserScreen(
                     val translateKey = resolver.buildTranslateKey(
                         texts = bubbles.map { it.originalText },
                         settings = settings,
-                        glossaryRevision = ServiceLocator.glossaryRepository.activeRevision()
+                        glossaryRevision = glossaryRevision
                     )
                     val outcome = withContext(Dispatchers.IO) {
                         resolver.resolveTranslations(
@@ -2137,10 +2439,15 @@ fun EmbeddedBrowserScreen(
                 }
                 Log.i(TAG, "webpage_text_done collected=${collected.size} applied=$appliedTotal")
             } catch (err: Exception) {
+                // 部分批次已回填时也要标记为“已翻译”：否则下一次点文字球会继续翻已改写的 DOM，
+                // 页面语言检测也会被目标语言污染。让用户先恢复原文。
+                webpageTextApplied = appliedTotal > 0
                 statusText = "网页文字翻译失败：${err.message?.take(60) ?: "未知错误"}"
-                Log.w(TAG, "webpage_text_fail reason=${err.message?.take(120)}")
+                Log.w(TAG, "webpage_text_fail reason=${err.message?.take(120)} applied=$appliedTotal")
             } finally {
                 webpageTextBusy = false
+                // 一条都没回填：DOM 没被改写，解冻以便后续还能正常检测。
+                if (appliedTotal == 0) pageLanguageLocked = false
             }
         }
     }
@@ -2152,12 +2459,17 @@ fun EmbeddedBrowserScreen(
                 webView.evaluateJavascriptSuspend(BrowserWebpageTextScript.restoreJs(), what = "webpage_restore")
             )?.optInt("restored", 0) ?: 0
             webpageTextApplied = false
+            if (restored > 0) {
+                // 原文回来了：解冻并重新采样，底部语言条恢复真实页面语言。
+                pageLanguageLocked = false
+                ensurePageLanguage(force = true, mode = "webpage_restore")
+            }
             statusText = "已恢复页面原文"
-            Log.d(TAG, "webpage_text_restore restored=$restored")
+            Log.d(TAG, "webpage_text_restore restored=$restored locked=${pageLanguageLocked}")
         }
     }
 
-    fun startScreenshotTranslation() {
+    fun startScreenshotTranslation(pageLanguage: PageLanguageDetector.Detected? = null) {
         if (screenshotBusy) {
             statusText = "正在截图翻译…"
             return
@@ -2174,7 +2486,7 @@ fun EmbeddedBrowserScreen(
         Log.d(
             TAG,
             "shot_start url=${BrowserHistoryRepository.urlWithoutScheme(captureUrl)} " +
-                "dom_overlay=$domOverlay shown=$shownLayer"
+                "dom_overlay=$domOverlay shown=$shownLayer browser_source=$browserSourceLanguage"
         )
         sessionScope.launch {
             // 位图所有权：translateImage 的所有出口（成功/失败）都会回收入参位图；
@@ -2195,6 +2507,18 @@ fun EmbeddedBrowserScreen(
                         "shot_wait_prev waited=${System.currentTimeMillis() - waitStartedAt}ms"
                     )
                 }
+                // 0.5) 网页源语言：auto 用页面语言，失败回退首页源语言；同语言页直接跳过。
+                if (pageLanguage == null && browserSourceLanguage == BrowserSourceLanguage.AUTO) {
+                    statusText = "正在识别页面语言…"
+                }
+                val detected = pageLanguage ?: ensurePageLanguage(force = false, mode = "screenshot")
+                if (shouldSkipSameLanguage(detected, "screenshot")) return@launch
+                val sourceLanguage = resolveBrowserSource(detected, "screenshot")
+                Log.d(
+                    TAG,
+                    "shot_source lang=$sourceLanguage browser_source=$browserSourceLanguage " +
+                        "page_lang=${detected?.languageId ?: "none"}"
+                )
                 // 1) 先收起当前译文层（R1：一次只有一个来源）——顺带修掉「截图把已有译文一起
                 //    截进去、OCR 读到中文」的老限制；失败时 finally 会贴回。
                 val previousLayer = shownLayer
@@ -2257,7 +2581,8 @@ fun EmbeddedBrowserScreen(
                         } else {
                             BrowserRenderMode.FULL_PNG
                         },
-                        onPhase = { label -> mainHandler.post { if (screenshotBusy) statusText = label } }
+                        onPhase = { label -> mainHandler.post { if (screenshotBusy) statusText = label } },
+                        sourceLanguageOverride = sourceLanguage
                     )
                 }
                 ownedByPipeline = true
@@ -2330,6 +2655,251 @@ fun EmbeddedBrowserScreen(
         }
     }
 
+    /**
+     * Pixiv 阅读器页会话（2026-11-01）。
+     *
+     * 与截图链路并列，但**不截图**：阅读器自己把当前页/下一页画在 canvas 里，
+     * 我们按 `leftDrawnRect` 裁图后交给同一个 [WebtoonImageTranslator]。
+     *
+     * 生命周期复用 [session]：
+     * - `session.token` 一变，会话在下一轮 `isActive` 检查时自己退出（协作式，不 cancel）；
+     * - `running` 只表示「这个页会话还在跑」，球的 STOP / 原文译文切换沿用现有语义。
+     */
+    fun startPixivViewerSession(
+        initialProbe: PixivViewerProbe,
+        pageLanguage: PageLanguageDetector.Detected? = null,
+        sourceLanguage: String = appSettings.sourceLanguage
+    ) {
+        if (!domOverlay) {
+            Log.d(TAG, "pixiv_session_fallback reason=dom_overlay_off")
+            startScreenshotTranslation()
+            return
+        }
+        if (initialProbe.isDoublePage) {
+            Log.d(TAG, "pixiv_session_fallback reason=double_page")
+            startScreenshotTranslation()
+            return
+        }
+        if (screenshotBusy || reShowBusy) {
+            statusText = "正在处理上一张画面…"
+            return
+        }
+        // 上一轮还在收尾（OCR 可能还卡在 Paddle 里）：不要并发起第二个引擎会话。
+        if (session.job?.isActive == true) {
+            statusText = "上一轮还在收尾，稍等一下再点球"
+            Log.d(TAG, "pixiv_session_reject reason=previous_job_active")
+            return
+        }
+        // 上一次活翻译/截图留下的覆盖层先摘掉：页会话的锚点 id 不同，不摘会两层叠在一起。
+        val previousLayer = shownLayer
+        if (previousLayer != BrowserShownLayer.NONE) {
+            removeOverlayNodes()
+            shownLayer = BrowserShownLayer.NONE
+            Log.d(TAG, "pixiv_session_clear_previous layer=$previousLayer")
+        }
+
+        session.token += 1
+        val myToken = session.token
+        running = true
+        viewMode = BrowserViewMode.TRANSLATED
+        statusText = "Pixiv 预翻译中…（第 ${initialProbe.page + 1}/${initialProbe.total} 页）"
+        Log.d(
+            TAG,
+            "pixiv_session_start page=${initialProbe.page} total=${initialProbe.total} " +
+                "next=${initialProbe.hasNext} next_ready=${initialProbe.nextReady} " +
+                "canvas=${initialProbe.canvasWidth}x${initialProbe.canvasHeight} " +
+                "drawn=${initialProbe.drawnRect.width.roundToInt()}x" +
+                "${initialProbe.drawnRect.height.roundToInt()} " +
+                "browser_source=$browserSourceLanguage source=$sourceLanguage " +
+                "page_lang=${pageLanguage?.languageId ?: "none"}"
+        )
+
+        val host = object : PixivViewerSessionHost {
+            var loadingVisible = false
+
+            override fun isActive(): Boolean = session.token == myToken && running
+
+            override suspend fun probe(): PixivViewerProbe? =
+                withContext(mainThreadDispatcher) { PixivViewerSupport.probe(webView) }
+
+            override suspend fun captureCurrent(page: Int): PixivViewerFrame? =
+                withContext(mainThreadDispatcher) {
+                    PixivViewerSupport.captureCurrent(webView, expectedPage = page)
+                }
+
+            override suspend fun captureNext(page: Int): PixivViewerFrame? =
+                withContext(mainThreadDispatcher) {
+                    PixivViewerSupport.captureNext(webView, expectedPage = page)
+                }
+
+            override suspend fun translate(frame: PixivViewerFrame): BrowserSceneBuilder.Scene? {
+                val bitmap = frame.bitmap ?: return null
+                // 与截图链路同口径：句子表来源记当前站点。
+                TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
+                return withContext(Dispatchers.IO) {
+                    val outcome = translator.translateImage(
+                        bitmap,
+                        renderMode = BrowserRenderMode.DOM_SCENE,
+                        sourceLanguageOverride = sourceLanguage,
+                        onPhase = { label -> updateLoading(label) }
+                    )
+                    outcome.warningMessage?.let {
+                        Log.w(
+                            TAG,
+                            "pixiv_translate_warn page=${frame.page} msg=${it.take(80)}"
+                        )
+                    }
+                    outcome.scene
+                }
+            }
+
+            override suspend fun applyScene(
+                scene: BrowserSceneBuilder.Scene,
+                probe: PixivViewerProbe
+            ): Boolean {
+                // 用户可能在 JS 往返期间切到了「原文」：这时不要再把译文层贴回去。
+                if (viewMode != BrowserViewMode.TRANSLATED) return false
+                // 贴场景前先收 loading；否则新场景和 loading 卡片会叠在一起。
+                loadingVisible = false
+                webView.evaluateJavascript(hideLoadingJs(PIXIV_ANCHOR_ID), null)
+                if (!rendererInjected) {
+                    webView.evaluateJavascriptSuspend(
+                        OverlayRendererScript.load(context),
+                        what = "pixiv_renderer"
+                    )
+                    rendererInjected = true
+                }
+                val anchorJs = PixivViewerSupport.anchorJs(PIXIV_ANCHOR_ID, probe)
+                if (anchorJs == null) {
+                    Log.w(TAG, "pixiv_anchor_fail page=${probe.page} reason=bad_rect")
+                    return false
+                }
+                val anchor = decodeJsJsonResult(
+                    webView.evaluateJavascriptSuspend(anchorJs, what = "pixiv_anchor")
+                )
+                if (anchor?.optBoolean("ok") != true) {
+                    Log.w(
+                        TAG,
+                        "pixiv_anchor_fail page=${probe.page} " +
+                            "reason=${anchor?.optString("reason").orEmpty().ifBlank { "bad_result" }}"
+                    )
+                    return false
+                }
+                val result = decodeJsJsonResult(
+                    webView.evaluateJavascriptSuspend(
+                        applySceneJs(
+                            BrowserSceneBuilder.buildSceneJson(PIXIV_ANCHOR_ID, scene)
+                        ),
+                        what = "pixiv_scene"
+                    )
+                )
+                if (result?.optBoolean("ok") != true) {
+                    Log.w(
+                        TAG,
+                        "pixiv_scene_fail page=${probe.page} " +
+                            "reason=${result?.optString("reason").orEmpty().ifBlank { "bad_result" }}"
+                    )
+                    return false
+                }
+                if (viewMode != BrowserViewMode.TRANSLATED) {
+                    webView.evaluateJavascript(
+                        PixivViewerSupport.removeSceneJs(PIXIV_ANCHOR_ID),
+                        null
+                    )
+                    return false
+                }
+                webView.evaluateJavascript(PixivViewerSupport.noTouchJs(PIXIV_ANCHOR_ID), null)
+                viewMode = BrowserViewMode.TRANSLATED
+                shownLayer = BrowserShownLayer.LIVE
+                Log.d(
+                    TAG,
+                    "pixiv_scene_show page=${probe.page} bubbles=${scene.bubbles.size} " +
+                        "anchor=${anchor?.optString("host").orEmpty()}"
+                )
+                return true
+            }
+
+            override suspend fun removeScene() {
+                webView.evaluateJavascript(
+                    PixivViewerSupport.removeSceneJs(PIXIV_ANCHOR_ID),
+                    null
+                )
+                if (shownLayer == BrowserShownLayer.LIVE) {
+                    shownLayer = BrowserShownLayer.NONE
+                }
+                Log.d(TAG, "pixiv_scene_remove")
+            }
+
+            override suspend fun showLoading(probe: PixivViewerProbe, label: String) {
+                if (!rendererInjected) {
+                    webView.evaluateJavascriptSuspend(
+                        OverlayRendererScript.load(context),
+                        what = "pixiv_loading_renderer"
+                    )
+                    rendererInjected = true
+                }
+                val anchorJs = PixivViewerSupport.anchorJs(PIXIV_ANCHOR_ID, probe)
+                if (anchorJs == null) {
+                    Log.w(TAG, "pixiv_loading_anchor_fail page=${probe.page} reason=bad_rect")
+                    return
+                }
+                webView.evaluateJavascriptSuspend(anchorJs, what = "pixiv_loading_anchor")
+                loadingVisible = true
+                webView.evaluateJavascript(showLoadingJs(PIXIV_ANCHOR_ID, label), null)
+                Log.d(TAG, "pixiv_loading_show page=${probe.page} label=$label")
+            }
+
+            override suspend fun hideLoading() {
+                loadingVisible = false
+                webView.evaluateJavascript(hideLoadingJs(PIXIV_ANCHOR_ID), null)
+            }
+
+            override fun updateLoading(label: String) {
+                // 管线阶段回调在 IO 线程：先回主线程，且只在 loading 还在屏上时更新，
+                // 避免「已贴好译文后，一个迟到的阶段回调又把 loading 卡片建回来」。
+                mainHandler.post {
+                    if (loadingVisible && viewMode == BrowserViewMode.TRANSLATED) {
+                        webView.evaluateJavascript(
+                            showLoadingJs(PIXIV_ANCHOR_ID, label),
+                            null
+                        )
+                    }
+                }
+            }
+
+            override fun isViewVisible(): Boolean = viewMode == BrowserViewMode.TRANSLATED
+
+            override fun status(text: String) {
+                statusText = text
+            }
+        }
+
+        val job = sessionScope.launch {
+            try {
+                PixivViewerSession(host).run()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (err: Throwable) {
+                Log.w(
+                    TAG,
+                    "pixiv_session_fail ${err.javaClass.simpleName}: ${err.message?.take(120)}"
+                )
+                if (session.token == myToken) {
+                    running = false
+                    statusText = "Pixiv 预翻译中断 · 可改用截图翻译"
+                }
+            } finally {
+                runCatching { host.hideLoading() }
+                if (session.token == myToken) {
+                    running = false
+                    Log.d(TAG, "pixiv_session_end page=${initialProbe.page}")
+                }
+            }
+        }
+        session.job = job
+        job.invokeOnCompletion { if (session.job === job) session.job = null }
+    }
+
     // 悬浮球与「原文｜译文」开关共用的控件状态（纯函数，成本可忽略；提升到
     // when(browserPage) 之前是因为悬浮球在网页态 Box 里也要用同一份判定）。
     // 声明必须在 onPrimaryAction 之前：Kotlin 局部函数看不到自己后面才声明的变量
@@ -2378,6 +2948,8 @@ fun EmbeddedBrowserScreen(
 
             BrowserPrimaryAction.STOP -> {
                 stopSession(if (placedIds.isNotEmpty()) "已停止 · 译文保留" else "已停止")
+                // 停止是协作式的，OCR 可能还要几秒才退出；先把 Pixiv loading 卡收掉。
+                webView.evaluateJavascript(hideLoadingJs(PIXIV_ANCHOR_ID), null)
                 Log.d(TAG, "ball_tap action=stop")
             }
 
@@ -2386,19 +2958,43 @@ fun EmbeddedBrowserScreen(
                 viewMode = BrowserViewMode.TRANSLATED
                 Log.d(TAG, "ball_tap action=start shown=$shownLayer")
                 scope.launch {
-                    // P2：直接用网页声明语言；图片一般跟随网页语言，不再为语言判定跑 OCR。
-                    val pageLanguage = webView.readPageLanguage()
-                    if (pageLanguage?.id == appSettings.targetLanguage) {
-                        statusText = "页面语言与目标语言相同，无需翻译"
-                        Log.d(
-                            TAG,
-                            "page_same_lang mode=image lang=${pageLanguage.id} " +
-                                "source=${pageLanguage.source} target=${appSettings.targetLanguage}"
-                        )
+                    if (autoDetectBusy) {
+                        statusText = "正在识别页面语言…"
                         return@launch
                     }
-                    // Pixiv comic-store-viewer 等 canvas 阅读器：页图无法导出像素，
-                    // 自动改走 WebView 截图链路（当前视口一页一页翻）。
+                    autoDetectBusy = true
+                    val detected = try {
+                        if (browserSourceLanguage == BrowserSourceLanguage.AUTO) {
+                            statusText = "正在识别页面语言…"
+                        }
+                        ensurePageLanguage(force = true, mode = "image")
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (err: Throwable) {
+                        Log.w(TAG, "page_language_action_fail ${err.javaClass.simpleName}: ${err.message}")
+                        null
+                    } finally {
+                        autoDetectBusy = false
+                    }
+                    if (shouldSkipSameLanguage(detected, "image")) return@launch
+                    // auto 使用页面语言；手动语言直接使用；检测失败回退首页源语言。
+                    val sourceLanguage = resolveBrowserSource(detected, "image")
+                    // Pixiv comic-store-viewer：阅读器自己有当前页/下一页 canvas 缓冲，
+                    // 优先走页会话（不截图、下一页提前翻译）。probe 失败再回退截图。
+                    if (PixivViewerSupport.isViewerUrl(webView.url)) {
+                        statusText = "读取 Pixiv 阅读器…"
+                        val pixivProbe = PixivViewerSupport.probe(webView)
+                        if (pixivProbe != null) {
+                            startPixivViewerSession(
+                                initialProbe = pixivProbe,
+                                pageLanguage = detected,
+                                sourceLanguage = sourceLanguage
+                            )
+                            return@launch
+                        }
+                        Log.w(TAG, "pixiv_probe fallback reason=null")
+                    }
+                    // 其他 canvas 阅读器：页图无法导出像素，自动改走 WebView 截图链路。
                     val profile = webView.currentPageProfile()
                     if (profile != null &&
                         shouldUseCanvasScreenshot(profile.canvases, profile.images)
@@ -2407,11 +3003,12 @@ fun EmbeddedBrowserScreen(
                         Log.d(
                             TAG,
                             "canvas_page_fallback canvases=${profile.canvases} " +
-                                "images=${profile.images} lang=${pageLanguage?.id ?: "auto"}"
+                                "images=${profile.images} lang=$sourceLanguage " +
+                                "auto=${browserSourceLanguage == BrowserSourceLanguage.AUTO}"
                         )
-                        startScreenshotTranslation()
+                        startScreenshotTranslation(detected)
                     } else {
-                        startSession()
+                        startSession(pageLanguage = detected, sourceLanguage = sourceLanguage)
                     }
                 }
             }
@@ -2681,18 +3278,20 @@ fun EmbeddedBrowserScreen(
                         )
                     }
                 }
-                // 翻译悬浮球（2026-10-12 用户要求「翻译按钮变成悬浮球，好按一点」）：
-                // 单击 = 翻译/停止/恢复原文（三态由 [BrowserTranslateUiPolicy.resolve] 判定）；
-                // 长按或点 ⋮ 胶囊 = 截图翻译 + 原文/译文菜单。只盖在网页内容区上。
-                BrowserTranslateFloatingBall(
-                    running = running,
-                    busy = controls.primaryBusy,
-                    enabled = controls.primaryEnabled,
-                    action = controls.primaryAction,
+                // 翻译悬浮组（2026-11-01 用户要求「网页文字球和漫画球放一块」）：
+                // 上球 = 网页文字（点一下翻译/恢复 DOM 文本），下球 = 漫画（单击 = 翻译/停止/恢复原文，
+                // 三态由 [BrowserTranslateUiPolicy.resolve] 判定）；整组拖动、吸附，只存一份位置。
+                // 长按任一球或点 ⋮ 胶囊 = 合并菜单（截图翻译 + 原文/译文 + 网页文字翻译）。
+                BrowserFloatingBallGroup(
+                    comicAction = controls.primaryAction,
+                    comicBusy = controls.primaryBusy,
                     pageUrl = pageUrl,
                     viewMode = viewMode,
                     modeToggleEnabled = controls.modeToggleEnabled,
                     modeToggleDisabledReason = controls.modeToggleDisabledReason,
+                    webpageTextBusy = webpageTextBusy,
+                    webpageTextApplied = webpageTextApplied,
+                    savedPosition = savedBallPosition,
                     onPrimaryTap = { onPrimaryAction() },
                     onSelectViewMode = { target ->
                         when (target) {
@@ -2701,35 +3300,33 @@ fun EmbeddedBrowserScreen(
                         }
                     },
                     onScreenshotTranslate = { startScreenshotTranslation() },
-                    savedPosition = savedBallPosition,
+                    onWebpageTextTap = {
+                        if (webpageTextApplied) restoreWebpageText()
+                        else startWebpageTextTranslation()
+                    },
                     onPositionChanged = { xRatio, yRatio ->
                         settingsRepository.setBrowserFloatingBallPosition(xRatio, yRatio)
                     }
                 )
-                // 网页文字翻译悬浮球：默认不显示，用户开启后出现在左侧，点一下翻译/还原 DOM 文本。
-                if (hasPage && webpageTextBallEnabled) {
-                    BrowserWebpageTextBall(
-                        busy = webpageTextBusy,
-                        applied = webpageTextApplied,
-                        savedPosition = savedTextBallPosition,
-                        onPositionChanged = { xRatio, yRatio ->
-                            settingsRepository.setBrowserWebpageTextBallPosition(xRatio, yRatio)
-                        },
-                        onTap = {
-                            if (webpageTextApplied) restoreWebpageText()
-                            else startWebpageTextTranslation()
-                        }
-                    )
-                }
             }
 
-            // 底栏：单行 48dp（2026-10-12 第三轮，画布 `11:220` 定稿）。
-            //
-            // 只留网页导航（后退/前进/刷新）+ 状态文字：
-            // - 「翻译/停止」主按钮 → 网页上的**悬浮球**（原按钮在底栏角落，长漫画阅读时够不着）；
-            // - 「原文｜译文」分段开关 → 移到悬浮球的 ⋮ 菜单里（底栏再放一份只会让
-            //   「哪个才是权威入口」继续含糊，2026-10-02 的老问题）。
+            // 底栏两行（2026-11-01 用户定稿）：
+            // 1) 源语言 / 交换 / 译文语言 —— 网页里默认自动检测，底部直接实时切换；
+            // 2) 网页导航（后退/前进/刷新）+ 状态文字。
+            // 「翻译/停止」主按钮仍然是网页上的悬浮球（底栏不放重复入口）。
             Column(modifier = Modifier.background(MtColors.Surface)) {
+                HorizontalDivider(color = MtColors.Border)
+                val (bottomSourceTitle, bottomSourceSubtitle) = browserBottomSourceDisplay()
+                BrowserBottomLanguageBar(
+                    sourceTitle = bottomSourceTitle,
+                    sourceSubtitle = bottomSourceSubtitle,
+                    targetTitle = AppLanguage.fromId(appSettings.targetLanguage).label,
+                    sourceOptions = browserSourceOptions(),
+                    targetOptions = AppLanguage.entries,
+                    onPickSource = { pickBrowserSourceLanguage(it) },
+                    onPickTarget = { pickBrowserTargetLanguage(it) },
+                    onSwap = { swapBrowserLanguages() }
+                )
                 HorizontalDivider(color = MtColors.Border)
                 Row(
                     modifier = Modifier
@@ -2820,26 +3417,6 @@ fun EmbeddedBrowserScreen(
     // 放在这一层而不是 `when(browserPage)` 里面，是为了让它在任何页面态都能盖上来。
     if (settingsSheetOpen) {
         BrowserSettingsSheet(
-            sourceLanguage = AppLanguage.fromId(appSettings.sourceLanguage),
-            targetLanguage = AppLanguage.fromId(appSettings.targetLanguage),
-            onSetSourceLanguage = { language ->
-                updateSettings { it.copy(sourceLanguage = language.id) }
-                invalidateRenderedResults("已切换源语言")
-            },
-            onSetTargetLanguage = { language ->
-                updateSettings { it.copy(targetLanguage = language.id) }
-                invalidateRenderedResults("已切换目标语言")
-            },
-            onSwapLanguages = {
-                // 直接对调两个字段，不要走两次 copy：中间态会让「源=目标」短暂成立。
-                updateSettings {
-                    it.copy(
-                        sourceLanguage = it.targetLanguage,
-                        targetLanguage = it.sourceLanguage
-                    )
-                }
-                invalidateRenderedResults("已交换语言")
-            },
             adapter = matchedAdapter,
             rulesActive = siteRulesActive(matchedAdapter),
             inpaintClean = inpaintClean,
@@ -2849,8 +3426,8 @@ fun EmbeddedBrowserScreen(
                 // 已贴的成图是旧设置渲染的：全部丢掉，下次「翻译」按新设置重画。
                 clearRenderedOverlays()
                 stopSession(
-                    if (enabled) "已开启精细擦字（整页 inpaint），点「翻译」重新翻译"
-                    else "已关闭精细擦字（逐块快速贴背景），点「翻译」重新翻译"
+                    if (enabled) "已开启精细擦字（整页 inpaint），点「译」球重新翻译"
+                    else "已关闭精细擦字（逐块快速贴背景），点「译」球重新翻译"
                 )
                 Log.d(TAG, "inpaint_clean_set enabled=$enabled")
             },
@@ -2861,19 +3438,13 @@ fun EmbeddedBrowserScreen(
                 // 旧结果是旧模式渲染的：全部丢掉，下次「翻译」按新模式重画。
                 clearRenderedOverlays()
                 stopSession(
-                    if (enabled) "已开启覆盖层渲染，点「翻译」重新翻译"
-                    else "已切换整图替换，点「翻译」重新翻译"
+                    if (enabled) "已开启覆盖层渲染，点「译」球重新翻译"
+                    else "已切换整图替换，点「译」球重新翻译"
                 )
                 Log.d(TAG, "dom_overlay_set enabled=$enabled")
             },
             webpageTextBusy = webpageTextBusy,
             webpageTextApplied = webpageTextApplied,
-            webpageTextBallEnabled = webpageTextBallEnabled,
-            onWebpageTextBallChange = { enabled ->
-                webpageTextBallEnabled = enabled
-                settingsRepository.setBrowserWebpageTextBallEnabled(enabled)
-                Log.d(TAG, "webpage_text_ball_set enabled=$enabled")
-            },
             onTranslatePageText = {
                 settingsSheetOpen = false
                 startWebpageTextTranslation()
@@ -2988,6 +3559,8 @@ private suspend fun runTranslationSession(
     placedIds: HashSet<String>,
     seamBySrc: LinkedHashMap<String, PendingSeam>,
     useDomOverlay: Boolean,
+    /** 浏览器实际源语言（auto 已解析成具体语言）：OCR/翻译必须用它。 */
+    sourceLanguage: String,
     rendererScript: String,
     ensureRenderer: suspend () -> Unit,
     isViewVisible: () -> Boolean,
@@ -3532,7 +4105,7 @@ private suspend fun runTranslationSession(
             // 阅读器滚动时用 pushState 把阅读位置写进地址（`?cut=N` / `#cut-N`），文档没换 ——
             // 字符串比较会在用户每次滚动后命中，整段会话被误判为「页面已跳转」而终止。
             if (!BrowserUrlResolver.isSameDocument(webView.url, sessionPageUrl)) {
-                reportStatus("页面已跳转，点「翻译」继续")
+                reportStatus("页面已跳转，点「译」球继续")
                 return
             }
             val scan = parseScannedImages(webView.evaluateJavascriptSuspend(BrowserScanScript.SCAN_JS, what = "scan"))
@@ -3911,7 +4484,9 @@ private suspend fun runTranslationSession(
                             allowIncomingMerge = seamBySrc.values.none { it.nextSrc == image.src },
                             // 阶段回调可能在 IO 线程上（擦字与翻译请求并发）：WebView 线程受限，
                             // 必须 post 回主线程再下发文案（`mainHandler` 见文件末尾说明）。
-                            onPhase = { label -> mainHandler.post { setLoadingLabel(label) } }
+                            onPhase = { label -> mainHandler.post { setLoadingLabel(label) } },
+                            // 网页 auto 解析出的具体源语言：不能在子线程再读一遍页面。
+                            sourceLanguageOverride = sourceLanguage
                         )
 
                     // 重跑要用的移交贴片副本：`translateImage` 会回收传进去的贴片位图，
@@ -4205,8 +4780,8 @@ private suspend fun runTranslationSession(
 // 「浏览器与翻译」底部弹层（画布 `10:133`，整屏稿 `10:1`；2026-10-12）
 // ---------------------------------------------------------------------------
 
-/** 弹层里能展开下拉的四个位置。用枚举而不是四个布尔量：同一时刻只允许开一个。 */
-private enum class BrowserSheetPicker { SOURCE_LANGUAGE, TARGET_LANGUAGE, PROFILE, OCR_ENGINE }
+/** 弹层里能展开下拉的位置。用枚举而不是多个布尔量：同一时刻只允许开一个。 */
+private enum class BrowserSheetPicker { PROFILE, OCR_ENGINE }
 
 /**
  * 下拉项 / 值行用的短名。
@@ -4217,11 +4792,167 @@ private enum class BrowserSheetPicker { SOURCE_LANGUAGE, TARGET_LANGUAGE, PROFIL
  */
 private fun TranslateEngine.sheetLabel(): String = label.substringBefore("（").trim()
 
+/** 底栏语言下拉的一项；auto 不是 [AppLanguage] 成员，所以用字符串 id 承载。 */
+private data class BrowserLanguageOption(val id: String, val label: String)
+
+private enum class BrowserBottomPicker { SOURCE, TARGET }
+
+/** 源语言候选：自动检测 + 五个具体语言；首页不出现 auto。 */
+private fun browserSourceOptions(): List<BrowserLanguageOption> = buildList {
+    add(BrowserLanguageOption(BrowserSourceLanguage.AUTO, "自动检测（按页面语言）"))
+    AppLanguage.entries.forEach { add(BrowserLanguageOption(it.id, it.label)) }
+}
+
+/**
+ * 浏览器底栏第一行：源语言 / 交换 / 译文语言（2026-11-01 用户定稿）。
+ *
+ * 与设置弹层里的旧语言对不同：这一行常驻、可实时切换；网页源语言用浏览器 pref，
+ * 译文语言仍写全局 `AppSettings.targetLanguage`（与首页共用）。
+ */
+@Composable
+private fun BrowserBottomLanguageBar(
+    sourceTitle: String,
+    sourceSubtitle: String?,
+    targetTitle: String,
+    sourceOptions: List<BrowserLanguageOption>,
+    targetOptions: List<AppLanguage>,
+    onPickSource: (String) -> Unit,
+    onPickTarget: (AppLanguage) -> Unit,
+    onSwap: () -> Unit
+) {
+    var picker by remember { mutableStateOf<BrowserBottomPicker?>(null) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(52.dp)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        BrowserBottomLanguageBox(
+            title = sourceTitle,
+            subtitle = sourceSubtitle,
+            modifier = Modifier.weight(1f),
+            expanded = picker == BrowserBottomPicker.SOURCE,
+            onToggle = {
+                picker = if (picker == BrowserBottomPicker.SOURCE) null else BrowserBottomPicker.SOURCE
+            },
+            onDismiss = { picker = null },
+            options = sourceOptions.map { option ->
+                option.label to {
+                    picker = null
+                    onPickSource(option.id)
+                }
+            }
+        )
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .background(MtColors.BrandTint)
+                .clickable(onClick = onSwap)
+                .semantics { contentDescription = "交换源语言与目标语言" },
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = MtSwapIcon,
+                contentDescription = null,
+                tint = MtColors.BrandInk,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        BrowserBottomLanguageBox(
+            title = targetTitle,
+            subtitle = null,
+            modifier = Modifier.weight(1f),
+            expanded = picker == BrowserBottomPicker.TARGET,
+            onToggle = {
+                picker = if (picker == BrowserBottomPicker.TARGET) null else BrowserBottomPicker.TARGET
+            },
+            onDismiss = { picker = null },
+            options = targetOptions.map { language ->
+                language.label to {
+                    picker = null
+                    onPickTarget(language)
+                }
+            }
+        )
+    }
+}
+
+/** 底栏语言框：40dp 高，auto 时标题下加一行小字（自动检测 / 识别中 / 无法判断）。 */
+@Composable
+private fun BrowserBottomLanguageBox(
+    title: String,
+    subtitle: String?,
+    modifier: Modifier = Modifier,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onDismiss: () -> Unit,
+    options: List<Pair<String, () -> Unit>>
+) {
+    var anchorWidth by remember { mutableStateOf(0) }
+    Box(
+        modifier = modifier.onGloballyPositioned { anchorWidth = it.size.width }
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(40.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(MtColors.SurfaceMuted)
+                .clickable(onClick = onToggle)
+                .padding(start = 12.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = title,
+                    fontSize = if (subtitle == null) 14.sp else 13.sp,
+                    color = MtColors.TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        fontSize = 9.sp,
+                        color = MtColors.TextTertiary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            Icon(
+                imageVector = MtChevronDownIcon,
+                contentDescription = null,
+                tint = MtColors.TextSecondary,
+                modifier = Modifier.size(14.dp)
+            )
+        }
+        MtDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = onDismiss,
+            anchorWidthPx = anchorWidth
+        ) {
+            options.forEach { (label, onClick) ->
+                MtDropdownItem(text = label) {
+                    onDismiss()
+                    onClick()
+                }
+            }
+        }
+    }
+}
+
 /**
  * 浏览器与翻译设置（画布 `10:133`）—— 网页态右上角齿轮点开的就是它。
  *
- * 顺序与设计稿一致：语言对 → 站点适配（只读）→ 精细擦字 → 覆盖层渲染 →
- * 翻译配置 → 识别引擎。
+ * 顺序：站点适配（只读）→ 精细擦字 → 覆盖层渲染 → 翻译配置 → 识别引擎。
+ * 语言对已移到浏览器底栏常驻（2026-11-01 用户定稿），弹层里不再重复。
  *
  * 这里**全是设置**，一条操作都不留：2026-10-12 把最后一条操作「收藏当前页」
  * 挪到了顶栏的收藏星（见 `BrowserPage.WEB` 的顶栏），所以现在不存在
@@ -4234,11 +4965,6 @@ private fun TranslateEngine.sheetLabel(): String = label.substringBefore("（").
  */
 @Composable
 private fun BrowserSettingsSheet(
-    sourceLanguage: AppLanguage,
-    targetLanguage: AppLanguage,
-    onSetSourceLanguage: (AppLanguage) -> Unit,
-    onSetTargetLanguage: (AppLanguage) -> Unit,
-    onSwapLanguages: () -> Unit,
     adapter: BrowserSiteAdapter,
     rulesActive: Boolean,
     inpaintClean: Boolean,
@@ -4247,8 +4973,6 @@ private fun BrowserSettingsSheet(
     onDomOverlayChange: (Boolean) -> Unit,
     webpageTextBusy: Boolean,
     webpageTextApplied: Boolean,
-    webpageTextBallEnabled: Boolean,
-    onWebpageTextBallChange: (Boolean) -> Unit,
     onTranslatePageText: () -> Unit,
     onRestorePageText: () -> Unit,
     translateProfile: String,
@@ -4340,75 +5064,6 @@ private fun BrowserSettingsSheet(
                     )
                 }
 
-                // 语言对：两个 Filled 框（128×44）+ 中间 40 圆底交换键，整组居中（画布 `23:35`）
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.width(320.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(text = "源语言", fontSize = 13.sp, color = MtColors.TextSecondary)
-                        Text(text = "目标语言", fontSize = 13.sp, color = MtColors.TextSecondary)
-                    }
-                    Row(
-                        modifier = Modifier.width(320.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        BrowserSheetLanguageBox(
-                            label = sourceLanguage.label,
-                            expanded = picker == BrowserSheetPicker.SOURCE_LANGUAGE,
-                            onToggle = {
-                                picker = if (picker == BrowserSheetPicker.SOURCE_LANGUAGE) {
-                                    null
-                                } else {
-                                    BrowserSheetPicker.SOURCE_LANGUAGE
-                                }
-                            },
-                            onDismiss = { picker = null },
-                            onPick = {
-                                onSetSourceLanguage(it)
-                                picker = null
-                            }
-                        )
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(CircleShape)
-                                .background(MtColors.BrandTint)
-                                .clickable(onClick = onSwapLanguages)
-                                .semantics { contentDescription = "交换源语言与目标语言" },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = MtSwapIcon,
-                                contentDescription = null,
-                                tint = MtColors.BrandInk,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        BrowserSheetLanguageBox(
-                            label = targetLanguage.label,
-                            expanded = picker == BrowserSheetPicker.TARGET_LANGUAGE,
-                            onToggle = {
-                                picker = if (picker == BrowserSheetPicker.TARGET_LANGUAGE) {
-                                    null
-                                } else {
-                                    BrowserSheetPicker.TARGET_LANGUAGE
-                                }
-                            },
-                            onDismiss = { picker = null },
-                            onPick = {
-                                onSetTargetLanguage(it)
-                                picker = null
-                            }
-                        )
-                    }
-                }
-
                 // 网页文字翻译（2026-10-14 定稿为 Tonal 按钮）：只翻 DOM 文本节点，与漫画图链路互不干扰。
                 // 放在设置分隔线之上（画布 32:55）——它是一个动作，不是设置项，不该和开关挤在一起。
                 MtTonalButton(
@@ -4424,19 +5079,8 @@ private fun BrowserSettingsSheet(
                     fontSize = 15
                 )
 
-                // 网页文字翻译悬浮球：默认关闭，用户自己选择是否常驻。
-                // 开启后不用每次进设置找这个按钮，页面上直接点「文」球。
-                BrowserSheetSwitchRow(
-                    title = "网页文字悬浮球",
-                    subtitle = if (webpageTextBallEnabled) {
-                        "页面左侧显示「文」球，点一下翻译/还原"
-                    } else {
-                        "开启后不用进设置找「网页文字翻译」"
-                    },
-                    checked = webpageTextBallEnabled,
-                    onCheckedChange = onWebpageTextBallChange
-                )
-
+                // 网页文字翻译悬浮球：常驻在翻译组里（2026-11-01 用户定稿），
+                // 不再需要单独的启用开关；这里保留按钮作为设置页里的显式入口。
                 HorizontalDivider(color = MtColors.Border)
 
                 // 站点适配：只读 + 绿对勾。**不给开关**（2026-10-12 用户定：默认开启，用户不自己关）。
@@ -4650,61 +5294,6 @@ private fun BrowserSheetValueRow(
                         action()
                     }
                 )
-            }
-        }
-    }
-}
-
-/** 语言框：128×44 / r12 / Filled 底 / 右侧 chevron（画布 `11:360` / `11:371`）。 */
-@Composable
-private fun BrowserSheetLanguageBox(
-    label: String,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-    onDismiss: () -> Unit,
-    onPick: (AppLanguage) -> Unit
-) {
-    var anchorWidth by remember { mutableStateOf(0) }
-    Box(
-        modifier = Modifier
-            .width(128.dp)
-            .onGloballyPositioned { anchorWidth = it.size.width }
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(44.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(MtColors.SurfaceMuted)
-                .clickable(onClick = onToggle)
-                .padding(start = 16.dp, end = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = label,
-                fontSize = 15.sp,
-                color = MtColors.TextPrimary,
-                modifier = Modifier.weight(1f),
-                maxLines = 1
-            )
-            Icon(
-                imageVector = MtChevronDownIcon,
-                contentDescription = null,
-                tint = MtColors.TextSecondary,
-                modifier = Modifier.size(16.dp)
-            )
-        }
-        MtDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = onDismiss,
-            anchorWidthPx = anchorWidth
-        ) {
-            AppLanguage.entries.forEach { language ->
-                MtDropdownItem(text = language.label) {
-                    // 同值行：先收菜单，再改语言。
-                    onDismiss()
-                    onPick(language)
-                }
             }
         }
     }
@@ -5396,618 +5985,6 @@ private fun BrowserHistoryRow(
     }
 }
 
-/**
- * 内嵌浏览器翻译悬浮球（2026-10-12 用户要求「翻译按钮变成悬浮球，好按一点」）。
- *
- * 手势表（与常见「小白点」一致，无需学习成本）：
- * - **单击球** = 三态动作（由 [BrowserTranslateUiPolicy.resolve] 判定，文案与图标跟着变）：
- *   开始翻译（蓝底「译」）/ 停止翻译（红底白方块）/ **恢复原文**（蓝底 ✕，截图覆盖层在屏时，
- *   对齐首页那条链路的交互）；
- * - **单击球上的 ⋮ 胶囊** = 展开 / 收起菜单；
- * - **长按球** = 展开菜单（老手势保留）；
- * - **拖动球** = 移动位置，松手吸附到左/右边缘（纵向保持拖到的高度）。
- *
- * 收起的三种方式：点 ⋮ 胶囊 / 点球 / 点菜单外的空白（透明 scrim）。
- *
- * 三个用户诉求的落点：
- * 1. 翻译与停止 → 单击悬浮球；
- * 2. 原文/译文切换 → ⋮ 菜单（与 [BrowserTranslateUiPolicy] 同一份状态，两处永远一致）；
- * 3. 截图翻译快捷方式 → ⋮ 菜单：只截 WebView 自己的视口（`webView.draw`），
- *    免 MediaProjection / 悬浮窗授权（[onScreenshotTranslate]，2026-10-12 由首页授权链路改来）。
- *
- * 2026-10-16 重设计：删掉 `reShowBusy` 一个参数的"半禁用"写法，改成明确的
- * `enabled` / `busy` / `action` 三件套 —— 截图翻译与一次性贴回期间球呈忙碌态且不响应，
- * 用户点它时会看到状态行给出原因，而不是静默无事发生。
- *
- * 几何规则（夹紧 / 吸附 / 菜单朝向）全部在 [BrowserFloatingBallPolicy]（纯函数 + 单测），
- * 本组件只负责手势与绘制。菜单展开时有一层透明 scrim：点空白收起，也防止误触网页。
- */
-@Composable
-private fun BrowserTranslateFloatingBall(
-    running: Boolean,
-    busy: Boolean,
-    enabled: Boolean,
-    action: BrowserPrimaryAction?,
-    pageUrl: String,
-    viewMode: BrowserViewMode,
-    modeToggleEnabled: Boolean,
-    modeToggleDisabledReason: String?,
-    onPrimaryTap: () -> Unit,
-    onSelectViewMode: (BrowserViewMode) -> Unit,
-    onScreenshotTranslate: () -> Unit,
-    savedPosition: BrowserFloatingBallPosition?,
-    onPositionChanged: (Float, Float) -> Unit
-) {
-    val context = LocalContext.current
-    val density = LocalDensity.current
-    val containerSize = remember { mutableStateOf(IntSize.Zero) }
-    // 拖动中的原始位置；null = 还没初始化（等容器量出尺寸后按策略给默认点）。
-    var rawOffset by remember { mutableStateOf<Offset?>(null) }
-    var dragging by remember { mutableStateOf(false) }
-    var expanded by remember { mutableStateOf(false) }
-    // ⚠️ `pointerInput(Unit)` 里的手势 lambda **只在首次组合时创建**：直接读 `running` /
-    // `busy` / `onPrimaryTap` 会永远停在那一刻的值（实测：点「停止」时日志里 running 仍是
-    // false）。用 rememberUpdatedState 让回调读到最新状态 —— 这是「点不动」类问题的排查线索之一。
-    val latestRunning by rememberUpdatedState(running)
-    val latestBusy by rememberUpdatedState(busy)
-    val latestAction by rememberUpdatedState(action)
-    val latestExpanded by rememberUpdatedState(expanded)
-    val latestPrimaryTap by rememberUpdatedState(onPrimaryTap)
-    // 页面跳转后菜单里的「原文/译文」已与新页无关（onPageStarted 也会停会话）：收起。
-    LaunchedEffect(pageUrl) { expanded = false }
-
-    val ballSizePx = with(density) { BrowserFloatingBallPolicy.SIZE_DP.dp.toPx() }
-    val dockMarginPx = with(density) { BrowserFloatingBallPolicy.DOCK_MARGIN_DP.dp.toPx() }
-    val bottomMarginPx =
-        with(density) { BrowserFloatingBallPolicy.DEFAULT_BOTTOM_MARGIN_DP.dp.toPx() }
-    val menuGapPx = with(density) { BrowserFloatingBallPolicy.MENU_GAP_DP.dp.toPx() }
-    val menuWidth = BrowserFloatingBallPolicy.MENU_WIDTH_DP.dp
-    val menuWidthPx = with(density) { menuWidth.toPx() }
-    val menuHeightPx = with(density) { BrowserFloatingBallPolicy.MENU_HEIGHT_DP.dp.toPx() }
-    val capsuleWidth = BrowserFloatingBallPolicy.CAPSULE_WIDTH_DP.dp
-    val capsuleHeight = BrowserFloatingBallPolicy.CAPSULE_HEIGHT_DP.dp
-    val capsuleWidthPx = with(density) { capsuleWidth.toPx() }
-    val capsuleHeightPx = with(density) { capsuleHeight.toPx() }
-    val capsuleGapPx = with(density) { BrowserFloatingBallPolicy.CAPSULE_GAP_DP.dp.toPx() }
-
-    // pointerInput(Unit) 的手势 lambda 只创建一次：用它读取「最新的」尺寸/回调和位置，
-    // 避免密度或容器变化后保存到旧尺寸（与上面 running/busy 的 rememberUpdatedState 同一原因）。
-    val latestBallSizePx by rememberUpdatedState(ballSizePx)
-    val latestDockMarginPx by rememberUpdatedState(dockMarginPx)
-    val latestOnPositionChanged by rememberUpdatedState(onPositionChanged)
-
-    /**
-     * 拖动结束时落盘。
-     *
-     * 保存「松手后会吸附到的那一侧」而不是手指离开时的原始 x：下次进来球直接出现在边缘，
-     * 不会先停在页面中间再滑过去；纵向保存用户拖到的比例。容器尺寸无效时不覆盖旧值。
-     */
-    fun persistBallPosition() {
-        val current = rawOffset ?: return
-        val size = containerSize.value
-        if (size.width <= 0 || size.height <= 0) return
-        val width = size.width.toFloat()
-        val height = size.height.toFloat()
-        val dockedX = BrowserFloatingBallPolicy.dockX(
-            current.x, latestBallSizePx, width, latestDockMarginPx
-        )
-        val ratio = BrowserFloatingBallPolicy.encodePosition(
-            Offset(dockedX, current.y), latestBallSizePx, width, height
-        ) ?: return
-        latestOnPositionChanged(ratio.x, ratio.y)
-        Log.d(
-            TAG,
-            "ball_position_save x=${ratio.x} y=${ratio.y} " +
-                "rawX=${current.x} rawY=${current.y} container=${size.width}x${size.height}"
-        )
-    }
-
-    Box(modifier = Modifier.fillMaxSize().onSizeChanged { containerSize.value = it }) {
-        // 首次布局：优先恢复上次位置；没有记录才给默认停靠点（右边缘、贴内容区底）。
-        LaunchedEffect(containerSize.value, savedPosition) {
-            if (rawOffset == null && containerSize.value.width > 0 && containerSize.value.height > 0) {
-                val width = containerSize.value.width.toFloat()
-                val height = containerSize.value.height.toFloat()
-                rawOffset = savedPosition?.let { saved ->
-                    BrowserFloatingBallPolicy.decodePosition(
-                        ratio = Offset(saved.xRatio, saved.yRatio),
-                        sizePx = ballSizePx,
-                        containerWidthPx = width,
-                        containerHeightPx = height
-                    )
-                } ?: BrowserFloatingBallPolicy.defaultPosition(
-                    width,
-                    height,
-                    ballSizePx,
-                    dockMarginPx,
-                    bottomMarginPx
-                )
-                Log.d(
-                    TAG,
-                    "ball_position_restore saved=${savedPosition != null} " +
-                        "x=${rawOffset?.x} y=${rawOffset?.y} " +
-                        "container=${containerSize.value.width}x${containerSize.value.height}"
-                )
-            }
-        }
-        val raw = rawOffset ?: return@Box
-        val clamped = BrowserFloatingBallPolicy.clamp(
-            raw,
-            ballSizePx,
-            containerSize.value.width.toFloat(),
-            containerSize.value.height.toFloat()
-        )
-        val dockedRight = BrowserFloatingBallPolicy.isDockedRight(
-            clamped.x, ballSizePx, containerSize.value.width.toFloat()
-        )
-        // 拖动时跟手（snap），松手后从当前位置滑到吸附点（tween）。
-        val ballX by animateFloatAsState(
-            targetValue = if (dragging) {
-                clamped.x
-            } else {
-                BrowserFloatingBallPolicy.dockX(
-                    clamped.x, ballSizePx, containerSize.value.width.toFloat(), dockMarginPx
-                )
-            },
-            animationSpec = if (dragging) snap() else tween(durationMillis = 160),
-            label = "browserFloatingBallX"
-        )
-        val ballY = clamped.y
-        val menuLeft = BrowserFloatingBallPolicy.menuLeft(
-            ballX, ballSizePx, menuWidthPx, containerSize.value.width.toFloat(),
-            dockedRight, menuGapPx
-        )
-        val menuTop = BrowserFloatingBallPolicy.menuTop(
-            ballY, ballSizePx, menuHeightPx, containerSize.value.height.toFloat()
-        )
-        // ⋮ 胶囊：贴球上方（顶边放不下时自动翻到球下方），与球同心。
-        val capsuleLeft = BrowserFloatingBallPolicy.capsuleLeft(ballX, ballSizePx, capsuleWidthPx)
-        val capsuleTop = BrowserFloatingBallPolicy.capsuleTop(
-            ballY, ballSizePx, capsuleHeightPx, capsuleGapPx
-        )
-
-        // 展开时的透明 scrim：点空白收起；同时挡住对网页的误触（菜单开着时页面不该响应）。
-        if (expanded) {
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .pointerInput(Unit) { detectTapGestures { expanded = false } }
-            )
-        }
-
-        // 展开菜单（白卡，画布 `23:265`）：球在右半 → 菜单朝左，球在左半 → 朝右；
-        // 纵向由 [BrowserFloatingBallPolicy.expandsUpward] 决定往上/往下长。
-        //
-        // 2026-10-12 用户反馈旧菜单 176dp 宽「非常遮挡原图」，瘦到 120dp 并去掉「设置」
-        // （设置常驻顶栏齿轮）与两条分隔线；内容只留两项：截图翻译 + 原文｜译文。
-        if (expanded) {
-            Column(
-                modifier = Modifier
-                    .offset { IntOffset(menuLeft.roundToInt(), menuTop.roundToInt()) }
-                    .width(menuWidth)
-                    .shadow(6.dp, RoundedCornerShape(14.dp))
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(MtColors.Surface)
-                    .border(1.dp, MtColors.Border, RoundedCornerShape(14.dp))
-                    .padding(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(44.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable {
-                            expanded = false
-                            Log.d(TAG, "capture_shortcut_from_ball")
-                            onScreenshotTranslate()
-                        }
-                        .padding(horizontal = 8.dp)
-                        .semantics { contentDescription = "截图翻译（悬浮球菜单）" },
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = MtScanIcon,
-                        contentDescription = null,
-                        tint = MtColors.TextPrimary,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Text(
-                        text = "截图翻译",
-                        fontSize = 14.sp,
-                        color = MtColors.TextPrimary,
-                        maxLines = 1
-                    )
-                }
-                // 与底栏同一个开关组件（同一份状态、同一套禁用规则）；
-                // 没有译文可切时整块置灰，点它 toast 说明原因。
-                Box(
-                    modifier = Modifier.clickable(enabled = !modeToggleEnabled) {
-                        Toast.makeText(
-                            context,
-                            modeToggleDisabledReason ?: "暂时不可用",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                ) {
-                    BrowserViewModeToggle(
-                        mode = viewMode,
-                        enabled = modeToggleEnabled,
-                        disabledReason = modeToggleDisabledReason,
-                        onSelect = onSelectViewMode
-                    )
-                }
-            }
-        }
-
-        // ⋮ 胶囊（画布 `23:167`）：菜单唯一的展开入口，点它开/关。
-        // 收起态 = 白底 + 灰描边，展开态 = 浅蓝底 + 蓝描边 + 蓝点（与球形成一组）。
-        Box(
-            modifier = Modifier
-                .offset { IntOffset(capsuleLeft.roundToInt(), capsuleTop.roundToInt()) }
-                .size(capsuleWidth, capsuleHeight)
-                .shadow(4.dp, RoundedCornerShape(18.dp))
-                .clip(RoundedCornerShape(18.dp))
-                .background(
-                    // 轻微透底：胶囊也只该是一条轻提示，不该像一张白贴片压在画面上。
-                    if (expanded) MtColors.BrandTint else MtColors.Surface.copy(alpha = 0.96f)
-                )
-                .border(
-                    width = 1.dp,
-                    color = if (expanded) MtColors.BrandInk else MtColors.Border,
-                    shape = RoundedCornerShape(18.dp)
-                )
-                .clickable {
-                    expanded = !expanded
-                    Log.d(TAG, "ball_capsule_tap expanded=$expanded")
-                }
-                .semantics {
-                    contentDescription = if (expanded) "收起翻译菜单" else "打开翻译菜单"
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Filled.MoreVert,
-                contentDescription = null,
-                tint = if (expanded) MtColors.BrandInk else MtColors.TextPrimary,
-                modifier = Modifier.size(16.dp)
-            )
-        }
-
-        Box(
-            modifier = Modifier
-                .offset { IntOffset(ballX.roundToInt(), ballY.roundToInt()) }
-                .size(BrowserFloatingBallPolicy.SIZE_DP.dp)
-                .alpha(if (enabled) 1f else 0.65f)
-                .shadow(6.dp, CircleShape)
-                .clip(CircleShape)
-                .background(
-                    // 轻微透底：悬浮球不该让用户感觉「挡了一大块画面」，
-                    // 但也不能太透以至于和页面内容混在一起。
-                    // 红色只给「停止」（会话在跑）；忙碌时压暗，表示"这一下不会被采纳"。
-                    (if (action == BrowserPrimaryAction.STOP) MtColors.Danger else MtColors.Brand)
-                        .copy(alpha = if (busy) 0.55f else 0.92f)
-                )
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = {
-                            if (latestExpanded) {
-                                expanded = false
-                            } else {
-                                // 忙碌（截图翻译/一次性贴回）时也照常上报：宿主会把原因写进状态行。
-                                // 以前这里是**静默忽略**，用户「点不动」的排查连一行日志都没有
-                                // （2026-10-14 的教训），这条已留成硬约束。
-                                Log.d(
-                                    TAG,
-                                    "ball_primary_tap running=$latestRunning busy=$latestBusy " +
-                                        "action=${latestAction ?: "none"}"
-                                )
-                                latestPrimaryTap()
-                            }
-                        },
-                        onLongPress = {
-                            Log.d(TAG, "ball_menu_open dockedRight=$dockedRight")
-                            expanded = true
-                        }
-                    )
-                }
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { dragging = true },
-                        onDragEnd = {
-                            dragging = false
-                            persistBallPosition()
-                        },
-                        onDragCancel = {
-                            dragging = false
-                            persistBallPosition()
-                        }
-                    ) { change, dragAmount ->
-                        change.consume()
-                        rawOffset = (rawOffset ?: Offset.Zero) + dragAmount
-                    }
-                }
-                .semantics {
-                    // 三态各有自己的说法：无障碍（与 .verify 的 dump 断言）靠它区分球此刻干什么。
-                    contentDescription = when {
-                        busy -> "翻译悬浮球：正在截图翻译，稍后可用"
-                        action == BrowserPrimaryAction.RESTORE ->
-                            "翻译悬浮球：点按恢复原文（截图译文显示中），长按打开菜单"
-
-                        action == BrowserPrimaryAction.STOP ->
-                            "翻译悬浮球：点按停止翻译，长按打开菜单"
-
-                        else -> "翻译悬浮球：点按开始翻译，长按打开菜单"
-                    }
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            when {
-                busy -> CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
-                    strokeWidth = 2.dp,
-                    color = Color.White
-                )
-                // 运行中 = 红底白方块（停止）；material-icons-core 没有 Stop 图标，
-                // 画一个 14dp 方块比硬凑语义相近的图标更直白（与原底栏按钮的决定一致）。
-                action == BrowserPrimaryAction.STOP -> Box(
-                    modifier = Modifier
-                        .size(14.dp)
-                        .clip(RoundedCornerShape(3.dp))
-                        .background(Color.White)
-                )
-                // 截图覆盖层在屏 = 蓝底白 ✕（点它就收起，恢复原文）——首页那条链路同款语义。
-                action == BrowserPrimaryAction.RESTORE -> Icon(
-                    imageVector = Icons.Filled.Close,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(22.dp)
-                )
-
-                else -> Text(
-                    text = "译",
-                    color = Color.White,
-                    fontSize = 19.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-        }
-    }
-}
-
-/**
- * 网页文字翻译悬浮球（2026-11-01 用户要求）：默认关闭，设置里开启后出现在页面左侧。
- *
- * 只翻 DOM 文本节点，和图片翻译的红色悬浮球互不干扰；位置独立持久化。
- * - 单击：未翻 → 翻译页面文字；已翻 → 恢复原文；
- * - 拖动：松手吸附左/右边缘；位置存比例，重进页面恢复。
- */
-@Composable
-private fun BrowserWebpageTextBall(
-    busy: Boolean,
-    applied: Boolean,
-    savedPosition: BrowserFloatingBallPosition?,
-    onPositionChanged: (Float, Float) -> Unit,
-    onTap: () -> Unit
-) {
-    val density = LocalDensity.current
-    val containerSize = remember { mutableStateOf(IntSize.Zero) }
-    var rawOffset by remember { mutableStateOf<Offset?>(null) }
-    var dragging by remember { mutableStateOf(false) }
-    val latestOnTap by rememberUpdatedState(onTap)
-    val latestOnPositionChanged by rememberUpdatedState(onPositionChanged)
-    val latestBusy by rememberUpdatedState(busy)
-    val latestApplied by rememberUpdatedState(applied)
-    val ballSizePx = with(density) { TEXT_BALL_SIZE_DP.dp.toPx() }
-    val dockMarginPx = with(density) { BrowserFloatingBallPolicy.DOCK_MARGIN_DP.dp.toPx() }
-    val bottomMarginPx =
-        with(density) { BrowserFloatingBallPolicy.DEFAULT_BOTTOM_MARGIN_DP.dp.toPx() }
-    val latestSizePx by rememberUpdatedState(ballSizePx)
-    val latestDockMarginPx by rememberUpdatedState(dockMarginPx)
-
-    fun persistPosition() {
-        val current = rawOffset ?: return
-        val size = containerSize.value
-        if (size.width <= 0 || size.height <= 0) return
-        val width = size.width.toFloat()
-        val height = size.height.toFloat()
-        val dockedX = BrowserFloatingBallPolicy.dockX(
-            current.x, latestSizePx, width, latestDockMarginPx
-        )
-        val ratio = BrowserFloatingBallPolicy.encodePosition(
-            Offset(dockedX, current.y), latestSizePx, width, height
-        ) ?: return
-        latestOnPositionChanged(ratio.x, ratio.y)
-        Log.d(TAG, "text_ball_position_save x=${ratio.x} y=${ratio.y}")
-    }
-
-    Box(modifier = Modifier.fillMaxSize().onSizeChanged { containerSize.value = it }) {
-        LaunchedEffect(containerSize.value, savedPosition) {
-            if (rawOffset == null && containerSize.value.width > 0 && containerSize.value.height > 0) {
-                val width = containerSize.value.width.toFloat()
-                val height = containerSize.value.height.toFloat()
-                rawOffset = savedPosition?.let { saved ->
-                    BrowserFloatingBallPolicy.decodePosition(
-                        Offset(saved.xRatio, saved.yRatio), ballSizePx, width, height
-                    )
-                } ?: Offset(
-                    dockMarginPx,
-                    (height - ballSizePx - bottomMarginPx).coerceAtLeast(0f)
-                )
-                Log.d(
-                    TAG,
-                    "text_ball_position_restore saved=${savedPosition != null} " +
-                        "x=${rawOffset?.x} y=${rawOffset?.y}"
-                )
-            }
-        }
-        val raw = rawOffset ?: return@Box
-        val clamped = BrowserFloatingBallPolicy.clamp(
-            raw, ballSizePx, containerSize.value.width.toFloat(), containerSize.value.height.toFloat()
-        )
-        val ballX by animateFloatAsState(
-            targetValue = if (dragging) {
-                clamped.x
-            } else {
-                BrowserFloatingBallPolicy.dockX(
-                    clamped.x, ballSizePx, containerSize.value.width.toFloat(), dockMarginPx
-                )
-            },
-            animationSpec = if (dragging) snap() else tween(160),
-            label = "webpageTextBallX"
-        )
-        val ballY = clamped.y
-        Box(
-            modifier = Modifier
-                .offset { IntOffset(ballX.roundToInt(), ballY.roundToInt()) }
-                .size(TEXT_BALL_SIZE_DP.dp)
-                .alpha(if (busy) 0.7f else 0.94f)
-                .shadow(5.dp, CircleShape)
-                .clip(CircleShape)
-                .background(if (applied) MtColors.Brand else MtColors.BrandInk)
-                .pointerInput(Unit) {
-                    detectTapGestures(
-                        onTap = {
-                            Log.d(TAG, "text_ball_tap busy=$latestBusy applied=$latestApplied")
-                            if (!latestBusy) latestOnTap()
-                        }
-                    )
-                }
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { dragging = true },
-                        onDragEnd = {
-                            dragging = false
-                            persistPosition()
-                        },
-                        onDragCancel = {
-                            dragging = false
-                            persistPosition()
-                        }
-                    ) { change, dragAmount ->
-                        change.consume()
-                        rawOffset = (rawOffset ?: Offset.Zero) + dragAmount
-                    }
-                }
-                .semantics {
-                    contentDescription = if (applied) {
-                        "网页文字翻译悬浮球：点按恢复原文"
-                    } else {
-                        "网页文字翻译悬浮球：点按翻译页面文字"
-                    }
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            when {
-                busy -> CircularProgressIndicator(
-                    modifier = Modifier.size(16.dp),
-                    strokeWidth = 2.dp,
-                    color = Color.White
-                )
-                applied -> Icon(
-                    imageVector = Icons.Filled.Check,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
-                )
-                else -> Text(
-                    text = "文",
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-        }
-    }
-}
-
-private const val TEXT_BALL_SIZE_DP = 44
-
-/**
- * 「原文｜译文」两段式视图开关（2026-10-02）。
- *
- * 与「翻译/停止」主按钮的分工是硬的：这个开关只决定**看什么**（译文层挂不挂在页面上），
- * 不启停任何任务；主按钮只决定**翻不翻**。两者形状也必须不同 —— 分段控件一眼能看出
- * 「当前选中哪个」，而这正是改造前并排两个同款胶囊按钮读不出来的信息。
- *
- * 没有译文可切时（会话没跑且屏上无译文层）**整块置灰禁用**，而不是「能点但点了没反应」。
- */
-@Composable
-private fun BrowserViewModeToggle(
-    mode: BrowserViewMode,
-    enabled: Boolean,
-    disabledReason: String?,
-    onSelect: (BrowserViewMode) -> Unit
-) {
-    val desc = if (enabled) {
-        "原文/译文显示切换"
-    } else {
-        "原文/译文显示切换（${disabledReason ?: "不可用"}）"
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(34.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(MtColors.SurfaceMuted)
-            .padding(3.dp)
-            .alpha(if (enabled) 1f else 0.4f)
-            .semantics { contentDescription = desc },
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        BrowserViewModeSegment(
-            label = "原文",
-            target = BrowserViewMode.ORIGINAL,
-            mode = mode,
-            enabled = enabled,
-            onSelect = onSelect,
-            modifier = Modifier.weight(1f)
-        )
-        BrowserViewModeSegment(
-            label = "译文",
-            target = BrowserViewMode.TRANSLATED,
-            mode = mode,
-            enabled = enabled,
-            onSelect = onSelect,
-            modifier = Modifier.weight(1f)
-        )
-    }
-}
-
-/** 分段开关的一段；选中段用品牌色浅底 + 蓝字（与菜单里的选中态同一套视觉语言）。 */
-@Composable
-private fun BrowserViewModeSegment(
-    label: String,
-    target: BrowserViewMode,
-    mode: BrowserViewMode,
-    enabled: Boolean,
-    onSelect: (BrowserViewMode) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val selectedNow = mode == target
-    Box(
-        modifier = modifier
-            .height(28.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (selectedNow) MtColors.BrandTint else Color.Transparent)
-            // 点已选中的那一段不做任何事（它本来就已经是当前状态，不该看起来"没反应"）。
-            .clickable(enabled = enabled && !selectedNow) { onSelect(target) }
-            .semantics {
-                contentDescription = "显示$label"
-                selected = selectedNow
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = label,
-            fontSize = 13.sp,
-            fontWeight = if (selectedNow) FontWeight.SemiBold else FontWeight.Normal,
-            color = if (selectedNow) MtColors.BrandInk else MtColors.TextSecondary
-        )
-    }
-}
-
 @Composable
 private fun MtBrowserIconButton(
     icon: ImageVector,
@@ -6033,7 +6010,7 @@ private fun MtBrowserIconButton(
 }
 
 /** 大图解码：长边超过 [MAX_LONG_SIDE] 时降采样，控制内存；文字尺寸在 2400px 内足够 OCR。 */
-private fun decodeCapped(bytes: ByteArray): Bitmap? {
+internal fun decodeCapped(bytes: ByteArray): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
@@ -6126,7 +6103,7 @@ private suspend fun emptyScanHint(webView: WebView, scan: ScanResult): String {
         profile.canvases > 0 ->
             "画面在 <canvas> 里：翻译需要页面允许导出像素；不支持时请用悬浮球截屏链路"
         profile.images == 0 ->
-            "这一页可能不是阅读页，或图还没加载 —— 往下滑一下再点「翻译」"
+            "这一页可能不是阅读页，或图还没加载 —— 往下滑一下再点「译」球"
         else ->
             "规则=${adapterLabel} 命中 ${scan.explicitHits} 条，但都不够像漫画页（可逐站关掉适配试试）"
     }
@@ -6168,74 +6145,111 @@ private suspend fun WebView.currentPageProfile(): PageProfile? {
     )
 }
 
-private data class PageLanguage(val id: String, val source: String)
-
 /**
- * 读取网页声明的语言（2026-11-01，P2）。
+ * 读取页面语言（2026-11-01）：**内容优先 + ML Kit**，声明语言只作兜底。
  *
- * 用户裁定：**直接用网页语言，不从图片/OCR 猜**。优先 `<html lang>`、`content-language`、
- * `og:locale`；三者都没有时才用 `navigator.language` 和正文采样兜底（仍是网页文本，
- * 不会为语言判定多跑 OCR/翻译请求）。
+ * 旧实现先信 `<html lang>`，Pixiv 这类「英文 UI + 日文正文」会被误判成英文并整页跳过。
+ * 现在正文采样走 `main/article`，过滤导航/页脚/隐藏节点/自身覆盖层；样本不足 40 字
+ * 才用声明语言兜底。不跑 OCR、不调翻译接口。
  */
-private suspend fun WebView.readPageLanguage(): PageLanguage? {
-    val raw = runCatching { evaluateJavascriptSuspend(PAGE_LANGUAGE_JS) }.getOrNull() ?: return null
-    val json = decodeJsJsonResult(raw) ?: return null
-    val hints = json.optJSONArray("hints")
-    if (hints != null) {
-        for (i in 0 until hints.length()) {
-            val hint = normalizePageLanguageHint(hints.optString(i))
-            if (hint != null) return PageLanguage(hint, "html")
+private suspend fun WebView.readPageLanguage(mode: String): PageLanguageDetector.Detected? {
+    val raw = runCatching { evaluateJavascriptSuspend(PAGE_LANGUAGE_JS) }.getOrNull()
+    val json = raw?.let { decodeJsJsonResult(it) }
+    val hints = json?.optJSONArray("hints")?.let { array ->
+        (0 until array.length()).mapNotNull { index ->
+            array.optString(index).takeIf { it.isNotBlank() }
         }
+    }.orEmpty()
+    val sample = json?.optString("sample").orEmpty()
+    val candidates = if (sample.trim().length >= PageLanguageDetector.MIN_SAMPLE_CHARS) {
+        MlKitLanguageIdentifier.identify(sample)
+    } else {
+        emptyList()
     }
-    val sample = json.optString("sample").orEmpty()
-    if (sample.isNotBlank()) {
-        val detected = SourceScriptDetector.detect(listOf(sample))
-        if (detected != null) return PageLanguage(detected.languageId, "body")
-    }
-    return null
+    val detected = PageLanguageDetector.detect(sample, hints, candidates)
+    Log.d(
+        TAG,
+        "page_language mode=$mode lang=${detected?.languageId ?: "none"} " +
+            "source=${detected?.source ?: "none"} reliable=${detected?.reliable == true} " +
+            "chars=${sample.trim().length} " +
+            "candidates=" + candidates.take(3).joinToString(separator = ",") { candidate ->
+                String.format(Locale.US, "%s:%.2f", candidate.languageTag, candidate.confidence)
+            } +
+            " hints=" + hints.joinToString(separator = "|")
+    )
+    return detected
 }
 
-/** HTML 语言标签 → AppLanguage.id；`zh-Hans/zh-CN/zh-Hant/zh-TW` 归到简/繁。 */
-internal fun normalizePageLanguageHint(raw: String): String? {
-    val value = raw.trim().lowercase().replace('_', '-')
-        .substringBefore(',').substringBefore(';').trim()
-    if (value.isEmpty() || value == "und") return null
-    return when {
-        value.startsWith("zh") -> {
-            if (value.contains("tw") || value.contains("hk") || value.contains("hant")) {
-                "zh-tw"
-            } else {
-                "zh-cn"
-            }
-        }
-        value.startsWith("ja") -> "ja"
-        value.startsWith("ko") -> "ko"
-        value.startsWith("en") -> "en"
-        else -> null
-    }
-}
+/** 兼容旧单测：HTML 语言标签 → AppLanguage.id；实现已收敛到 [PageLanguageDetector]。 */
+internal fun normalizePageLanguageHint(raw: String): String? = PageLanguageDetector.normalizeHint(raw)
 
 private const val PAGE_LANGUAGE_JS = """(function(){
   try {
     var hints = [];
-    function push(value) {
+    function pushHint(value) {
       var text = String(value || '').trim();
       if (text && hints.indexOf(text) < 0) hints.push(text);
     }
-    push(document.documentElement && document.documentElement.lang);
+    pushHint(document.documentElement && document.documentElement.lang);
     var metas = document.querySelectorAll('meta[http-equiv],meta[property="og:locale"]');
     for (var i = 0; i < metas.length; i++) {
       var key = String(metas[i].getAttribute('http-equiv') || metas[i].getAttribute('property') || '').toLowerCase();
-      if (key === 'content-language' || key === 'og:locale') push(metas[i].content);
+      if (key === 'content-language' || key === 'og:locale') pushHint(metas[i].content);
     }
-    // 不用 navigator.language：那是浏览器 UI 语言，不是网页语言（Pixiv 英文界面但内容是日文）。
+    var MAX = 2000;
+    var MIN = 40;
+    var SKIP = 'nav,footer,aside,[role=navigation],[role=contentinfo],[aria-hidden="true"],[hidden],'
+      + '[data-mt-id],.__mt_overlay,.__mt_scene_root,.__mt_loading_root,.__mt_seam_root,'
+      + '.mt-overlay-root,.mt-loading-card,[data-mt-webpage]';
+    var SKIP_TAGS = { SCRIPT:1, STYLE:1, NOSCRIPT:1, CODE:1, PRE:1, TEXTAREA:1, INPUT:1,
+      SELECT:1, OPTION:1, TITLE:1, META:1, LINK:1, IFRAME:1, SVG:1 };
+    function normalize(t) { return String(t == null ? '' : t).replace(/\s+/g, ' ').trim(); }
+    function collectFrom(root) {
+      if (!root) return '';
+      var parts = [];
+      var chars = 0;
+      var seen = 0;
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(node) {
+          var parent = node.parentElement;
+          if (!parent || !root.contains(parent)) return NodeFilter.FILTER_REJECT;
+          if (SKIP_TAGS[parent.tagName]) return NodeFilter.FILTER_REJECT;
+          if (parent.closest && parent.closest(SKIP)) return NodeFilter.FILTER_REJECT;
+          var style = window.getComputedStyle(parent);
+          if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          var text = normalize(node.nodeValue);
+          if (!text || /^[\s\p{P}\p{S}\d]+$/u.test(text)) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      while (seen < 1600 && chars < MAX) {
+        var node = walker.nextNode();
+        if (!node) break;
+        seen += 1;
+        var text = normalize(node.nodeValue);
+        if (!text) continue;
+        parts.push(text);
+        chars += text.length;
+      }
+      return parts.join('\n').slice(0, MAX);
+    }
+    var roots = document.querySelectorAll("main, article, [role='main']");
     var sample = '';
-    try { sample = String(document.body && document.body.innerText || '').slice(0, 2000); } catch (e) {}
+    for (var r = 0; r < roots.length && sample.length < MIN; r++) {
+      sample = collectFrom(roots[r]);
+    }
+    if (sample.length < MIN) {
+      var body = collectFrom(document.body);
+      if (body.length > sample.length) sample = body;
+    }
     return JSON.stringify({ hints: hints, sample: sample });
   } catch (e) {
     return JSON.stringify({ hints: [], sample: '' });
   }
 })()"""
+
 
 private const val PAGE_PROFILE_JS = """(function(){
   try {
@@ -6297,6 +6311,7 @@ private suspend fun WebView.extractPagePixels(image: ScannedImage, tag: String):
     evaluateJavascript(BrowserScanScript.EXTRACTOR_JS, null)
     val builder = StringBuilder()
     var offset = 0
+    var loadingRetries = 0
     while (offset < PIXEL_MAX_CHARS) {
         val decoded = decodeJsJsonResult(
             evaluateJavascriptSuspend(
@@ -6308,14 +6323,23 @@ private suspend fun WebView.extractPagePixels(image: ScannedImage, tag: String):
             return null
         }
         if (!decoded.optBoolean("ok")) {
+            val reason = decoded.optString("reason")
+            // CSS 背景图（Pixiv comic.pixiv.net 的 div#page-N）是异步 fetch blob：
+            // 第一次只启动加载，后续短轮询直到 base64 就绪。
+            if (reason == "loading" && loadingRetries < 40) {
+                loadingRetries += 1
+                delay(50)
+                continue
+            }
             Log.w(
                 tag,
-                "pixel_extract reason=${decoded.optString("reason")} id=${image.id} " +
+                "pixel_extract reason=$reason id=${image.id} " +
                     "src=${BrowserHistoryRepository.urlWithoutScheme(image.src)} " +
                     "msg=${decoded.optString("message")}"
             )
             return null
         }
+        loadingRetries = 0
         builder.append(decoded.optString("chunk"))
         offset = decoded.optInt("next", offset + PIXEL_CHUNK_CHARS)
         if (decoded.optBoolean("done")) break

@@ -25,6 +25,8 @@ dependencies {
     implementation("com.google.mlkit:text-recognition-japanese:16.0.0")
     implementation("com.google.mlkit:text-recognition-korean:16.0.0")
     implementation("com.google.mlkit:translate:17.0.3")
+    // 网页语言识别（bundled，约 +900KB，本地推理）：2026-11-01「网页自动检测源语言」。
+    implementation("com.google.mlkit:language-id:17.0.6")
     implementation("com.google.android.gms:play-services-tasks:18.2.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.29.0")
     implementation("org.opencv:opencv:4.10.0")

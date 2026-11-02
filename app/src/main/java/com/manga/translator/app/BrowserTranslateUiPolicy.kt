@@ -138,11 +138,11 @@ object BrowserTranslateUiPolicy {
         pageLoaded: Boolean
     ): String = when {
         shown == BrowserShownLayer.SNAPSHOT -> "截图译文显示中 · 点屏幕恢复原文"
-        !pageLoaded -> "打开漫画网页后点球翻译"
-        shown == BrowserShownLayer.LIVE && running -> "译文显示中 · 点球可停止"
+        !pageLoaded -> "打开漫画网页后点「译」球翻译"
+        shown == BrowserShownLayer.LIVE && running -> "译文显示中 · 点「译」球可停止"
         shown == BrowserShownLayer.LIVE -> "译文显示中"
-        viewMode == BrowserViewMode.ORIGINAL && running -> "原文显示中 · 球上菜单切译文"
-        viewMode == BrowserViewMode.ORIGINAL -> "原文显示中 · 点球翻译"
-        else -> "点球自动翻完整页"
+        viewMode == BrowserViewMode.ORIGINAL && running -> "原文显示中 · ⋮ 菜单切译文"
+        viewMode == BrowserViewMode.ORIGINAL -> "原文显示中 · 点「译」球翻译"
+        else -> "点「译」球自动翻完整页"
     }
 }

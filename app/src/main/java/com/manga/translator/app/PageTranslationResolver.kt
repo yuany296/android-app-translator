@@ -3,6 +3,7 @@ package com.manga.translator.app
 import android.util.Base64
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.GlossaryEntry
+import com.manga.translator.store.SentenceTranslationUpdate
 import com.manga.translator.store.TranslationHistoryEntry
 import com.manga.translator.store.TranslationOrigin
 import com.manga.translator.translate.Bubble
@@ -36,9 +37,9 @@ class PageTranslationResolver(
         timer: TranslationTimer,
         onTranslatorDownloading: ((Boolean) -> Unit)? = null
     ): TranslationOutcome {
-        // 源语言自动识别（2026-10-14 定稿）：**只提示、不跟随**。识别不符的提示由
-        // （2026-10-15：语言提示已按用户裁定移除；翻译语言恒等于用户配置。）
-        // 翻译一律按用户配置的语言走，不再用识别结果改写 sourceLanguage。
+        // 源语言：2026-11-01 起网页可自动检测，但 auto 在 EmbeddedBrowserScreen 里已经
+        // 解析成具体语言后才传入（页面语言冻结 / 首页回退）。这里不再二次识别，
+        // 首页与悬浮球链路也始终是用户配置的具体语言。
         val effective = settings
         // 2026-10-18（用户选 A）：整页台词作为上下文（含缓存命中、本次不翻的句子）。
         // 缓存命中句以前根本不会送给模型，模型只能看到半页碎句，这是「不流畅」的来源之一。
@@ -47,6 +48,7 @@ class PageTranslationResolver(
             .map { it.trim().replace(Regex("\\s+"), " ") }
             .filter { it.isNotEmpty() }
         val sentenceRepo = ServiceLocator.sentenceTranslationRepository
+        timer.mark("cache_lookup_start", "bubbles=${bubbles.size}")
         val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
             val map = hashMapOf<String, String>()
             val miss = mutableListOf<Bubble>()
@@ -112,6 +114,9 @@ class PageTranslationResolver(
                 "page=${pageContext.size} missing=${missing.size} " +
                     "cached=${cacheStats.hitCount} skipped=${cacheStats.skipped}"
             )
+            // 唯一阶段 tag：OCR 与翻译都曾用 request_send/response_ok，summary 会把 OCR 的
+            // 时间戳覆盖掉，导致 translate_ms 永远为 0（2026-11-02 真机日志发现）。
+            timer.mark("translate_start", "missing=${missing.size} total=${bubbles.size}")
             timer.mark("request_send", "stage=translate missing=${missing.size} total=${bubbles.size}")
             val (translated, fallbackHint) = withContext(ioDispatcher) {
                 translateMissing(
@@ -126,6 +131,7 @@ class PageTranslationResolver(
             timer.mark("response_ok", "stage=translate count=${translated.size}")
             timer.mark("translate_response", "count=${translated.size}")
             val result = withContext(ioDispatcher) {
+                val updates = ArrayList<SentenceTranslationUpdate>(missing.size)
                 missing.forEachIndexed { index, bubble ->
                     // 译文归一化空白（\n/多余空格→单空格），避免 LLM 返回的换行
                     // 残留到渲染显示（如「超越……留下深刻印象\n以至于」）。
@@ -134,15 +140,19 @@ class PageTranslationResolver(
                         .replace(Regex("\\s+"), " ").trim()
                     translatedByOriginal[bubble.originalText] = value
                     // 2026-10-31：带上来源标签与页面标识，句子历史页据此显示「来自哪、哪一页」。
-                    sentenceRepo.put(
-                        effective.sourceLanguage,
-                        effective.targetLanguage,
-                        bubble.originalText,
-                        value,
+                    updates += SentenceTranslationUpdate(
+                        sourceLanguage = effective.sourceLanguage,
+                        targetLanguage = effective.targetLanguage,
+                        originalText = bubble.originalText,
+                        translatedText = value,
                         originLabel = TranslationOrigin.label,
                         originPageHash = pageHash
                     )
                 }
+                // 一页只落盘一次：旧实现每条 put 都重写整个 JSON（2026-11-02，P3）。
+                timer.mark("translate_store_start", "count=${updates.size}")
+                sentenceRepo.putAll(updates)
+                timer.mark("translate_store_done", "count=${updates.size}")
                 // 2026-10-31：原→译成对打印，用来核对「话有没有贴到别的框上」。
                 // 只打前 12 对、每侧截 12 字，避免长章节刷屏。
                 timer.mark(
