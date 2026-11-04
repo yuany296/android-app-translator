@@ -203,6 +203,22 @@ class OpenAiVisionClient(
         fun requestChunk(chunk: List<String>, jsonFormat: Boolean): ApiResult {
             // 提示词按「本批实际内容」拼：术语表只注入这批真正出现的词条（2026-10-15），
             // 整表照抄会把指令稀释掉（用户反馈「插件效果更好」，其一是这一条）。
+            if (glossary.isNotEmpty()) {
+                // 诊断「术语到底有没有进这次请求」：只看这几行即可区分
+                // 「没匹配上」和「注入了但模型没用」。
+                val relevantForLog = glossary.filter { (source, target) ->
+                    source.isNotBlank() && target.isNotBlank() &&
+                        chunk.any { GlossaryTermMatch.matchesSourceTerm(it, source) }
+                }
+                Log.d(
+                    TAG,
+                    "[$traceId] glossary_batch size=${chunk.size} entries=${glossary.size} " +
+                        "relevant=${relevantForLog.size}"
+                )
+                buildGlossaryLine(relevantForLog)?.let {
+                    Log.d(TAG, "[$traceId] glossary_line ${it.take(240)}")
+                }
+            }
             val prompt = buildTranslatePrompt(
                 texts = chunk,
                 sourceLanguageId = sourceLanguageId,
@@ -328,6 +344,50 @@ class OpenAiVisionClient(
                 "[$traceId] sentence_retry count=${suspects.size} applied=$applied " +
                     "indices=${suspects.take(12).joinToString(",")}"
             )
+        }
+
+        // ---- 确定性术语修复：译文里还留着术语原文拼写的，就地换成术语译名 ----
+        // 放在 finalFailed 之前：修好之后这句不再算「未生效」，也不会再触发下一次重试。
+        var repairedCount = 0
+        val repairedSamples = mutableListOf<String>()
+        texts.indices.forEach { index ->
+            val current = values[index] ?: texts[index]
+            val repaired = TermRepair.repairWithChanges(texts[index], current, glossary)
+            if (repaired.text != current) {
+                values[index] = repaired.text
+                repairedCount += 1
+                if (repairedSamples.size < 6) {
+                    repairedSamples += repaired.changes.joinToString(";") { (source, target) ->
+                        "$source→$target"
+                    }
+                }
+            }
+        }
+        if (repairedCount > 0) {
+            Log.d(
+                TAG,
+                "[$traceId] term_repair count=$repairedCount " +
+                    "samples=${repairedSamples.joinToString(" | ")}"
+            )
+        }
+
+        // 诊断「术语进了提示词但模型没用」：只记日志，不额外重试（手机版参考项目同策略）。
+        if (glossary.isNotEmpty()) {
+            val misses = texts.indices.flatMap { index ->
+                val output = values[index] ?: texts[index]
+                glossary.filter { (source, target) ->
+                    source.isNotBlank() && target.isNotBlank() &&
+                        GlossaryTermMatch.matchesSourceTerm(texts[index], source) &&
+                        !output.contains(target, ignoreCase = true)
+                }.map { (source, target) -> "$source→$target" }
+            }.distinct()
+            if (misses.isNotEmpty()) {
+                Log.d(
+                    TAG,
+                    "[$traceId] glossary_miss count=${misses.size} " +
+                        "samples=${misses.take(6).joinToString(" | ")}"
+                )
+            }
         }
 
         val finalFailed = texts.indices.filter { unchanged(values[it], texts[it]) }.toList()
@@ -1976,7 +2036,8 @@ class OpenAiVisionClient(
         val relevant = glossary.filter { (source, target) ->
             val s = source.trim()
             val t = target.trim()
-            s.isNotEmpty() && t.isNotEmpty() && texts.any { it.contains(s, ignoreCase = true) }
+            // 韩文术语常带助词（레오나르도가 / 레오나르도는），不能只用 contains。
+            s.isNotEmpty() && t.isNotEmpty() && texts.any { GlossaryTermMatch.matchesSourceTerm(it, s) }
         }
         if (relevant.isNotEmpty()) {
             buildGlossaryLine(relevant)?.let { lines += it }

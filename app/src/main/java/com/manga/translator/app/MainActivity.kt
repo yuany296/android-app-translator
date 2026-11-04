@@ -734,6 +734,9 @@ class MainActivity : ComponentActivity() {
                                         scope.launch {
                                             withContext(Dispatchers.IO) {
                                                 ServiceLocator.sentenceTranslationRepository.clear()
+                                                // 句子清空后页面级详情没有可对应的句子，一并清掉；
+                                                // 页面缩略图是独立管理的（「管理图片」里单独删）。
+                                                ServiceLocator.translationPageRepository.clear()
                                             }
                                             refreshSentences()
                                             toast("句子已清空 · 下次会重新翻译")

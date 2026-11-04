@@ -21,10 +21,12 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -152,6 +154,8 @@ import com.manga.translator.store.FavoriteAddResult
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.TranslateEngine
 import com.manga.translator.store.TranslationOrigin
+import com.manga.translator.store.TranslationOriginContext
+import com.manga.translator.store.TranslationPageKind
 import com.manga.translator.store.applyProfile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -1214,11 +1218,27 @@ private enum class PageLanguageStatus {
 private val ADD_FAVORITE_TILE = Any()
 
 /** 收藏新增/编辑弹窗的编辑态；[originalUrl] = null 表示新增。 */
-private data class FavoriteEditor(
+internal data class FavoriteEditor(
     val originalUrl: String?,
     val label: String,
     val url: String
 )
+
+/**
+ * 顶栏收藏星点按「添加」时的预填编辑态（2026-11-03 用户要求：收藏网站时弹出网址/名称窗口）。
+ *
+ * 网址取当前页的规范地址（与历史/收藏同一套 [BrowserHistoryRepository.normalizeUrl]），
+ * 名称预填域名（用户可清空，保存时仓储仍会用域名兜底）。
+ * 当前页不是 http/https（about:blank、data: 等）时返回 null，调用方提示「当前没有打开的网页」。
+ */
+internal fun favoriteEditorForCurrentPage(pageUrl: String): FavoriteEditor? {
+    val normalized = BrowserHistoryRepository.normalizeUrl(pageUrl) ?: return null
+    return FavoriteEditor(
+        originalUrl = null,
+        label = BrowserFavoriteRepository.defaultLabel(normalized),
+        url = normalized
+    )
+}
 
 private val TIME_HHMM: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 private val TIME_MONTH_DAY: DateTimeFormatter = DateTimeFormatter.ofPattern("M/d")
@@ -1339,6 +1359,8 @@ fun EmbeddedBrowserScreen(
         )
     }
     var confirmClearHistory by remember { mutableStateOf(false) }
+    // 长按历史记录打开的详情（2026-11-02）：完整标题/URL/首次与最近访问。
+    var historyDetail by remember { mutableStateOf<BrowserHistoryEntry?>(null) }
     // 地址栏原地编辑（2026-09-28 用户反馈：点地址框就跳新标签页，跟正规浏览器不一致）：
     // 编辑态 = 页面不动、地址栏变成输入框并全选原 URL，回车/Go 才真正跳转。
     var addressEditing by remember { mutableStateOf(false) }
@@ -1425,6 +1447,11 @@ fun EmbeddedBrowserScreen(
             FavoriteAddResult.INVALID_URL
         }
         refreshFavorites()
+        Log.d(
+            TAG,
+            "favorite_save mode=${if (editor.originalUrl == null) "add" else "edit"} " +
+                "url=${BrowserHistoryRepository.urlWithoutScheme(editor.url)} result=$result"
+        )
         return when (result) {
             FavoriteAddResult.ADDED -> "已收藏"
             FavoriteAddResult.UPDATED -> "已更新收藏"
@@ -1452,10 +1479,39 @@ fun EmbeddedBrowserScreen(
         val normalized = BrowserHistoryRepository.normalizeUrl(url) ?: return
         if (normalized == lastRecordedUrl) return
         lastRecordedUrl = normalized
+        // 用事件发生时刻而不是协程真正执行的时刻：SPA 连续跳转时多个写入协程可能乱序，
+        // 但 lastVisitMs 仍按用户实际访问顺序记录。
+        val visitedAt = System.currentTimeMillis()
         scope.launch {
-            withContext(Dispatchers.IO) { historyRepository.record(normalized, title) }
+            withContext(Dispatchers.IO) { historyRepository.record(normalized, title, visitedAt) }
             refreshHistory()
-            Log.d(TAG, "history_record url=${BrowserHistoryRepository.urlWithoutScheme(normalized)}")
+            Log.d(
+                TAG,
+                "history_record url=${BrowserHistoryRepository.urlWithoutScheme(normalized)} " +
+                    "title_len=${title.length}"
+            )
+        }
+    }
+
+    /**
+     * 页面标题晚到（2026-11-02）：`onReceivedTitle` 可能在 onPageFinished 之后才回调，
+     * 甚至由 JS 改标题。只更新标题，不再加一次访问。
+     */
+    fun updateHistoryTitle(url: String, title: String) {
+        val normalized = BrowserHistoryRepository.normalizeUrl(url) ?: return
+        if (title.isBlank()) return
+        scope.launch {
+            val changed = withContext(Dispatchers.IO) {
+                historyRepository.updateTitle(normalized, title)
+            }
+            if (changed) {
+                refreshHistory()
+                Log.d(
+                    TAG,
+                    "history_title url=${BrowserHistoryRepository.urlWithoutScheme(normalized)} " +
+                        "title_len=${title.length}"
+                )
+            }
         }
     }
 
@@ -1617,6 +1673,9 @@ fun EmbeddedBrowserScreen(
                     // 只刷新地址与站点适配；页面没重载，渲染层注入/译文层/会话都不动。
                     if (url.isNullOrBlank() || url == "about:blank" || url == pageUrl) return
                     pageUrl = url
+                    // SPA 站内跳转（pushState/replaceState）不会走 onPageFinished；
+                    // 旧逻辑只在这里刷地址，不写历史，所以章节/翻页类站点的子页会被「吞掉」。
+                    recordHistory(url, view.title.orEmpty())
                     matchedAdapter = BrowserSiteAdapterRegistry.resolveUrl(url)
                     // SPA 站内跳转换的是**同一份文档**里的另一页，onPageStarted 不会来 ——
                     // 上一页的网页文字翻译状态必须在这里一起清掉，否则新页面还没翻过，
@@ -1652,6 +1711,9 @@ fun EmbeddedBrowserScreen(
                 override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
                     pageUrl = url
+                    // 重新导航到同一 URL（刷新/重新进入）也应算一次新访问：
+                    // 不清空的话 recordHistory 的「同 URL 去重」会把它当成重复回调。
+                    lastRecordedUrl = ""
                     // 新页面 = 旧页面的渲染层注入失效，落地后由 onPageFinished 重新注入。
                     rendererInjected = false
                     // 新页面既没有可隐藏的译文层，也没有可贴回的覆盖层：视图回「译文」，
@@ -1723,6 +1785,13 @@ fun EmbeddedBrowserScreen(
             webChromeClient = object : WebChromeClient() {
                 override fun onProgressChanged(view: WebView, newProgress: Int) {
                     loadProgress = newProgress
+                }
+
+                override fun onReceivedTitle(view: WebView, title: String?) {
+                    super.onReceivedTitle(view, title)
+                    // WebView 经常在 onPageFinished 之后才给出标题（或由 JS 后改）；
+                    // 这里只补标题，不重复记一次访问。
+                    updateHistoryTitle(view.url.orEmpty(), title.orEmpty())
                 }
             }
         }
@@ -2109,6 +2178,8 @@ fun EmbeddedBrowserScreen(
                 token = myToken,
                 sessionMode = mode,
                 sessionPageUrl = currentUrl,
+                // 标题在主线程读一次，IO 会话里不再碰 WebView。
+                sessionPageTitle = webView.title.orEmpty(),
                 userAgent = webView.settings.userAgentString,
                 renderedTokens = renderedTokens,
                 renderedScenes = renderedScenes,
@@ -2316,12 +2387,21 @@ fun EmbeddedBrowserScreen(
         }
         webpageTextBusy = true
         statusText = "正在收集页面文字…"
-        // 2026-10-31：给句子表记来源（纯展示），后续 put 会带进缓存条目。
-        TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
         // 每次点「翻译页面文字」= 一个独立会话。旧实现所有网页文字共用
         // pageHash="webpage-text"，翻译历史「按页」会把几百条网页句子糊成一张卡；
         // 带时间戳后每次会话单独成组，用户能按时间找到某次翻译。
         val webpageSessionId = "webpage-text:" + System.currentTimeMillis()
+        // 2026-11-02：来源/URL/标题/runId 显式传给解析器；这次会话的所有批次共用
+        // 同一个 runId，页面统计会累加而不是被最后一批覆盖。
+        val webpageOrigin = TranslationOriginContext(
+            kind = TranslationPageKind.WEBPAGE_TEXT,
+            label = TranslationOrigin.hostOf(webView.url),
+            url = webView.url.orEmpty(),
+            title = webView.title.orEmpty(),
+            runId = webpageSessionId,
+            // 网页文字一次会话分多批，批与批是页面的不同片段 → 统计累加。
+            accumulateStats = true
+        )
         Log.d(
             TAG,
             "webpage_text_start session=$webpageSessionId " +
@@ -2372,9 +2452,8 @@ fun EmbeddedBrowserScreen(
                 //    与漫画链路同源，同一句话在两条链路之间还能共享缓存。
                 // 术语表读取放到 IO 并只读一次：不要在主线程 parse 大 JSON，也不要每个 batch
                 // 重复计算 revision（2026-11-02，P3）。
-                val (glossaryEntries, glossaryRevision) = withContext(Dispatchers.IO) {
-                    val repo = ServiceLocator.glossaryRepository
-                    repo.activeGlossaryEntries() to repo.activeRevision()
+                val glossaryEntries = withContext(Dispatchers.IO) {
+                    ServiceLocator.glossaryRepository.activeGlossaryEntries()
                 }
                 val resolver = PageTranslationResolver()
                 val batches = BrowserWebpageTextScript.buildBatches(collected)
@@ -2400,7 +2479,7 @@ fun EmbeddedBrowserScreen(
                     val translateKey = resolver.buildTranslateKey(
                         texts = bubbles.map { it.originalText },
                         settings = settings,
-                        glossaryRevision = glossaryRevision
+                        glossaryEntries = glossaryEntries
                     )
                     val outcome = withContext(Dispatchers.IO) {
                         resolver.resolveTranslations(
@@ -2410,7 +2489,8 @@ fun EmbeddedBrowserScreen(
                             pageHash = webpageSessionId,
                             glossaryEntries = glossaryEntries,
                             timer = TranslationTimer(),
-                            onTranslatorDownloading = null
+                            onTranslatorDownloading = null,
+                            origin = webpageOrigin
                         )
                     }
                     val payload = buildList {
@@ -2571,7 +2651,14 @@ fun EmbeddedBrowserScreen(
                 val useDom = domOverlay
                 statusText = "识别翻译中…"
                 // 2026-10-31：句子表来源标签（截图翻译链路 = 当前站点）。
-                TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
+                // 2026-11-02：显式上下文；每次截图独立 runId，同一页重复截图不会合并统计。
+                val shotOrigin = TranslationOriginContext(
+                    kind = TranslationPageKind.WEB_SCREENSHOT,
+                    label = TranslationOrigin.hostOf(webView.url),
+                    url = webView.url.orEmpty(),
+                    title = webView.title.orEmpty(),
+                    runId = "web_screenshot:${System.currentTimeMillis()}"
+                )
                 val startedAt = System.currentTimeMillis()
                 val outcome = withContext(Dispatchers.IO) {
                     translator.translateImage(
@@ -2582,7 +2669,8 @@ fun EmbeddedBrowserScreen(
                             BrowserRenderMode.FULL_PNG
                         },
                         onPhase = { label -> mainHandler.post { if (screenshotBusy) statusText = label } },
-                        sourceLanguageOverride = sourceLanguage
+                        sourceLanguageOverride = sourceLanguage,
+                        origin = shotOrigin
                     )
                 }
                 ownedByPipeline = true
@@ -2702,6 +2790,10 @@ fun EmbeddedBrowserScreen(
         val myToken = session.token
         running = true
         viewMode = BrowserViewMode.TRANSLATED
+        // 页面现场在主线程抓一次：worker 线程不直接读 WebView 的 url/title。
+        val pixivUrl = webView.url.orEmpty()
+        val pixivTitle = webView.title.orEmpty()
+        val pixivHost = TranslationOrigin.hostOf(pixivUrl)
         statusText = "Pixiv 预翻译中…（第 ${initialProbe.page + 1}/${initialProbe.total} 页）"
         Log.d(
             TAG,
@@ -2734,14 +2826,24 @@ fun EmbeddedBrowserScreen(
 
             override suspend fun translate(frame: PixivViewerFrame): BrowserSceneBuilder.Scene? {
                 val bitmap = frame.bitmap ?: return null
-                // 与截图链路同口径：句子表来源记当前站点。
-                TranslationOrigin.label = TranslationOrigin.hostOf(webView.url)
+                // 与截图链路同口径：句子表来源记当前站点；页码/总页数进页面详情。
+                val origin = TranslationOriginContext(
+                    kind = TranslationPageKind.PIXIV,
+                    label = pixivHost,
+                    url = pixivUrl,
+                    title = pixivTitle,
+                    pageIndex = frame.page,
+                    pageTotal = initialProbe.total,
+                    runId = "pixiv:${initialProbe.contentKey}:${frame.page}:" +
+                        System.currentTimeMillis()
+                )
                 return withContext(Dispatchers.IO) {
                     val outcome = translator.translateImage(
                         bitmap,
                         renderMode = BrowserRenderMode.DOM_SCENE,
                         sourceLanguageOverride = sourceLanguage,
-                        onPhase = { label -> updateLoading(label) }
+                        onPhase = { label -> updateLoading(label) },
+                        origin = origin
                     )
                     outcome.warningMessage?.let {
                         Log.w(
@@ -3048,7 +3150,9 @@ fun EmbeddedBrowserScreen(
                 refreshFavorites()
             },
             recent = historyEntries.take(RECENT_HISTORY_LIMIT),
+            historyTotal = historyEntries.size,
             onOpenUrl = { url -> openUrl(url) },
+            onShowHistoryDetail = { historyDetail = it },
             onOpenHistory = {
                 refreshHistory()
                 browserPage = BrowserPage.HISTORY
@@ -3060,6 +3164,7 @@ fun EmbeddedBrowserScreen(
             entries = historyEntries,
             onBack = { browserPage = BrowserPage.NEW_TAB },
             onOpenUrl = { url -> openUrl(url) },
+            onShowHistoryDetail = { historyDetail = it },
             onClear = { confirmClearHistory = true },
             onSelectTab = onSelectTab
         )
@@ -3191,7 +3296,10 @@ fun EmbeddedBrowserScreen(
                 //
                 // 2026-10-12 用户把收藏从设置弹层提到顶栏：读漫画时「想收藏这个站」是
                 // 读到哪里冒出来的冲动动作，原来要先点齿轮、再从弹层最底下找「收藏当前页」，
-                // 隔着两层；现在一按即收、再按即撤。
+                // 隔着两层。
+                // 2026-11-03 用户要求「收藏网站时弹出编辑网址和名称的窗口」：未收藏时点星
+                // 先弹 [FavoriteEditDialog]（网址/名称已按当前页预填），确认后才写入；
+                // 已收藏时再点仍是「取消收藏」，改名走新标签页收藏格的「编辑」。
                 // 两态：未收藏 = 空心描边 `#10141C`；已收藏 = 实心 `#F5A623`（见 [MtColors.FavoriteStar]）。
                 val normalizedPageUrl = BrowserHistoryRepository.normalizeUrl(pageUrl)
                 val pageFavorited = normalizedPageUrl != null &&
@@ -3215,23 +3323,14 @@ fun EmbeddedBrowserScreen(
                                 )
                             }
                             else -> {
-                                // 名字留空 → 仓储用域名兜底；改名走首页收藏格的「编辑」。
-                                val result = favoriteRepository.add(
-                                    BrowserFavoriteRepository.defaultLabel(normalizedPageUrl),
-                                    normalizedPageUrl
-                                )
-                                refreshFavorites()
-                                val toast = when (result) {
-                                    FavoriteAddResult.ADDED -> "已收藏"
-                                    FavoriteAddResult.UPDATED -> "已更新收藏"
-                                    FavoriteAddResult.FULL ->
-                                        "收藏已满（最多 ${BrowserFavoriteRepository.MAX_FAVORITES} 个）"
-                                    FavoriteAddResult.INVALID_URL -> "这个网址不能收藏"
-                                }
-                                Toast.makeText(context, toast, Toast.LENGTH_SHORT).show()
+                                // 弹出编辑窗（2026-11-03 用户要求）：网址 = 当前页完整地址，
+                                // 名称 = 域名（用户可改，清空仍由仓储用域名兜底）。
+                                // 确认走底部统一的 [FavoriteEditDialog] → [saveFavorite]，
+                                // 输入非法时弹窗保持打开。
+                                favoriteEditor = favoriteEditorForCurrentPage(normalizedPageUrl)
                                 Log.d(
                                     TAG,
-                                    "favorite_add url=${BrowserHistoryRepository.urlWithoutScheme(normalizedPageUrl)}"
+                                    "favorite_dialog_open source=page_star url=${BrowserHistoryRepository.urlWithoutScheme(normalizedPageUrl)}"
                                 )
                             }
                         }
@@ -3495,6 +3594,28 @@ fun EmbeddedBrowserScreen(
         )
     }
 
+    historyDetail?.let { entry ->
+        BrowserHistoryDetailDialog(
+            entry = entry,
+            onOpen = {
+                historyDetail = null
+                openUrl(entry.url)
+            },
+            onDelete = {
+                scope.launch {
+                    withContext(Dispatchers.IO) { historyRepository.delete(entry.url) }
+                    refreshHistory()
+                    Log.d(
+                        TAG,
+                        "history_delete url=${BrowserHistoryRepository.urlWithoutScheme(entry.url)}"
+                    )
+                }
+                historyDetail = null
+            },
+            onDismiss = { historyDetail = null }
+        )
+    }
+
     if (confirmClearHistory) {
         AlertDialog(
             onDismissRequest = { confirmClearHistory = false },
@@ -3544,6 +3665,7 @@ private suspend fun runTranslationSession(
     token: Int,
     sessionMode: BrowserSessionMode,
     sessionPageUrl: String,
+    sessionPageTitle: String = "",
     userAgent: String?,
     renderedTokens: HashMap<String, String>,
     renderedScenes: LinkedHashMap<String, BrowserSceneBuilder.Scene>,
@@ -4336,6 +4458,19 @@ private suspend fun runTranslationSession(
                     }
                 }
                 val imageStartedAt = System.currentTimeMillis()
+                // 页面现场（2026-11-02）：在主线程抓 URL/标题/文档页码；同一次重跑用
+                // 同一个 origin/runId，避免「条带加高重跑」把一次翻译记成两次。
+                val documentPageIndex = images.indexOf(image)
+                val webtoonOrigin = TranslationOriginContext(
+                    kind = TranslationPageKind.WEBTOON,
+                    label = TranslationOrigin.hostOf(sessionPageUrl),
+                    url = sessionPageUrl,
+                    title = sessionPageTitle,
+                    pageIndex = documentPageIndex,
+                    pageTotal = images.size,
+                    // 同一张图的重跑（条带加高）共用同一个 runId：页面详情只记一次。
+                    runId = "webtoon:$token:${image.id}:$imageStartedAt"
+                )
                 currentContentKey = null
                 // loading 框：开始处理这张图就浮上去（对齐参考项目 `.mt-loading-card`）。
                 // 只在「译文」视图下挂 —— 切到「原文」时用户要的就是干净原图。
@@ -4473,7 +4608,8 @@ private suspend fun runTranslationSession(
                         source: Bitmap,
                         topStrip: Bitmap?,
                         bottomStrip: Bitmap?,
-                        incoming: List<CrossBubblePart>
+                        incoming: List<CrossBubblePart>,
+                        origin: TranslationOriginContext
                     ): com.manga.translator.app.WebtoonImageTranslator.Outcome =
                         translator.translateImage(
                             source, topStrip, bottomStrip, incoming,
@@ -4486,7 +4622,9 @@ private suspend fun runTranslationSession(
                             // 必须 post 回主线程再下发文案（`mainHandler` 见文件末尾说明）。
                             onPhase = { label -> mainHandler.post { setLoadingLabel(label) } },
                             // 网页 auto 解析出的具体源语言：不能在子线程再读一遍页面。
-                            sourceLanguageOverride = sourceLanguage
+                            sourceLanguageOverride = sourceLanguage,
+                            // 页面现场由主线程在进入 withContext 前抓取。
+                            origin = origin
                         )
 
                     // 重跑要用的移交贴片副本：`translateImage` 会回收传进去的贴片位图，
@@ -4507,7 +4645,8 @@ private suspend fun runTranslationSession(
                         current,
                         topStripSource,
                         next?.let { cropTopStrip(it, current.width) },
-                        incomingUsed
+                        incomingUsed,
+                        webtoonOrigin
                     )
                     // 条带太短 → 加高条带重跑一次（2026-10-03）。
                     //
@@ -4533,7 +4672,8 @@ private suspend fun runTranslationSession(
                                 retrySource,
                                 topStripBackup,
                                 cropTopStrip(next, retrySource.width, taller),
-                                incomingBackup
+                                incomingBackup,
+                                webtoonOrigin
                             )
                             if (second.stripTruncated) {
                                 Log.w(
@@ -5377,7 +5517,9 @@ private fun BrowserNewTabPage(
     onEditFavorite: (BrowserFavorite) -> Unit,
     onDeleteFavorite: (String) -> Unit,
     recent: List<BrowserHistoryEntry>,
+    historyTotal: Int,
     onOpenUrl: (String) -> Unit,
+    onShowHistoryDetail: (BrowserHistoryEntry) -> Unit,
     onOpenHistory: () -> Unit,
     onSelectTab: (Int) -> Unit
 ) {
@@ -5577,7 +5719,7 @@ private fun BrowserNewTabPage(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "历史记录",
+                    text = if (historyTotal > 0) "历史记录（$historyTotal）" else "历史记录",
                     fontSize = 17.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MtColors.TextPrimary
@@ -5605,7 +5747,8 @@ private fun BrowserNewTabPage(
                             entry = entry,
                             today = today,
                             grouped = false,
-                            onClick = { onOpenUrl(entry.url) }
+                            onClick = { onOpenUrl(entry.url) },
+                            onLongClick = { onShowHistoryDetail(entry) }
                         )
                     }
                 }
@@ -5800,6 +5943,7 @@ private fun BrowserHistoryPage(
     entries: List<BrowserHistoryEntry>,
     onBack: () -> Unit,
     onOpenUrl: (String) -> Unit,
+    onShowHistoryDetail: (BrowserHistoryEntry) -> Unit,
     onClear: () -> Unit,
     onSelectTab: (Int) -> Unit
 ) {
@@ -5858,6 +6002,12 @@ private fun BrowserHistoryPage(
             )
             if (entries.isNotEmpty()) {
                 Text(
+                    text = "${entries.size} 条",
+                    fontSize = 11.sp,
+                    color = MtColors.TextTertiary,
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+                Text(
                     text = "清空",
                     fontSize = 13.sp,
                     color = MtColors.DangerText,
@@ -5890,6 +6040,12 @@ private fun BrowserHistoryPage(
                 }
             }
         } else {
+            Text(
+                text = "长按记录查看完整网址与访问详情",
+                fontSize = 11.sp,
+                color = MtColors.TextTertiary,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 2.dp)
+            )
             LazyColumn(
                 modifier = Modifier
                     .weight(1f)
@@ -5915,7 +6071,8 @@ private fun BrowserHistoryPage(
                             entry = entry,
                             today = today,
                             grouped = true,
-                            onClick = { onOpenUrl(entry.url) }
+                            onClick = { onOpenUrl(entry.url) },
+                            onLongClick = { onShowHistoryDetail(entry) }
                         )
                     }
                 }
@@ -5927,19 +6084,24 @@ private fun BrowserHistoryPage(
 }
 
 /** 历史行：36dp 圆徽标 + 标题/网址（gap 2）+ 右侧时间；行高 56、组内 gap 12。 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun BrowserHistoryRow(
     entry: BrowserHistoryEntry,
     today: LocalDate,
     grouped: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .height(56.dp)
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick),
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            ),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
@@ -5969,7 +6131,12 @@ private fun BrowserHistoryRow(
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = BrowserHistoryRepository.urlWithoutScheme(entry.url),
+                text = buildString {
+                    append(BrowserHistoryRepository.urlWithoutScheme(entry.url))
+                    append(" · 访问 ")
+                    append(entry.visitCount)
+                    append(" 次")
+                },
                 fontSize = 12.sp,
                 color = MtColors.TextTertiary,
                 maxLines = 1,

@@ -2686,3 +2686,43 @@ node app/src/test/js/mt-overlay-acceptance.test.js：223/223
   - 边框用 `Modifier.drawBehind` 逐项画，视觉上仍是一张连续卡片。
 - **模拟器 + 真机实测**：模拟器 686 句旧网页组、真机 705 句 + 66 句网页组，展开/收起均在 300ms 内完成（旧实现要明显卡一下）；
   展开后滚动只组合可视行；普通 7 句页、选中本页、作废本页、来源筛选均正常。
+
+## 2026-11-02（第二十四轮）翻译历史按页保存原图 / 标记版（模拟器验证）
+
+### 1. 配置与存储
+
+- `SettingsRepository.isHistorySnapshotEnabled()` / `setHistorySnapshotEnabled()`：默认**关**，pref `history_snapshot`。
+- 新 `core-store/PageSnapshotRepository`：
+  - 以 `pageHash` 为键，最多 500 页 / 50MB，超了淘汰最旧图；
+  - 只存 `original.jpg`（360px 宽、最长 1400px、JPEG 72）；`bubblesJson` 只存气泡几何；
+  - 图片目录 `filesDir/page_snapshots/<pageHash>/`，索引 `mt_page_snapshots.json`；
+  - 删除/清空只动图，不动句子历史与句子缓存。
+- `app/HistorySnapshotFactory`：
+  - 网页链路按 `topH + source.height` 裁剪当前页，悬浮球链路裁整张截图；
+  - `annotate()` 实时画框：蓝 = 外框，红 = 内容框；标记版不落盘；
+  - `saveToGallery()` 走 MediaStore 保存到 `Pictures/MangaTranslator`。
+
+### 2. 接线
+
+- `PageTranslationResolver.resolveTranslations` 新增 `thumbnailSource` / `thumbnailCropTopPx` / `thumbnailCropHeightPx`；在**句子缓存命中提前返回之前**生成缩略图，因此整页全缓存也会留图。
+- `TranslateOrchestrator` 传整张截图；`WebtoonImageTranslator` 传拼接图 + `topH` / 本图高度。
+- `SentencesScreen` 按页卡片：左侧缩略图；点开「原图 / 标记版」；顶部开关 +「管理图片」。
+- 网页漫画 `EmbeddedBrowserScreen.runOnce` 补传 `TranslationOriginContext`（URL/标题/页码）；页面详情现在能显示 `127.0.0.1:8766 / lang-ko-img / 第 2/2 页 / 新翻 0 · 复用 2`。
+- `VisionFallbackTracker`：多模态重读 `replace=true` 时按同一 `pageHash` 记一页（进程内、上限 200 页）；按页卡片头/页面快照查看器显示「多模态重读」，不用再翻 logcat 才能判断框是不是它画的。
+
+### 3. 模拟器实测（Pixel_8，emulator-5554）
+
+- 打开「保存页面缩略图」→ 翻译本地夹具 `http://127.0.0.1:8766/lang-ko.html`：
+  - logcat：`page_record page=0dfb76a4… kind=webtoon count=2 new=0 cache=2`；
+  - logcat：`HistorySnapshot snapshot_create src=720x900 crop=0+900 out=360x450 bytes=16929`；
+  - 按页卡片出现缩略图 + 站点 + 标题 + 页码 + 统计；`管理图片（1 张 · 17 KB）`。
+- 查看器：原图正常；「标记版」显示蓝/红外框；`保存到相册` 可用；`删除图片` 后 `管理图片` 回到 `0 张 · 0 KB`，句子历史不变。
+- 同一页再次翻译（全缓存命中）仍会执行 `snapshot_create`，`perf_summary ... cache=2/2`，说明快照与句子缓存解耦。
+- 缩小后的原图 `360x450`、JPEG 约 17KB；远小于整页原图，500 页全开约 8-30MB。
+
+### 4. 已知边界
+
+- 旧历史记录没有源图，打开开关前已翻的页不会补图（只对之后新翻的页面生效）。
+- 标记版每次查看时生成，不占持久存储；要长期保留需「保存到相册」。
+- 网页文字翻译（DOM 文本链路）没有页面位图，不会生成快照。
+- 单测：`core-store` 全量通过（含本功能新增 `PageSnapshotCodecTest` 6 条；`SentenceOriginBackfillTest > 已填满的条目不再动` 已按新的 `origins` 多来源语义补上「来源列表已存在」这个条件，恢复幂等）、`core-translate` 通过、`app` 通过；`:app:assembleDebug` 通过并安装到 emulator-5554。

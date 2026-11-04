@@ -13,6 +13,8 @@ import com.manga.translator.overlay.OverlayRenderConfig
 import com.manga.translator.overlay.WritableAreaRefiner
 import com.manga.translator.store.AppSettings
 import com.manga.translator.store.PageOverlayAdjustment
+import com.manga.translator.store.TranslationOriginContext
+import com.manga.translator.store.TranslationPageKind
 import com.manga.translator.translate.Bubble
 import com.manga.translator.translate.BubbleGeometry
 import com.manga.translator.translate.BubbleRegion
@@ -138,7 +140,7 @@ class TranslateOrchestrator(
         val translateKey = translationResolver.buildTranslateKey(
             texts = effectiveOcrResult.bubbles.map { it.originalText },
             settings = settings,
-            glossaryRevision = ServiceLocator.glossaryRepository.activeRevision()
+            glossaryEntries = glossaryEntries
         )
 
         var warningMessage: String? = null
@@ -157,7 +159,12 @@ class TranslateOrchestrator(
             )
         } else {
             // 2026-10-31：截图链路的句子来源只能是「截图翻译」（拿不到被翻译 App 的身份）。
-            com.manga.translator.store.TranslationOrigin.label = "截图翻译"
+            // 2026-11-02：来源改为显式上下文，并给这次截图一个独立 runId（同页重复截图不串统计）。
+            val screenshotOrigin = TranslationOriginContext(
+                kind = TranslationPageKind.SCREENSHOT,
+                label = "截图翻译",
+                runId = "screenshot:${System.currentTimeMillis()}"
+            )
             translationResolver.resolveTranslations(
                 bubbles = effectiveOcrResult.bubbles,
                 settings = settings,
@@ -169,7 +176,10 @@ class TranslateOrchestrator(
                     onStageChanged?.invoke(
                         if (downloading) FloatingState.MODEL_LOADING else FloatingState.TRANSLATING
                     )
-                }
+                },
+                // 悬浮球链路：整张截图就是「这一页」。
+                thumbnailSource = bitmap,
+                origin = screenshotOrigin
             ).let { outcome ->
                 warningMessage = outcome.warningMessage
                 cacheStats = outcome.cacheStats

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "adb uninstall *": "deny",
+      "adb shell pm uninstall *": "deny",
+      "adb -s * uninstall *": "deny",
+      "adb shell cmd package uninstall *": "deny"
+    }
+  }
+}

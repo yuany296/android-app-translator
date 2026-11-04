@@ -270,7 +270,13 @@ class WebtoonImageTranslator(
          * 必须拿到具体语言。调用方在会话开始前按页面语言解析好，这里覆盖全局设置；
          * 非浏览器调用方不传（null）时保持原行为。
          */
-        sourceLanguageOverride: String? = null
+        sourceLanguageOverride: String? = null,
+        /**
+         * 本次翻译的页面现场（2026-11-02）：来源站点/URL/页码等，直接写进历史详情。
+         * 默认空对象 = 老调用方（只记语言与句子，不记页面现场）。
+         */
+        origin: com.manga.translator.store.TranslationOriginContext =
+            com.manga.translator.store.TranslationOriginContext()
     ): Outcome {
         val timer = TranslationTimer()
         try {
@@ -293,7 +299,8 @@ class WebtoonImageTranslator(
                     renderMode,
                     allowIncomingMerge,
                     onPhase,
-                    sourceLanguageOverride
+                    sourceLanguageOverride,
+                    origin
                 )
             } finally {
                 if (stitched !== source && !stitched.isRecycled) stitched.recycle()
@@ -320,7 +327,9 @@ class WebtoonImageTranslator(
         renderMode: BrowserRenderMode,
         allowIncomingMerge: Boolean,
         onPhase: (String) -> Unit = {},
-        sourceLanguageOverride: String? = null
+        sourceLanguageOverride: String? = null,
+        origin: com.manga.translator.store.TranslationOriginContext =
+            com.manga.translator.store.TranslationOriginContext()
     ): Outcome {
         val configuredSettings = ServiceLocator.settingsRepository.getSettings()
         // 网页「自动检测」解析出的具体语言优先于全局设置；非浏览器链路 null = 原行为。
@@ -738,8 +747,7 @@ class WebtoonImageTranslator(
             }
             // 术语表读取也可能要解析大 JSON；从主线程挪到 IO，并和擦字/内容框准备并行。
             val glossaryDeferred = async(ioDispatcher) {
-                val repo = ServiceLocator.glossaryRepository
-                repo.activeGlossaryEntries() to repo.activeRevision()
+                ServiceLocator.glossaryRepository.activeGlossaryEntries()
             }
             // 翻译请求 = owned 的原文 + 相邻行并回的合并原文（追加在尾部，结果按下标切回；
             // `resolveTranslations` 按列表顺序逐条返回，顺序/条数都与入参一致）。
@@ -774,11 +782,11 @@ class WebtoonImageTranslator(
                     }
                 )
             }
-            val (glossaryEntries, glossaryRevision) = glossaryDeferred.await()
+            val glossaryEntries = glossaryDeferred.await()
             val translateKey = translationResolver.buildTranslateKey(
                 texts = requestBubbles.map { it.originalText },
                 settings = settings,
-                glossaryRevision = glossaryRevision
+                glossaryEntries = glossaryEntries
             )
             if (missingCloudConfig && !useLocalEngine) {
                 warning = "仅OCR（未配置翻译API）"
@@ -794,7 +802,12 @@ class WebtoonImageTranslator(
                     pageHash = pageHash,
                     glossaryEntries = glossaryEntries,
                     timer = timer,
-                    onTranslatorDownloading = null
+                    onTranslatorDownloading = null,
+                    // 历史缩略图只裁「本图」这一页，不要把接缝条带里的邻页也带进去。
+                    thumbnailSource = stitched,
+                    thumbnailCropTopPx = topH,
+                    thumbnailCropHeightPx = source.height,
+                    origin = origin
                 ).let { outcome ->
                     warning = outcome.warningMessage
                     cacheStats = outcome.cacheStats

@@ -32,7 +32,9 @@ internal object MlKitTiledBlockMerger {
         val lineCount: Int,
         val lineBoxes: List<FloatArray>?,
         /** 来源块序号（同一张图分块检测时用；0 = 单块/老调用）。 */
-        val tileIndex: Int = 0
+        val tileIndex: Int = 0,
+        /** 从同一 block 按元素间距拆出的组标识；合并/去重时原样保留。 */
+        val splitGroupId: String? = null
     ) {
         val width: Float get() = right - left
         val height: Float get() = bottom - top

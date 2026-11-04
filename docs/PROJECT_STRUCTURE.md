@@ -64,7 +64,9 @@ android-app/
 │        ├─ GlossaryTextDecoding.kt        # 术语文件字节解码（UTF-8/BOM → GBK）
 │        ├─ OcrCacheRepository.kt          # OCR 结果短期缓存（2h TTL）
 │        ├─ TranslationHistoryRepository.kt# 翻译历史库（永久，JSON 文件，上限 500 条）
-│        ├─ BrowserHistoryRepository.kt    # 内嵌浏览器访问历史（JSON 文件，同 URL 去重置顶，上限 300 条）
+│        ├─ TranslationPageRepository.kt   # 按页翻译现场（URL/标题/页码/引擎/统计，上限 1000 页）
+│        ├─ PageSnapshotRepository.kt      # 按页缩略图 + 气泡几何（上限 500 页 / 50MB）
+│        ├─ BrowserHistoryRepository.kt    # 内嵌浏览器访问历史（同 URL 去重 + 访问次数/首次访问，上限 2000 条，原子写）
 │        ├─ PageOverlayAdjustmentRepository.kt
 │        └─ ...
 ├─ docs/
@@ -75,7 +77,10 @@ android-app/
 │  ├─ install_debug.bat
 │  ├─ reinstall_debug.bat
 │  ├─ capture_logcat.bat
-│  └─ run_regression_smoke.bat
+│  ├─ run_regression_smoke.bat
+│  ├─ backup_device_data.bat
+│  ├─ restore_device_data.bat
+│  └─ run_device_test_safe.bat
 ├─ gradle/
 ├─ build.gradle.kts
 ├─ settings.gradle.kts
@@ -97,6 +102,7 @@ android-app/
 3. `app/src/main/java/com/manga/translator/app/TranslateOrchestrator.kt`
    - 串联截图、压缩、OCR、翻译、缓存读取、擦字处理和 overlay 渲染，是主业务编排入口。
    - 句子级翻译解析（缓存查找 + 引擎分发 + 缓存/历史回写）已抽出为 `app/.../app/PageTranslationResolver.kt`，与内嵌浏览器链路共用。
+   - 翻译历史（2026-11-02）：句子表保留每句多页来源 `origins`；页面现场写入 `TranslationPageRepository`；按页聚合在 `HistoryPageGrouping.kt`，详情弹层在 `TranslationHistoryDetails.kt`。
 4. `app/src/main/java/com/manga/translator/app/WebtoonImageTranslator.kt`（内嵌浏览器链路，2026-09-28）
    - 对单张漫画图片执行「气泡检测 → OCR → 翻译 → 擦字 → 渲染译文图」，输出同尺寸 PNG；复用 ServiceLocator 全部底层能力（与悬浮球链路译文/缓存行为一致）。
    - 截页（中缝截字）处理：相邻图条带拼接 OCR（`EmbeddedBrowserScreen` 裁剪传入，带宽按图宽 `clamp(width*0.20,144,384)`）、气泡归属与「半截字」配对走 `app/.../SeamBubbleMerger.kt`（对齐 C:\homework\translator 的 seam 判据：水平重叠/**行数跨度**/间隙/合并高度 + 句子连续性；与 incomingCross 重叠则抑制，避免同一句画两遍）、跨下边界气泡打包 `CrossBubblePart` 交给下一张图补画（同扩展 stitch_overflow 思路；**注意贴片必须在 crossOut 构造之后才能回收**）。

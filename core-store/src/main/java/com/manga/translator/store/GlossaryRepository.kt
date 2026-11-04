@@ -285,12 +285,6 @@ class GlossaryRepository(context: Context) {
         }
     }
 
-    fun revision(collection: String = DEFAULT_COLLECTION): Int {
-        synchronized(lock) {
-            return collectionPayload(collection).optInt(KEY_REVISION, 0)
-        }
-    }
-
     fun count(collection: String): Int {
         synchronized(lock) {
             return collectionEntries(collection).length()
@@ -312,10 +306,6 @@ class GlossaryRepository(context: Context) {
             }
             return mergeActiveEntries(entriesByCollection, actives)
         }
-    }
-
-    fun activeRevision(): Int {
-        return getActiveCollections().sumOf { revision(it) }
     }
 
     // ------------------------------------------------------------------

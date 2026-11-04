@@ -1,5 +1,309 @@
 # Todolist
 
+## 78. 用户 2026-11-03：安全跑设备测试，避免测试卸载 app / 清本地数据
+
+### 一、问题
+
+- `:app:connectedDebugAndroidTest` 结束后 Gradle/AGP 会自动卸载主 app，
+  `files/`、`shared_prefs/` 一起被清掉；
+- 该卸载走 ddmlib，不经过 shell，`permission.bash` 的
+  `"adb uninstall *": "deny"` / `"adb shell pm uninstall *": "deny"` 拦不住；
+- 2026-11-03 排查拟声词问题时已实际踩到一次：app 被卸载，API 配置等本地数据丢失。
+
+### 二、实现
+
+- 新增 `scripts/backup_device_data.bat`：
+  - `run-as` + `tar` 备份 `files / shared_prefs / databases / no_backup`
+    到 `logs\device-backups\com.manga.translator.app-<时间>.tar`；
+  - 不安装、不卸载；备份后用 `tar -tf` 校验可读。
+- 新增 `scripts/restore_device_data.bat`：
+  - 支持指定 tar 或默认选最新备份；
+  - 恢复前 `force-stop`，push 到 `/data/local/tmp` 后 `run-as tar -xf`；
+  - 默认二次确认，`--yes` 可跳过。
+- 新增 `scripts/run_device_test_safe.bat`：
+  - 构建 `app-debug.apk` + `app-debug-androidTest.apk`；
+  - 先备份，再 `adb install -r` 主 app/测试包；
+  - 直接 `adb shell am instrument` 跑测试，解析 `OK (...)` / `FAILURES!!!`；
+  - **全程不卸载主 app**；测试包默认留下（只卸载 `com.manga.translator.app.test` 是安全的）。
+- 根 `build.gradle.kts` 增加任务图闸门：
+  - 任务图里出现 `connected*AndroidTest` 时直接抛 `GradleException`，在安装/卸载发生前终止；
+  - 确需运行时必须显式传 `-PALLOW_CONNECTED_ANDROID_TEST=true`，并先跑
+    `scripts\backup_device_data.bat`。
+- `scripts/reinstall_debug.bat` 的 `FORCE_UNINSTALL=1` 增加第二道闸：
+  - 先自动备份；还必须同时设置 `ALLOW_DATA_LOSS=1` 才允许卸载。
+
+### 三、验证
+
+- 真机 HUAWEI MAA-AN10 实测：
+  - `backup_device_data.bat` 生成约 7MB tar，包含 `files / shared_prefs / databases / no_backup`；
+  - `run_device_test_safe.bat --class com.manga.translator.app.MlKitConfidenceProbeTest --no-build`
+    5 条测试通过，跑完主 app 仍在、`files/` 仍在；
+  - `restore_device_data.bat <tar> --yes` 恢复成功，app 可正常拉起。
+- 文档：`docs/LOCAL_DEBUG_GUIDE.md` 新增「安全跑设备仪器测试」一节。
+
+### 四、边界
+
+- 备份依赖 `run-as`，只对 debug build 有效；
+- 备份不含外部存储 / `app_webview`；
+- 恢复会覆盖同名文件，恢复前如需保留当前数据，先手动跑一次备份；
+- 多设备时先设置 `ANDROID_SERIAL`。
+
+## 77. 用户 2026-11-03：分散的拟声词被合并成一块，清理图遮住一大片
+
+### 一、问题
+
+- 真机翻译历史（Lezhin，pageHash `4bee1031d4…`）里，同一页的拟声词 `하앗` 与 `쪽`
+  本来分散在画面两处，最终却合成一个 `하앗쪽` 气泡；
+- 该气泡的内容框是两段的外接框：`x=18.1%, y=57.1%, w=34.8%, h=34.8%`，
+  占页面高度约 35%，清理图/盖板跟着铺成一大片，画面很难看；
+- 不是「多模态重读」造成的：该页 `mt_translation_pages.json` 记录 `ocrEngine=ml_kit`。
+
+### 二、根因
+
+- ML Kit 的 block / line 粒度不可靠：现场把 `앗` 和 `쪽` 放进了**同一个 block 的同一行**
+  （`BLOCK 0 text=[앗 쪽]`），块级框是两段的外接框；
+- 下游 `BubbleFirstRegionPlanner` 只拿块级框/行框，无法看到中间那段空白，
+  于是当成一块文字做擦字与盖板；
+- 现有 `BubblePlausibility` 的单行 35% 高度上限刚好卡在 34.8% 之下，没有拦住。
+
+### 三、实现
+
+- 新增 `core-translate/MlKitDetachedClusterSplitter`：
+  - ML Kit 检测器把每个 `Text.Element` 的框和行号一起带出（`TextElement`）；
+  - 对可疑 block（块高 > 元素中位高 × 1.35，或同行元素间隙过大）先做**墨迹收紧**
+    （复用 `TextInkBounds`），再按元素间距聚类；
+  - 同一行间隙 > `0.45 × 较小边`、跨行间隙 > `0.85 × 较小边` 才断开，正常词距/行距不拆；
+  - 拆出的块写 `splitGroupId`，`OcrBlockMergeRules` 对同组碎片直接返回
+    `DETACHED_CLUSTER`，不会再被邻近规则拼回去；
+  - 若某个碎片被另一个块完全包含（文本子串 + 面积重叠 ≥ 0.6），直接丢弃，
+    避免 `하앗` 被拆成 `하` + `앗` 后重复翻译。
+- `MlKitTiledBlockMerger.Candidate` 透传 `splitGroupId`，分块检测路径也不丢组标识；
+- 日志：`mlkit_cluster_split from=… to=… before=[…] after=[…]`（TAG `MlKitLocalDetector`），
+  下次现场只需看这一行就能确认是否触发拆分。
+
+### 四、验证
+
+- 新增 `MlKitDetachedClusterSplitterTest` 6 条：同行远距元素拆分、正常英文词距不拆、
+  正常多行段落不拆、被完整包含的碎片丢弃、单元素块不拆、同组碎片不可再合并；
+- 真机探针（720×720 合成韩文 SFX，位置/字号按现场复刻）：
+  - 拆分前 ML Kit：`blocks=2`，`BLOCK 0 text=[앗 쪽]`（98×288）；
+  - 接入拆分后：`BLOCK 0 text=[쪽]`（92×93）、`BLOCK 1 text=[하앗]`（180×92），
+    两组框不再跨两段文字，`앗` 重复碎片被丢弃；
+- `:core-translate:testDebugUnitTest`、`:app:testDebugUnitTest` 通过；
+- 真机页面（原 Lezhin 第 4 页）复测项写入 `HumanTODO.md` 2026-11-03（第二十八轮）。
+
+### 五、边界
+
+- 只处理 ML Kit 的**元素级**合并；Paddle / 百度 / 远程多模态如果只返回一个整块
+  （没有元素框），这条规则不会拆。后续如遇到，需要在对应解析器里补 line/element 证据。
+- 拆分阈值刻意保守：正常词距（约 0.2~0.3 倍字高）和正常行距（约 0.2~0.6 倍）
+  都会连在一起，只有明显像「两段独立 SFX」的间距才拆。
+- 同一页最多把一个 block 拆成 4 段；超过 4 段视为误伤，放弃拆分、保持原行为。
+
+## 76. 用户 2026-11-03：收藏网站时弹出编辑网址 / 名称窗口
+
+### 一、需求
+
+- 顶栏收藏星点一下直接收藏，网址和名称都不给用户看/改；
+- 用户要求：收藏网站时先弹出窗口，能编辑 **网址** 和 **名称**，确认后再写入收藏。
+
+### 二、实现
+
+- `EmbeddedBrowserScreen` 的收藏星「添加」分支不再直接 `favoriteRepository.add(...)`，
+  改为打开已有的 `FavoriteEditDialog`：
+  - 网址预填**当前页完整地址**（与历史/收藏共用 `BrowserHistoryRepository.normalizeUrl`）；
+  - 名称预填域名（`BrowserFavoriteRepository.defaultLabel`，去掉 `www.`）；
+  - 两个字段都可改；确认走统一 `saveFavorite`，非法网址提示「网址无效，请填写完整地址」，
+    弹窗保持打开；成功后才关闭并刷新星标状态。
+- 新增纯函数 `favoriteEditorForCurrentPage(pageUrl)`（`EmbeddedBrowserScreen.kt`）承载预填规则，
+  `about:blank` / `data:` / `intent:` / 空地址返回 null，调用方仍提示「当前没有打开的网页」。
+- 已收藏状态保持原行为：点实心星直接「取消收藏」（名称/网址改名仍走新标签页收藏格的「编辑」）。
+- 日志：`favorite_dialog_open source=page_star url=...`、`favorite_save mode=add|edit url=... result=...`
+  （替换掉原来只在点星后打印的 `favorite_add`），排查收藏问题直接过滤 `EmbeddedBrowser`。
+
+### 三、验证
+
+- 新增 `FavoriteEditorPrefillTest` 3 条：完整 URL + 域名预填、去 `www.`/去首尾空白、
+  `about:blank`/`data:`/`intent:`/空地址不可收藏；
+- `:app:testDebugUnitTest` 全绿（含新增 3 条）；`:app:assembleDebug` 通过；
+- 真机点星后弹窗、改名保存后的星标/收藏格效果待人工复测，清单见 `HumanTODO.md` 2026-11-03（第二十七轮）。
+
+### 四、边界
+
+- 预填名称只取域名，不取网页标题（标题常带章节名/站点后缀，且可能很长；用户可自行改）；
+- 网址仍只接受 `http/https` 绝对地址，不自动补 `https://`（与「添加收藏」弹窗口径一致）；
+- 上限仍是 24 个；已满时保存提示「收藏已满」，弹窗不关闭；
+- 已收藏时点星仍是取消收藏，不弹编辑窗；如果后续需要「点已收藏的星也弹编辑窗」，
+  需要再给弹窗加删除动作，避免取消收藏失去入口。
+
+## 75. 用户 2026-11-02：浏览器历史会「吞网站」/ 有时候显示不全
+
+### 一、问题
+
+- 用户确认说的是**浏览器历史**（新标签页「历史记录」/「查看全部」），不是翻译历史。
+- SPA 站内跳转（`pushState/replaceState`）不会触发 `onPageFinished`；旧代码在
+  `doUpdateVisitedHistory` 只刷新地址栏，不写历史 → 章节/翻页类站点的子页被吞掉。
+- 同一 URL 去重成一条，但界面不显示 `visitCount` → 看起来「访问了却没记录」。
+- `MAX_ENTRIES = 300` 太小：长章节/多站点很容易满，最早访问的网站被淘汰。
+- 标题只在 `onPageFinished` 读一次；`onReceivedTitle` 晚到或 JS 后改标题时，
+  记录里标题为空/旧标题；标题存储上限只有 80 字。
+- 历史行固定 56dp、标题/URL 单行省略，没有查看完整网址/首次访问/访问次数的入口。
+- 历史 JSON 直接覆盖写；进程被杀/断电留下半截 JSON 时，下次解析失败会整份清空。
+
+### 二、实现
+
+- 记录时机：
+  - `doUpdateVisitedHistory` 里补 `recordHistory`，覆盖 SPA 站内跳转；
+  - `onPageStarted` 清空 `lastRecordedUrl`，刷新/重新进入同一 URL 也算一次新访问；
+  - `WebChromeClient.onReceivedTitle` → `BrowserHistoryRepository.updateTitle`，
+    只补标题、不重复加访问次数；
+  - 记录时间用事件发生时刻 `visitedAt`，避免多个写入协程乱序导致 `lastVisitMs` 错。
+- 数据：
+  - `BrowserHistoryEntry` 新增 `firstVisitMs`；旧数据加载时回退为 `lastVisitMs`；
+  - `MAX_ENTRIES` 300 → **2000**；`MAX_TITLE_LENGTH` 80 → **300**；
+  - `urlWithoutScheme` 展示截断独立为 `MAX_URL_DISPLAY_LENGTH = 120`，完整 URL 进详情弹层；
+  - 写盘改为「临时文件 + ATOMIC_MOVE」，失败才回退直接写，避免半截 JSON 清空历史。
+- UI：
+  - 新标签页标题显示 `历史记录（N）`，完整历史页标题右侧显示 `N 条`；
+  - 每行 URL 后显示 `· 访问 N 次`；
+  - 长按历史行打开详情弹层：完整标题、完整 URL、站点、访问次数、首次/最近访问，
+    可「打开 / 复制网址 / 删除记录」；
+  - 完整历史页顶部提示「长按记录查看完整网址与访问详情」。
+
+### 三、验证
+
+- `:core-store:testDebugUnitTest` **198 条**通过（`BrowserHistoryRepositoryTest` 补 firstVisit / 迁移 / hostOf / URL 截断）；
+- `:app:testDebugUnitTest` **403 条**通过（新增 `BrowserHistoryFormattingTest`）；
+- `:app:assembleDebug` 通过并安装 emulator-5554；
+- 模拟机手动检查：
+  - `lang-ko.html` 首次访问后历史出现；再次打开同一 URL，行内 `访问 2 次`；
+  - SPA 夹具 `127.0.0.1:8777/spa.html` 每 2.5s `pushState` 一次：
+    logcat `url_updated source=doUpdateVisitedHistory` + `history_record ...?page=1..10`；
+    新标签页显示 `历史记录（18）`，列表出现 `SPA page 1..10`，不再只留入口页；
+  - 长按行打开详情，完整 URL/标题/首次/最近时间正确，复制/删除可用；
+  - 刷新页面后 `访问` 次数增加；
+  - 旧历史文件（没有 firstVisitMs）加载后首次访问显示最近访问时间，不显示 1970。
+
+### 四、边界
+
+- 同一 URL 仍合并成一条记录（用 `访问 N 次` 表达重复访问），不是逐次流水；
+  如果用户需要「每次访问一行」，要另做数据结构/UI，不和本次混在一起。
+- query / hash 不同的 URL 仍视为不同记录（SPA 常用 `#/route`、`?chapter=` 定位）。
+- 历史仍只记 http/https；`about:`、`data:`、`intent:` 等不入库。
+- 标题最多存 300 字；超过部分详情里也看不到（正常网页标题远小于此）。
+- 旧记录没有首次访问时间，首次=最近访问时间是迁移口径，不是真实首次访问。
+
+## 74. 用户 2026-11-02：历史记录「记载有问题」—— 多页来源 + 页面详情 + 来源筛选修正
+
+### 一、问题
+
+- 用户反馈翻译历史的记载感觉有问题，希望尽量详细。
+- 旧模型每句只有一个 `originPageHash` / `originLabel`：同一句在多页出现时，后一页会把前一页覆盖，
+  「按页」历史会少句、串页；句子行也看不到「这句还在哪些页出现过」。
+- 网页漫画主链路没有显式设置来源：`TranslationOrigin.label` 可能为空，或沿用上一次截图翻译留下的
+  「截图翻译」，历史里会把漫画页记成截图。
+- 按页卡片的时间取组内句子的 `max(lastHitAtMs, createdAtMs)`：只要在别的页命中一次缓存，
+  旧页就会被顶成「刚刚」，不是这一页真正翻译的时间。
+- 来源筛选计数只看主来源；按页展开后同一句可能同时属于网页文字和漫画图片，两个视图数字对不上。
+- 详情不足：没有 URL、页面标题、页码、OCR/翻译引擎、本页新翻/复用/跳过句数、每页命中次数。
+
+### 二、实现
+
+- `core-store/TranslationPageRepository.kt`（新增）：
+  - `TranslationOriginContext`（kind / label / url / title / pageIndex / pageTotal / runId）由调用方显式传入，
+    不再用全局 `TranslationOrigin.label` 承载来源；
+  - `TranslationPageInfo` 按 `pageHash` 记录：来源类型、站点、URL、标题、页码、语言对、OCR/翻译引擎、
+    首次/最近翻译时间、翻译次数、本页句子/新翻/复用（精确/近似/模糊）/跳过/术语过期；
+  - `runId` 区分一次逻辑运行；`accumulateStats=true`（网页文字多批）时累加统计，
+    否则同一 run 的重跑覆盖统计（避免一张图重跑两次句数翻倍），不同 run 才把 `translateCount + 1`；
+  - 上限 1000 页，JSON 落盘 `mt_translation_pages.json`。
+- `SentenceTranslation` 增加 `origins: List<SentenceOrigin>`（每页的 firstSeen / lastSeen / hitCount /
+  lastMatchKind，最多 12 页）；旧数据加载时用旧单页字段合成一条，不需要改缓存版本。
+- `lookup` 增加 `originPageHash/originLabel`：命中缓存时把「本页也出现过」写进来源；`putAll` 新译文也合并来源。
+- `PageTranslationResolver`：缓存统计后把页面现场写入 `TranslationPageRepository`；全缓存/失败也会记录；
+  页面文本翻译按会话 `runId` 累加。
+- 来源接线：网页漫画连续会话（`WEBTOON`）、网页截图（`WEB_SCREENSHOT`）、Pixiv（`PIXIV`）、
+  网页文字（`WEBPAGE_TEXT`）、悬浮球截图（`SCREENSHOT`）分别传入 URL/标题/页码；修掉网页漫画来源为空/串成截图。
+- `SentencesScreen`：
+  - 「按句」meta 显示来源、首次、最近、命中次数、语言对；
+  - 「按页」按每句 origins 展开（同一句可出现在多张页卡片），卡片头显示站点/标题/页码/新翻·复用·跳过/语言/短引擎名；
+  - 新增「详情」页面弹层（URL、页标识、引擎、首次/最近、翻译次数、本页统计、缩略图）；
+  - 点击句子行打开「译文详情」：语言、首次入库、最近命中、命中次数、术语状态、所有页面来源；
+  - 来源筛选改为「任一来源匹配」，计数与按页展开一致；
+  - 清空句子时一并清掉页面级详情（缩略图仍由「管理图片」单独管理）。
+
+### 三、验证
+
+- `:core-store:testDebugUnitTest` 196 条通过（新增 `SentenceOriginTest`、`TranslationPageRepositoryTest`）；
+- `:app:testDebugUnitTest` 402 条通过（新增 `HistoryPageGroupingTest`、`TranslationHistoryFormattingTest`）；
+- `:core-translate:testDebugUnitTest` 280 条通过；`:app:assembleDebug` 通过并安装 emulator-5554。
+- 模拟机 `http://127.0.0.1:8766/lang-ko.html`：
+  - logcat `TranslationHistory: page_record page=0dfb76a4… kind=webtoon count=2 new=0 cache=2 run=webtoon:1:mt2:…`；
+  - `files/mt_translation_pages.json` 含 kind/label/url/title/pageIndex/pageTotal/引擎/统计；
+  - 按页卡片：`漫画/图片 · 127.0.0.1:8766 · 2 句 · 1 分钟前` / `lang-ko-img` /
+    `第 2/2 页 · 新翻 0 · 复用 2 · 跳过 0 · 韩文 → 简体中文 · ML Kit 本地`；
+  - 句子行：`本页最近 1 分钟前 · 本页命中 2 次 · 韩文 → 简体中文`；
+  - 页面详情与译文详情弹层字段完整；旧数据仍可按原有单页字段显示。
+- 旧句子缓存加载后自动补 `origins`（现场 JSON 已出现 `lastMatchKind=EXACT`、本页命中 2 次）。
+
+### 四、边界
+
+- 同一句最多保留 12 页来源，超出丢最久以前的页；页面级详情上限 1000 页。
+- 旧记录没有 `TranslationPageInfo`：卡片只显示来源 / 句数 / 来源命中，详情弹层明确写「旧记录没有页面级详情」。
+- `pageHash` 仍是内容标识：同一张图在不同站点出现会共用一条页面详情；来源列表本身按页去重。
+- 页面级统计记录的是「最近一次 run」（网页文字按一次会话累加）；不是逐次运行的历史流水。
+- 清空句子会清页面级详情，但不会自动删页面缩略图（避免误删用户手动保存的图）。
+
+## 73. 用户 2026-11-02：翻译历史按页保存原图 / 标记版 + 图片管理
+
+### 一、需求
+
+- 用户希望「按页查看翻译历史时保留原图」，并且原图和带标记版都要能看；
+- 不只是排查多模态重读的框，其他问题也可能需要保存；
+- 功能要能自己开关，已保存的图要能管理、单张删除、清空。
+
+### 二、实现
+
+- **开关**：`SettingsRepository.isHistorySnapshotEnabled()`，默认关；翻译历史页顶部「保存页面缩略图」。只对开启后新翻的页面生效。
+- **存储**：`core-store/PageSnapshotRepository`，以 `pageHash` 为键，存 `filesDir/page_snapshots/<pageHash>/original.jpg` + `mt_page_snapshots.json`；上限 500 页 / 50MB，超了淘汰最旧图；删除只动图，不动句子历史。
+- **缩略图**：`app/HistorySnapshotFactory` 在翻译时裁剪当前页（网页链路按 `topH + source.height` 去掉接缝条带），360px 宽、最长 1400px、JPEG 72；悬浮球传整张截图。
+- **标记版**：不落盘，查看时按历史气泡几何实时画框（蓝=外框，红=内容框）；可「保存到相册」。
+- **接线**：`PageTranslationResolver` 在句子缓存提前返回之前生成缩略图（整页全缓存也留图）；`TranslateOrchestrator` / `WebtoonImageTranslator` 传源图与裁剪参数；网页漫画补传 `TranslationOriginContext`（URL/标题/页码），按页卡片显示页面现场。
+- **UI**：`SentencesScreen` 按页卡片左侧缩略图；点开「原图 / 标记版」；「管理图片」显示张数/占用、单张删除、清空全部。
+- **多模态标记**：`VisionFallbackTracker` 在 `ocr_vision_fallback replace=true` 时按同一 `pageHash` 记一页；按页卡片/快照查看器显示「多模态重读」，不用再翻 logcat 判断框是不是它画的。
+
+### 三、验证
+
+- 模拟器 Pixel_8：`http://127.0.0.1:8766/lang-ko.html` 翻译后 logcat `HistorySnapshot snapshot_create src=720x900 crop=0+900 out=360x450 bytes=16929`；`page_record ... kind=webtoon`；按页卡片出现缩略图、站点、标题、`第 2/2 页 · 新翻 0 · 复用 2`。
+- 原图/标记版切换、保存到相册、删除图片、管理图片、清空图片均在模拟器验证；删除后卡片头缩略图立即消失。
+- 单测：`app` / `core-store` / `core-translate` 全绿（新增 `PageSnapshotCodecTest` 6 条；`SentenceOriginBackfillTest` 按新的 `origins` 语义补条件后恢复幂等）；`:app:assembleDebug` 通过并安装到 emulator-5554。
+- 人工复测清单见 `HumanTODO.md` 2026-11-02（第二十四轮）。
+
+## 72. 用户 2026-11-02：改了术语，新翻译仍用旧译名 —— 句子缓存加术语指纹 + 韩文匹配/术语修复
+
+### 一、根因
+
+- 句子缓存 key 只有 `源语言|目标语言|原文`，术语内容不参与命中判断；
+- 新图也会命中旧缓存：缓存按**句**存，不按图存；同一句以前在别的页翻过就会直接返回旧译文；
+- 术语注入本身正常（云端 API 下新句子确实能用新术语），所以问题不是术语表没保存、也不是提示词没注入。
+
+### 二、实现
+
+- `core-translate/GlossaryTermMatch.kt`：韩文助词链匹配（이/가/은/는/을/를/님/씨/라고요…）、NFC、空白折叠；拉丁词边界；拒绝更长单词。
+- `core-translate/GlossaryFingerprint.kt`：`active` = 全部生效词条内容指纹；`relevant` = 只算这句原文命中的词条。句子缓存用后者，页面历史 key 用前者。
+- `core-translate/TermRepair.kt`：译文里残留术语原文拼写时就地替换；韩文吃助词尾巴、拉丁词边界、长词优先、译名含原文则跳过。
+- `core-store/SentenceTranslationRepository.kt`：`SentenceTranslation` / `SentenceTranslationUpdate` 增加 `glossaryFingerprint`；`lookup` 指纹不一致返回 stale miss；用户手工改过的译文写 `manual` 哨兵，永不被术语变动覆盖；旧缓存无该字段时按空串加载（含生效术语的句子自动重译，不含的照常命中）。
+- `app/PageTranslationResolver.kt`：查缓存/写缓存都带 per-sentence 指纹；`buildTranslateKey` 改用全量术语指纹，删掉 `activeRevision` 求和。
+- `core-translate/OpenAiVisionClient.kt`：术语注入过滤改用 `matchesSourceTerm`；请求前日志 `glossary_batch` / `glossary_line`，翻译后 `term_repair` / `glossary_miss`。
+- 三处调用点（悬浮球 / 漫画 / 网页文字）只读一次 `activeGlossaryEntries()`，不再单独读 revision。
+
+### 三、验证
+
+- `:core-translate:testDebugUnitTest` 通过（新增 `GlossaryTermMatchTest` / `GlossaryFingerprintTest` / `TermRepairTest`；`TranslatePromptTest` 补韩文助词与拉丁边界）。
+- `:core-store:testDebugUnitTest --tests com.manga.translator.store.SentenceCacheGlossaryFingerprintTest` 通过。
+- 干净 worktree 里 `:app:compileDebugKotlin` + `:app:testDebugUnitTest` 通过。
+- 真机未复测（用户明确不验证）；同日并行的「翻译历史来源/页面快照」WIP 与本轮无关。
+
 ## 71. 用户 2026-11-01：网页文字球与漫画球合并为一组（参考 translator）
 
 ### 一、需求

@@ -119,6 +119,24 @@ data class RegionOcrResult(
     val layout: String
 )
 
+/**
+ * ML Kit 的**元素**（element）级文字框（2026-11-03，拟声词分散合框）。
+ *
+ * 为什么需要它：ML Kit 的 `Text.Line` 有时会把**相距很远的两段拟声词**放进同一行
+ * （现场 `앗` 与 `쪽` 同属一个 block 的同一个 line），只靠 `lineBoxes` 无法看出
+ * 中间那段空白，最终整块并成一个超大盖板。元素级框 + 墨迹收紧后才能把它们拆开。
+ *
+ * 坐标系与 [TextBlock] 相同（图片像素）；[lineIndex] 保留 ML Kit 的行序。
+ */
+data class TextElement(
+    val text: String,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val lineIndex: Int
+)
+
 data class TextBlock(
     val id: Int,
     val text: String,
@@ -147,12 +165,26 @@ data class TextBlock(
     /**
      * 逐行文字框（**图片像素**，每行 `[left, top, right, bottom]`）。
      *
-     * ML Kit 的段落级块自带每行 boundingBox（除回检测缩放后带出）；Paddle / 远程 OCR
+     * ML Kit 的段落级块自带每行 boundingBox（除回缩放后带出）；Paddle / 远程 OCR
      * 拿不到时为 null。用途（2026-10-14「字号以原文为基准」）：行高中位数 = 原文行高、
      * 行框并集 = 真实字形区 —— 块级框偏松且会粘到气泡描边，「块框高 ÷ 行数」把字号
      * 系统性放大 1/3、盖板比原文大一圈（用户截图：译文戳出气泡下沿）。
      */
-    val lineBoxes: List<FloatArray>? = null
+    val lineBoxes: List<FloatArray>? = null,
+    /**
+     * ML Kit 元素级框（可空；Paddle / 远程 OCR 没有）。
+     *
+     * 只在 ML Kit 检测器内部用于「同一 block 里相距很远的元素拆段」；合并器只看
+     * 块级/行级字段，拆分完成后这个字段不再参与布局。
+     */
+    val elements: List<TextElement>? = null,
+    /**
+     * 「从一个 block 里按元素间距拆出来」的组标识（可空）。
+     *
+     * 同一组拆出来的块**不允许再被 [OcrBlockMergeRules] 合并回去**，否则
+     * `앗 | 쪽` 又会被邻近规则拼成一块超大盖板。不同组（或 null）仍按原规则判。
+     */
+    val splitGroupId: String? = null
 )
 
 data class TextBlockGroup(

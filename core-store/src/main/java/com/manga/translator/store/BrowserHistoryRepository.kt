@@ -4,13 +4,17 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /** 一条内嵌浏览器访问记录（同一 URL 只保留最新一条，用 [visitCount] 记录次数）。 */
 data class BrowserHistoryEntry(
     val url: String,
     val title: String,
     val lastVisitMs: Long,
-    val visitCount: Int
+    val visitCount: Int,
+    /** 第一次访问时间（2026-11-02）；旧数据加载时回退为 lastVisitMs。 */
+    val firstVisitMs: Long = 0L
 )
 
 /**
@@ -46,6 +50,26 @@ class BrowserHistoryRepository(context: Context) {
         return true
     }
 
+    /**
+     * 更新某条记录的标题（2026-11-02）。
+     *
+     * WebView 的 `onReceivedTitle` 经常晚于 `onPageFinished`，甚至页面已经渲染完才由 JS
+     * 改标题。旧实现只在 onPageFinished 读一次 title，空标题/懒加载标题会永久缺失；
+     * 这里只改标题，不动访问次数与时间。
+     */
+    fun updateTitle(url: String, title: String): Boolean {
+        val normalized = normalizeUrl(url) ?: return false
+        val sanitized = title.trim().replace(Regex("\\s+"), " ").take(MAX_TITLE_LENGTH)
+        if (sanitized.isBlank()) return false
+        synchronized(lock) {
+            val entries = loadAll()
+            val existing = entries.firstOrNull { it.url == normalized } ?: return false
+            if (existing.title == sanitized) return false
+            write(entries.map { if (it.url == normalized) it.copy(title = sanitized) else it })
+            return true
+        }
+    }
+
     fun delete(url: String): Boolean {
         synchronized(lock) {
             val entries = loadAll()
@@ -76,15 +100,42 @@ class BrowserHistoryRepository(context: Context) {
 
     private fun write(entries: List<BrowserHistoryEntry>) {
         file.parentFile?.mkdirs()
-        file.writeText(toStoreJson(entries))
+        val json = toStoreJson(entries)
+        // 原子写（2026-11-02）：历史文件在每次访问后都会重写，直接覆盖时进程被杀/断电
+        // 可能留下半截 JSON；下次启动 parse 失败会整份历史清空，表现就是「网站被吞了」。
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        runCatching {
+            tmp.writeText(json)
+            Files.move(
+                tmp.toPath(),
+                file.toPath(),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE
+            )
+        }.onFailure {
+            runCatching {
+                file.writeText(json)
+                tmp.delete()
+            }
+        }
     }
 
     /** 纯逻辑放这里：app 模块（浏览器 UI）与单测都要用，故为 public。 */
     companion object {
         const val FILE_NAME = "mt_browser_history.json"
-        const val MAX_ENTRIES = 300
+
+        /**
+         * 历史条数上限（2026-11-02 从 300 提到 2000）。
+         *
+         * 300 条对「每个章节一个 URL」的漫画站来说很容易满：用户翻几十话再回看，
+         * 最早的站点已经被淘汰，看起来就是「网站被吞了」。单条约 200 字节，2000 条约 0.4MB。
+         */
+        const val MAX_ENTRIES = 2000
         const val DEFAULT_RECENT_LIMIT = 12
-        const val MAX_TITLE_LENGTH = 80
+        /** 页面标题存储上限；展示行仍由 UI 决定省略，详情弹层可看完整文本。 */
+        const val MAX_TITLE_LENGTH = 300
+        /** 历史行/日志里的 URL 展示上限（完整 URL 在详情弹层里看）。 */
+        const val MAX_URL_DISPLAY_LENGTH = 120
 
         /** 只接受 http/https 绝对地址（about:blank、data:、intent: 等不入库）。 */
         fun normalizeUrl(raw: String): String? {
@@ -106,12 +157,16 @@ class BrowserHistoryRepository(context: Context) {
             max: Int
         ): List<BrowserHistoryEntry> {
             val previous = existing.firstOrNull { it.url == url }
-            val sanitizedTitle = title.trim().take(MAX_TITLE_LENGTH)
+            val sanitizedTitle = title.trim().replace(Regex("\\s+"), " ").take(MAX_TITLE_LENGTH)
+            val firstVisit = previous?.firstVisitMs?.takeIf { it > 0L }
+                ?: previous?.lastVisitMs?.takeIf { it > 0L }
+                ?: nowMs
             val updated = BrowserHistoryEntry(
                 url = url,
                 title = sanitizedTitle.ifBlank { previous?.title.orEmpty() },
-                lastVisitMs = nowMs,
-                visitCount = (previous?.visitCount ?: 0) + 1
+                lastVisitMs = maxOf(previous?.lastVisitMs ?: 0L, nowMs),
+                visitCount = (previous?.visitCount ?: 0) + 1,
+                firstVisitMs = firstVisit
             )
             val rest = existing.filterNot { it.url == url }
             return (listOf(updated) + rest)
@@ -126,14 +181,35 @@ class BrowserHistoryRepository(context: Context) {
             return urlWithoutScheme(entry.url)
         }
 
-        /** 去掉 `https://` 前缀、去掉结尾 `/`、截断过长的查询串。 */
+        /** 去掉 `https://` 前缀、去掉结尾 `/`、截断过长的查询串（只用于展示/日志）。 */
         fun urlWithoutScheme(url: String): String {
             val stripped = url.trim()
                 .removePrefix("https://")
                 .removePrefix("http://")
                 .removePrefix("www.")
             val trimmed = stripped.trimEnd('/')
-            return if (trimmed.length <= MAX_TITLE_LENGTH) trimmed else trimmed.take(MAX_TITLE_LENGTH - 1) + "…"
+            return if (trimmed.length <= MAX_URL_DISPLAY_LENGTH) {
+                trimmed
+            } else {
+                trimmed.take(MAX_URL_DISPLAY_LENGTH - 1) + "…"
+            }
+        }
+
+        /** `https://www.a.com/x` → `a.com`；无效 URL 返回空串。 */
+        fun hostOf(url: String): String {
+            val raw = url.trim()
+            if (raw.isEmpty()) return ""
+            return runCatching {
+                java.net.URI(raw).host.orEmpty().removePrefix("www.")
+            }.getOrElse {
+                // 兜底：URI 解析失败时仍按字符串前缀取主机，至少不让详情空着。
+                raw.substringAfter("://", raw)
+                    .substringBefore('/')
+                    .substringBefore('?')
+                    .substringBefore('#')
+                    .substringBefore(':')
+                    .removePrefix("www.")
+            }
         }
 
         internal fun parseEntriesText(text: String): List<BrowserHistoryEntry> {
@@ -145,11 +221,16 @@ class BrowserHistoryRepository(context: Context) {
                     val item = arr.optJSONObject(index) ?: continue
                     val url = item.optString("url", "").trim()
                     if (url.isEmpty()) continue
+                    val lastVisitMs = item.optLong("lastVisitMs", 0L)
                     entries += BrowserHistoryEntry(
                         url = url,
                         title = item.optString("title", ""),
-                        lastVisitMs = item.optLong("lastVisitMs", 0L),
-                        visitCount = item.optInt("visitCount", 1).coerceAtLeast(1)
+                        lastVisitMs = lastVisitMs,
+                        visitCount = item.optInt("visitCount", 1).coerceAtLeast(1),
+                        // 旧文件没有 firstVisitMs：回退为 lastVisitMs，详情里至少不是 1970。
+                        firstVisitMs = item.optLong("firstVisitMs", 0L)
+                            .takeIf { it > 0L }
+                            ?: lastVisitMs
                     )
                 }
                 entries
@@ -165,6 +246,7 @@ class BrowserHistoryRepository(context: Context) {
                         .put("title", entry.title)
                         .put("lastVisitMs", entry.lastVisitMs)
                         .put("visitCount", entry.visitCount)
+                        .put("firstVisitMs", entry.firstVisitMs)
                 )
             }
             return JSONObject().put("entries", arr).toString()

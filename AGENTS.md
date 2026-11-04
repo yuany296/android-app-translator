@@ -34,6 +34,18 @@
 - 日志应覆盖关键时序与关键参数（如输入、输出、坐标换算、状态切换、错误类型），并使用稳定 Tag 便于过滤。
 - 完成修复前必须基于日志做一次检错闭环：复现 -> 采集日志 -> 定位 -> 修复 -> 复测 -> 清理临时日志（保留必要诊断日志）。
 
+## 5. 真机设备测试安全（长期生效）
+
+- **禁止**直接运行 `:app:connectedDebugAndroidTest`：任务结束 Gradle/AGP 会自动卸载主 app，
+  连同 `files/`、`shared_prefs/` 一起清空；该卸载走 ddmlib，`permission.bash` 的
+  `adb uninstall` deny 规则拦不住。
+- 根 `build.gradle.kts` 已加闸门：`connected*AndroidTest` 会在任务图阶段直接失败；
+  只有显式 `-PALLOW_CONNECTED_ANDROID_TEST=true` 且先备份时才允许运行。
+- 跑设备测试统一用 `scripts\run_device_test_safe.bat`（先备份、`install -r`、`am instrument`，
+  不卸载主 app）；详见 `docs/LOCAL_DEBUG_GUIDE.md`。
+- **禁止**卸载 `com.manga.translator.app`；只有测试包 `com.manga.translator.app.test` 可以单独卸载。
+- 任何可能重装/卸载/清数据的操作前，先运行 `scripts\backup_device_data.bat`。
+
 ## Agent skills
 
 ### Issue tracker

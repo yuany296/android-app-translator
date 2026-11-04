@@ -93,10 +93,19 @@ class SentenceOriginBackfillTest {
 
     @Test
     fun `已填满的条目不再动 保证幂等`() {
-        val patched = SentenceTranslationRepository.backfilledEntry(
-            entry(hash = "already", created = 999L),
-            snapshot
+        // 2026-11-02 起「填满」还包括多页来源列表：只补 hash/时间的旧规则会让
+        // 每次启动都重建 origins，破坏幂等。这里用已经有一条来源的条目钉住。
+        val filled = entry(hash = "already", created = 999L).copy(
+            origins = listOf(
+                SentenceOrigin(
+                    pageHash = "already",
+                    firstSeenAtMs = 999L,
+                    lastSeenAtMs = 999L,
+                    lastMatchKind = "NEW"
+                )
+            )
         )
+        val patched = SentenceTranslationRepository.backfilledEntry(filled, snapshot)
         assertNull(patched)
     }
 

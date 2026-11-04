@@ -28,7 +28,13 @@ enum class OcrMergeReason {
     GAP,
 
     /** 拒绝：宽度/边缘/中心对齐都不满足（不是一个段落的对齐形态）。 */
-    ALIGNMENT
+    ALIGNMENT,
+
+    /**
+     * 拒绝：两块是同一个 ML Kit block 里**按元素间距拆出来**的碎片
+     * （见 [MlKitDetachedClusterSplitter]）。拆开就是为了不让它们再合成一块。
+     */
+    DETACHED_CLUSTER
 }
 
 /**
@@ -118,6 +124,11 @@ object OcrBlockMergeRules {
         b: TextBlock,
         sameKnownRegion: Boolean = false
     ): OcrMergeDecision {
+        // 同一个 block 里拆出来的碎片：拆开是刻意的，不能再被邻近规则拼回去。
+        // 只拦「同组」；不同组（或 null）仍按原规则判，避免影响正常段落合并。
+        if (a.splitGroupId != null && a.splitGroupId == b.splitGroupId) {
+            return reject(OcrMergeReason.DETACHED_CLUSTER, a, b, vertical = false)
+        }
         val verticalA = TextLineGeometry.isVerticalColumn(a)
         val verticalB = TextLineGeometry.isVerticalColumn(b)
         val columnPair = looksLikeColumnPair(a, b)

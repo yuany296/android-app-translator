@@ -13,6 +13,9 @@
 - 重装并拉起：`scripts\reinstall_debug.bat`
 - 导出日志：`scripts\capture_logcat.bat`
 - 回归冒烟脚本：`scripts\run_regression_smoke.bat`
+- **备份 app 数据**：`scripts\backup_device_data.bat`
+- **恢复 app 数据**：`scripts\restore_device_data.bat`
+- **安全跑设备测试（不卸载主 app）**：`scripts\run_device_test_safe.bat`
 
 ## USB 授权修复（unauthorized）
 
@@ -163,10 +166,59 @@ curl.exe -L -o bt35.zip https://mirrors.cloud.tencent.com/AndroidSDK/build-tools
 .\gradlew.bat :app:assembleDebugAndroidTest # 仪器测试包
 ```
 
+## 安全跑设备仪器测试（不要用 connectedAndroidTest）
+
+> ⚠️ **2026-11-03 踩坑**：`connectedDebugAndroidTest` 结束后由 Gradle/AGP **自动卸载主 app**，
+> `files/`、`shared_prefs/` 一起被删。这个卸载走 ddmlib，不经过 shell，所以
+> `permission.bash` 里的 `"adb uninstall *": "deny"` / `"adb shell pm uninstall *": "deny"` **拦不住**。
+>
+> 根目录 `build.gradle.kts` 已加任务图闸门：直接跑 `connected*AndroidTest` 会在执行前失败；
+> 确需运行时先备份，再加 `-PALLOW_CONNECTED_ANDROID_TEST=true`。
+
+安全流程：
+
+```powershell
+# 1) 跑指定测试（默认会先备份 app 数据，再 install -r，再 am instrument）
+scripts\run_device_test_safe.bat --class com.manga.translator.app.MlKitConfidenceProbeTest
+
+# 2) 跑某个方法
+scripts\run_device_test_safe.bat --class com.manga.translator.app.FooTest --method bar
+
+# 3) 不重新构建 / 不备份（知道风险时）
+scripts\run_device_test_safe.bat --no-build --no-backup
+```
+
+脚本做这些事：
+
+1. 构建 `app-debug.apk` + `app-debug-androidTest.apk`；
+2. `scripts\backup_device_data.bat` 备份 `files / shared_prefs / databases / no_backup`
+   到 `logs\device-backups\`；
+3. `adb install -r` 安装主 app 和测试包（**保留数据**）；
+4. `adb shell am instrument` 直接跑测试；
+5. 解析 `OK (...)` / `FAILURES!!!`，日志写到 `logs\device-tests\`；
+6. **不卸载主 app**；测试包默认留下（只卸载 `com.manga.translator.app.test` 是安全的）。
+
+单独备份/恢复：
+
+```powershell
+scripts\backup_device_data.bat
+scripts\restore_device_data.bat "logs\device-backups\com.manga.translator.app-<时间>.tar"
+# 恢复默认选最新备份；加 --yes 可跳过交互确认
+```
+
+注意：
+
+- 备份依赖 `run-as`，只适用于 **debug build**；
+- 多设备时先 `set ANDROID_SERIAL=xxxx`；
+- 备份范围是 app 私有目录的四个数据目录，不含外部存储 / `app_webview`；
+- 恢复会覆盖同名文件；想保留当前数据，先手动跑一次 `backup_device_data.bat`；
+- `reinstall_debug.bat` 的 `FORCE_UNINSTALL=1` 现在还必须同时设置 `ALLOW_DATA_LOSS=1`，
+  并且会先自动备份，避免再次误删。
 
 ## 安装失败排查
 
-1. `INSTALL_FAILED_VERSION_DOWNGRADE`：先 `adb uninstall com.manga.translator.app` 再安装。
+1. `INSTALL_FAILED_VERSION_DOWNGRADE`：先跑 `scripts\backup_device_data.bat`，再考虑卸载；
+   不要在没有备份时直接 `adb uninstall com.manga.translator.app`（会清掉全部本地数据）。
 2. `INSTALL_FAILED_USER_RESTRICTED`：手机侧允许 USB 安装/调试安装。
 3. `no devices/emulators found`：先执行 `scripts\check_device.bat`。
 4. APK 不存在：先执行 `scripts\build_debug.bat`。

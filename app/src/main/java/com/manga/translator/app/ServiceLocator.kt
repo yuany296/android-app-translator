@@ -15,10 +15,12 @@ import com.manga.translator.store.BrowserHistoryRepository
 import com.manga.translator.store.OcrEngine
 import com.manga.translator.store.OriginSnapshot
 import com.manga.translator.store.PageOverlayAdjustmentRepository
+import com.manga.translator.store.PageSnapshotRepository
 import com.manga.translator.store.parseHistoryBubbles
 import com.manga.translator.store.SentenceTranslationRepository
 import com.manga.translator.store.SettingsRepository
 import com.manga.translator.store.TranslationHistoryRepository
+import com.manga.translator.store.TranslationPageRepository
 import com.manga.translator.translate.BaiduTranslateClient
 import com.manga.translator.translate.LocalTextDetector
 import com.manga.translator.translate.LocalTranslator
@@ -30,6 +32,7 @@ import com.manga.translator.translate.TextBlock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 object ServiceLocator {
     private lateinit var appContext: Context
@@ -52,6 +55,10 @@ object ServiceLocator {
     lateinit var browserFavoriteRepository: BrowserFavoriteRepository
         private set
     lateinit var pageOverlayAdjustmentRepository: PageOverlayAdjustmentRepository
+        private set
+    lateinit var pageSnapshotRepository: PageSnapshotRepository
+        private set
+    lateinit var translationPageRepository: TranslationPageRepository
         private set
     lateinit var captureSessionStateStore: CaptureSessionStateStore
         private set
@@ -87,6 +94,11 @@ object ServiceLocator {
         browserHistoryRepository = BrowserHistoryRepository(appContext)
         browserFavoriteRepository = BrowserFavoriteRepository(appContext)
         pageOverlayAdjustmentRepository = PageOverlayAdjustmentRepository(appContext)
+        pageSnapshotRepository = PageSnapshotRepository(appContext)
+        translationPageRepository = TranslationPageRepository(appContext)
+        // 预热页面快照/页面历史索引（IO 线程）：按页历史第一次组合时不必在主线程读 JSON。
+        appScope.launch { runCatching { pageSnapshotRepository.all() } }
+        appScope.launch { runCatching { translationPageRepository.all() } }
         captureSessionStateStore = CaptureSessionStateStore(appContext)
         visionClient = OpenAiVisionClient()
         baiduTranslateClient = BaiduTranslateClient()
@@ -382,6 +394,21 @@ class EngineSelectingTextDetector(
             TAG,
             "ocr_vision_fallback local=${local.size} vision=${vision.size} took=${tookMs}ms replace=$replace"
         )
+        if (replace) {
+            // 页级标记：翻译历史 → 按页 直接显示「多模态重读」，不用再翻 logcat。
+            // pageHash 与 WebtoonImageTranslator/TranslateOrchestrator 用同一套采样算法，
+            // 因此能和句子历史/页面快照按同一页对上。
+            runCatching {
+                val pageHash = ServiceLocator.eraseProcessor.buildPageHash(bitmap)
+                VisionFallbackTracker.mark(pageHash)
+                android.util.Log.d(TAG, "vision_fallback_page page=$pageHash")
+            }.onFailure {
+                android.util.Log.w(
+                    TAG,
+                    "vision_fallback_page_hash_fail reason=${it.message?.take(80)}"
+                )
+            }
+        }
         if (vision.isEmpty() && localEmpty) {
             emptyVisionMisses += 1
         } else if (vision.isNotEmpty()) {

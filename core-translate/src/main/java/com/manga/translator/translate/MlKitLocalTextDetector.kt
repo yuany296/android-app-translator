@@ -76,7 +76,8 @@ class MlKitLocalTextDetector : LocalTextDetector {
                 bottom = block.bottom,
                 lineCount = block.lineCount,
                 lineBoxes = block.lineBoxes,
-                tileIndex = 0
+                tileIndex = 0,
+                splitGroupId = block.splitGroupId
             )
         }
         val merged = MlKitTiledBlockMerger.merge(candidates)
@@ -91,7 +92,8 @@ class MlKitLocalTextDetector : LocalTextDetector {
                 bottom = candidate.bottom,
                 confidence = 0f,
                 lineCount = candidate.lineCount,
-                lineBoxes = candidate.lineBoxes
+                lineBoxes = candidate.lineBoxes,
+                splitGroupId = candidate.splitGroupId
             )
         }
     }
@@ -160,7 +162,8 @@ class MlKitLocalTextDetector : LocalTextDetector {
                     bottom = block.bottom,
                     lineCount = block.lineCount,
                     lineBoxes = block.lineBoxes,
-                    tileIndex = index
+                    tileIndex = index,
+                    splitGroupId = block.splitGroupId
                 )
             }
         }
@@ -185,7 +188,8 @@ class MlKitLocalTextDetector : LocalTextDetector {
                 bottom = candidate.bottom,
                 confidence = 0f,
                 lineCount = candidate.lineCount,
-                lineBoxes = candidate.lineBoxes
+                lineBoxes = candidate.lineBoxes,
+                splitGroupId = candidate.splitGroupId
             )
         }
     }
@@ -217,36 +221,103 @@ class MlKitLocalTextDetector : LocalTextDetector {
                 // 15s：分块并行后多块共享 CPU，单块可能比串行慢几倍；8s 在低端机上会把
                 // 本来能出的结果误判超时（超时 = 该块整块丢字，比慢更伤）。
                 val result = Tasks.await(recognizer.process(image), 15, TimeUnit.SECONDS)
-                result.textBlocks.mapIndexedNotNull { index, block ->
+                // 先在**检测图坐标系**（work）里建块、收紧元素、拆散相距很远的元素；
+                // 最后统一除回缩放 + 加块偏移，避免 Splitter 依赖 Bitmap/Android。
+                val workBlocks = result.textBlocks.mapIndexedNotNull { index, block ->
                     val box = block.boundingBox ?: return@mapIndexedNotNull null
                     val text = block.text.trim()
                     if (text.isBlank()) return@mapIndexedNotNull null
+                    val lineBoxes = block.lines.mapNotNull { line ->
+                        line.boundingBox?.let { lineBox ->
+                            floatArrayOf(
+                                lineBox.left.toFloat(),
+                                lineBox.top.toFloat(),
+                                lineBox.right.toFloat(),
+                                lineBox.bottom.toFloat()
+                            )
+                        }
+                    }.takeIf { it.isNotEmpty() }
+                    val elements = block.lines.flatMapIndexed { lineIndex, line ->
+                        line.elements.mapNotNull { element ->
+                            val elementBox = element.boundingBox ?: return@mapNotNull null
+                            if (element.text.isBlank()) return@mapNotNull null
+                            TextElement(
+                                text = element.text,
+                                left = elementBox.left.toFloat(),
+                                top = elementBox.top.toFloat(),
+                                right = elementBox.right.toFloat(),
+                                bottom = elementBox.bottom.toFloat(),
+                                lineIndex = lineIndex
+                            )
+                        }
+                    }.takeIf { it.isNotEmpty() }
                     TextBlock(
                         id = index,
                         text = text,
-                        left = offsetX + box.left / scale,
-                        top = offsetY + box.top / scale,
-                        right = offsetX + box.right / scale,
-                        bottom = offsetY + box.bottom / scale,
+                        left = box.left.toFloat(),
+                        top = box.top.toFloat(),
+                        right = box.right.toFloat(),
+                        bottom = box.bottom.toFloat(),
                         confidence = 0f,
                         // ML Kit 的 `block` 是**段落级**多行块：行数必须带出来，否则
                         // 「行高 = 框高 ÷ 行数」会退化成「整块高度」→ 合并阈值放大数倍
                         // （2026-10-03 两个独立气泡被并成一句的真机事故）。
-                        lineCount = block.lines.count { it.text.isNotBlank() }.coerceAtLeast(1),
-                        // 逐行框（除回缩放 + 块偏移，与块框同坐标系）：行高中位数 = 原文行高
-                        // 基线、行框并集 = 真实字形区。块级框偏松且会粘到气泡描边（OTSU
-                        // 收不回），「框高 ÷ 行数」系统性放大字号（2026-10-14 用户截图：
-                        // 译文比原文大 1/3、白盖板戳出气泡下沿）。
-                        lineBoxes = block.lines.mapNotNull { line ->
-                            line.boundingBox?.let { lineBox ->
-                                floatArrayOf(
-                                    offsetX + lineBox.left / scale,
-                                    offsetY + lineBox.top / scale,
-                                    offsetX + lineBox.right / scale,
-                                    offsetY + lineBox.bottom / scale
-                                )
-                            }
-                        }.takeIf { it.isNotEmpty() }
+                        lineCount = lineBoxes?.size?.coerceAtLeast(1) ?: 1,
+                        // 逐行框（检测图坐标）：行高中位数 = 原文行高基线、
+                        // 行框并集 = 真实字形区。
+                        lineBoxes = lineBoxes,
+                        elements = elements
+                    )
+                }
+                val splitWorkBlocks = MlKitDetachedClusterSplitter.split(workBlocks) { element ->
+                    val tight = TextInkBounds.findInBitmap(
+                        work,
+                        element.left.toInt(),
+                        element.top.toInt(),
+                        element.right.toInt(),
+                        element.bottom.toInt()
+                    )
+                    tight?.let {
+                        element.copy(
+                            left = it[0].toFloat(),
+                            top = it[1].toFloat(),
+                            right = it[2].toFloat(),
+                            bottom = it[3].toFloat()
+                        )
+                    }
+                }
+                if (splitWorkBlocks.map { it.text } != workBlocks.map { it.text }) {
+                    val before = workBlocks.map { it.text.replace('\n', '⏎').take(12) }
+                    val after = splitWorkBlocks.map { it.text.replace('\n', '⏎').take(12) }
+                    Log.d(TAG, "mlkit_cluster_split from=${before.size} to=${after.size} before=$before after=$after")
+                }
+                splitWorkBlocks.map { block ->
+                    TextBlock(
+                        id = block.id,
+                        text = block.text,
+                        left = offsetX + block.left / scale,
+                        top = offsetY + block.top / scale,
+                        right = offsetX + block.right / scale,
+                        bottom = offsetY + block.bottom / scale,
+                        confidence = block.confidence,
+                        lineCount = block.lineCount,
+                        lineBoxes = block.lineBoxes?.map { line ->
+                            floatArrayOf(
+                                offsetX + line[0] / scale,
+                                offsetY + line[1] / scale,
+                                offsetX + line[2] / scale,
+                                offsetY + line[3] / scale
+                            )
+                        },
+                        elements = block.elements?.map { element ->
+                            element.copy(
+                                left = offsetX + element.left / scale,
+                                top = offsetY + element.top / scale,
+                                right = offsetX + element.right / scale,
+                                bottom = offsetY + element.bottom / scale
+                            )
+                        },
+                        splitGroupId = block.splitGroupId
                     )
                 }
             }.getOrElse { err ->

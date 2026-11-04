@@ -17,8 +17,11 @@ enum class SentenceSource(val label: String) {
 }
 
 /** 判断一条句子属于网页文字翻译还是漫画/图片翻译。 */
-fun SentenceTranslation.sourceKind(): SentenceSource {
-    val page = originPageHash.trim()
+fun SentenceTranslation.sourceKind(): SentenceSource = sourceKindOfPageHash(originPageHash)
+
+/** 按页面标识判断来源大类；按页分组时每一条来源可能来自不同页。 */
+fun sourceKindOfPageHash(pageHash: String): SentenceSource {
+    val page = pageHash.trim()
     return if (page == "webpage-text" || page.startsWith("webpage-text:")) {
         SentenceSource.WEBPAGE_TEXT
     } else {

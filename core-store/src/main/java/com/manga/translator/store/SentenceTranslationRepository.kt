@@ -10,11 +10,33 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
+ * 一句译文在某一页出现过（2026-11-02「翻译历史尽量详细」）。
+ *
+ * 旧模型只有一个 `originPageHash`：同一句在多页出现时，后一页会把前一页顶掉，
+ * 「按页」历史因此会少句/错页。现在每句保留一份有上限的来源列表，
+ * 每页各自的首次/最近出现时间和本页命中次数都能查。
+ */
+data class SentenceOrigin(
+    val pageHash: String = "",
+    /** 展示用来源（站点 host / 「截图翻译」）；页面详情缺失时兜底。 */
+    val label: String = "",
+    val firstSeenAtMs: Long = 0L,
+    val lastSeenAtMs: Long = 0L,
+    /** 在这页命中句子缓存的次数（不含首次翻译）。 */
+    val hitCount: Int = 0,
+    /** 最近一次命中方式：EXACT / COMPACT / FUZZY / NEW。 */
+    val lastMatchKind: String = ""
+)
+
+/**
  * 一条句子译文（2026-10-31 起也是「句子历史」的一行）。
  *
  * [originLabel] / [originPageHash] / [createdAtMs] / [lastHitAtMs] / [hitCount] 是
  * 2026-10-31 新增的溯源元数据：以前只有原文和译文，界面上没法回答「这句是哪来的、
  * 什么时候翻的、被复用过几次」。旧文件缺这些字段时按默认值补齐，不做版本作废。
+ *
+ * [origins] 是 2026-11-02 追加的多页来源：旧文件没有这个字段时，由
+ * [originsOrLegacy] 用旧的单页字段合成一条，迁移不需要改缓存版本。
  */
 data class SentenceTranslation(
     val sourceLanguage: String,
@@ -27,8 +49,40 @@ data class SentenceTranslation(
     val originPageHash: String = "",
     val createdAtMs: Long = 0L,
     val lastHitAtMs: Long = 0L,
-    val hitCount: Int = 0
+    val hitCount: Int = 0,
+    /**
+     * 写入这条译文时，**这句原文实际命中的术语**的内容指纹（2026-11-02）。
+     *
+     * 空串 = 当时没有生效术语命中这句；`manual` = 用户在翻译历史里手工改过，
+     * 永久跳过术语指纹校验（尊重用户最后的修改）。
+     */
+    val glossaryFingerprint: String = "",
+    /** 多页来源列表，按最近出现时间倒序保留 [MAX_ORIGINS] 条。 */
+    val origins: List<SentenceOrigin> = emptyList()
 )
+
+/**
+ * 读取多页来源；旧数据没有 [SentenceTranslation.origins] 时用单页字段合成。
+ *
+ * 页面级详情缺失也不影响「按页」分组：至少还能按 pageHash 分到正确的页，
+ * 只是少 URL/标题/引擎等信息。
+ */
+fun SentenceTranslation.originsOrLegacy(): List<SentenceOrigin> {
+    if (origins.isNotEmpty()) return origins
+    val hash = originPageHash.trim()
+    if (hash.isEmpty()) return emptyList()
+    val created = createdAtMs.takeIf { it > 0L } ?: 0L
+    val last = maxOf(lastHitAtMs, createdAtMs).takeIf { it > 0L } ?: 0L
+    return listOf(
+        SentenceOrigin(
+            pageHash = hash,
+            label = originLabel,
+            firstSeenAtMs = created,
+            lastSeenAtMs = last,
+            hitCount = hitCount
+        )
+    )
+}
 
 enum class SentenceCacheMatchKind { EXACT, COMPACT, FUZZY }
 
@@ -65,12 +119,16 @@ data class SentenceTranslationUpdate(
     val originalText: String,
     val translatedText: String,
     val originLabel: String = "",
-    val originPageHash: String = ""
+    val originPageHash: String = "",
+    /** 这句原文实际命中的术语指纹；由 [PageTranslationResolver] 在写缓存前算好。 */
+    val glossaryFingerprint: String = ""
 )
 
 data class SentenceCacheLookup(
     val translatedText: String?,
-    val matchKind: SentenceCacheMatchKind?
+    val matchKind: SentenceCacheMatchKind?,
+    /** 命中了条目但术语指纹已过期：调用方应把它当 miss，重新翻译。 */
+    val staleGlossary: Boolean = false
 ) {
     val hit: Boolean get() = translatedText != null
 
@@ -99,20 +157,46 @@ class SentenceTranslationRepository(context: Context) {
     // 同时避免同一原文在不同语言对之间串译文（2026-11-02）。
     private val compactIndex = hashMapOf<String, HashMap<String, MutableList<String>>>()
     private var lastStatsPersistMs = 0L
+    private var statsDirty = false
 
-    fun lookup(sourceLanguage: String, targetLanguage: String, originalText: String): SentenceCacheLookup {
+    fun lookup(
+        sourceLanguage: String,
+        targetLanguage: String,
+        originalText: String,
+        glossaryFingerprint: String? = null,
+        /**
+         * 当前翻译发生在哪一页（2026-11-02）：命中缓存时把「本页也出现过」
+         * 记进来源列表；空串 = 调用方不关心来源（老入口/测试）。
+         */
+        originPageHash: String = "",
+        originLabel: String = ""
+    ): SentenceCacheLookup {
         val normalized = normalize(originalText)
         if (normalized.isEmpty()) return SentenceCacheLookup.MISS
         val langKey = "${sourceLanguage.trim()}|${targetLanguage.trim()}"
         synchronized(lock) {
             ensureLoaded()
+            fun staleHit(entry: SentenceTranslation, kind: String): SentenceCacheLookup {
+                Log.d(
+                    TAG,
+                    "lookup stale_glossary lang=$langKey kind=$kind " +
+                        "stored=${entry.glossaryFingerprint.take(12)} " +
+                        "current=${glossaryFingerprint.orEmpty().take(12)} " +
+                        "text=${truncate(originalText)}"
+                )
+                return SentenceCacheLookup(null, null, staleGlossary = true)
+            }
+
             val exactKey = "$langKey|$normalized"
             index[exactKey]?.let { entry ->
                 if (isPoisoned(entry, normalized)) {
                     Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=exact text=${truncate(originalText)}")
                     return SentenceCacheLookup.MISS
                 }
-                return recordHit(entry, SentenceCacheMatchKind.EXACT)
+                if (!isGlossaryFingerprintFresh(entry.glossaryFingerprint, glossaryFingerprint)) {
+                    return staleHit(entry, "exact")
+                }
+                return recordHit(entry, SentenceCacheMatchKind.EXACT, originPageHash, originLabel)
             }
 
             val compact = compactKey(normalized)
@@ -127,7 +211,10 @@ class SentenceTranslationRepository(context: Context) {
                                 Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=compact text=${truncate(originalText)}")
                                 return SentenceCacheLookup.MISS
                             }
-                            return recordHit(entry, SentenceCacheMatchKind.COMPACT)
+                            if (!isGlossaryFingerprintFresh(entry.glossaryFingerprint, glossaryFingerprint)) {
+                                return staleHit(entry, "compact")
+                            }
+                            return recordHit(entry, SentenceCacheMatchKind.COMPACT, originPageHash, originLabel)
                         }
                     }
                 }
@@ -151,12 +238,15 @@ class SentenceTranslationRepository(context: Context) {
                                 Log.d(TAG, "lookup poisoned_skip lang=$langKey kind=fuzzy text=${truncate(originalText)}")
                                 return SentenceCacheLookup.MISS
                             }
+                            if (!isGlossaryFingerprintFresh(entry.glossaryFingerprint, glossaryFingerprint)) {
+                                return staleHit(entry, "fuzzy")
+                            }
                             Log.d(
                                 TAG,
                                 "lookup fuzzy_hit lang=$langKey dist=$bestDist " +
                                     "src=${truncate(originalText)} matched=${truncate(entry.originalText)}"
                             )
-                            return recordHit(entry, SentenceCacheMatchKind.FUZZY)
+                            return recordHit(entry, SentenceCacheMatchKind.FUZZY, originPageHash, originLabel)
                         }
                     }
                 }
@@ -250,7 +340,17 @@ class SentenceTranslationRepository(context: Context) {
             // 首次写入时间沿用旧值，避免改一次译文就把「什么时候开始的」冲掉。
             createdAtMs = previous?.createdAtMs?.takeIf { it > 0L } ?: now,
             lastHitAtMs = previous?.lastHitAtMs ?: 0L,
-            hitCount = previous?.hitCount ?: 0
+            hitCount = previous?.hitCount ?: 0,
+            glossaryFingerprint = update.glossaryFingerprint.trim(),
+            // 同一句在新的一页被重新翻译：来源列表里加一条，旧页不会丢。
+            origins = mergeOrigin(
+                origins = previous?.originsOrLegacy().orEmpty(),
+                pageHash = update.originPageHash,
+                label = update.originLabel,
+                now = now,
+                matchKind = MATCH_KIND_NEW,
+                hit = false
+            )
         )
         index[key] = entry
         addCompactEntry(entry, key)
@@ -261,8 +361,13 @@ class SentenceTranslationRepository(context: Context) {
         synchronized(lock) {
             ensureLoaded()
             return index.values.sortedWith(
-                compareByDescending<SentenceTranslation> { maxOf(it.lastHitAtMs, it.createdAtMs) }
-                    .thenByDescending { it.createdAtMs }
+                compareByDescending<SentenceTranslation> {
+                    maxOf(
+                        it.lastHitAtMs,
+                        it.createdAtMs,
+                        it.origins.maxOfOrNull { origin -> origin.lastSeenAtMs } ?: 0L
+                    )
+                }.thenByDescending { it.createdAtMs }
             )
         }
     }
@@ -309,7 +414,11 @@ class SentenceTranslationRepository(context: Context) {
             ensureLoaded()
             val key = keyOf(sourceLanguage, targetLanguage, normalized)
             val entry = index[key] ?: return false
-            index[key] = entry.copy(translatedText = value)
+            // 用户手工改过的译文是「最终答案」：以后术语再变也不覆盖它。
+            index[key] = entry.copy(
+                translatedText = value,
+                glossaryFingerprint = MANUAL_FINGERPRINT
+            )
             persist()
             return true
         }
@@ -327,6 +436,8 @@ class SentenceTranslationRepository(context: Context) {
             index.clear()
             compactIndex.clear()
             compactDirty = true
+            statsDirty = false
+            lastStatsPersistMs = 0L
             file.delete()
         }
     }
@@ -374,15 +485,51 @@ class SentenceTranslationRepository(context: Context) {
      * 只更新内存并**限频落盘**（最多 30 秒一次）：lookup 在翻译热路径上，一页几十句，
      * 每命中一次就重写 400KB 的 JSON 会把 I/O 打满。
      */
-    private fun recordHit(entry: SentenceTranslation, kind: SentenceCacheMatchKind): SentenceCacheLookup {
+    private fun recordHit(
+        entry: SentenceTranslation,
+        kind: SentenceCacheMatchKind,
+        originPageHash: String,
+        originLabel: String
+    ): SentenceCacheLookup {
         val now = System.currentTimeMillis()
-        val updated = entry.copy(hitCount = entry.hitCount + 1, lastHitAtMs = now)
+        val updated = entry.copy(
+            hitCount = entry.hitCount + 1,
+            lastHitAtMs = now,
+            // 最近一次出现在哪一页：按句视图显示「最近来源」用；按页分组读 origins。
+            originPageHash = originPageHash.trim().ifBlank { entry.originPageHash },
+            originLabel = originLabel.trim().ifBlank { entry.originLabel },
+            origins = mergeOrigin(
+                origins = entry.originsOrLegacy(),
+                pageHash = originPageHash,
+                label = originLabel,
+                now = now,
+                matchKind = kind.name,
+                hit = true
+            )
+        )
         index[keyOf(entry.sourceLanguage, entry.targetLanguage, entry.originalText)] = updated
+        statsDirty = true
         if (now - lastStatsPersistMs >= STATS_PERSIST_INTERVAL_MS) {
             lastStatsPersistMs = now
+            statsDirty = false
             runCatching { persist() }
         }
         return SentenceCacheLookup(updated.translatedText, kind)
+    }
+
+    /**
+     * 把本次页面命中的来源统计立即落盘（2026-11-02）。
+     *
+     * 热路径上的 [recordHit] 只做限频落盘；一页翻完调用一次这里，
+     * 避免 App 被杀进程时丢掉「本页命中次数 / 最近出现时间」。无改动时是空操作。
+     */
+    fun flushStats() {
+        synchronized(lock) {
+            if (!statsDirty) return
+            statsDirty = false
+            lastStatsPersistMs = System.currentTimeMillis()
+            runCatching { persist() }
+        }
     }
 
     private fun ensureLoaded() {
@@ -410,7 +557,7 @@ class SentenceTranslationRepository(context: Context) {
                 if (sourceLanguage.isEmpty() || targetLanguage.isEmpty() || originalText.isEmpty() || translatedText.isEmpty()) {
                     continue
                 }
-                index[keyOf(sourceLanguage, targetLanguage, originalText)] = SentenceTranslation(
+                val parsed = SentenceTranslation(
                     sourceLanguage = sourceLanguage,
                     targetLanguage = targetLanguage,
                     originalText = originalText,
@@ -420,8 +567,15 @@ class SentenceTranslationRepository(context: Context) {
                     originPageHash = item.optString("originPageHash", ""),
                     createdAtMs = item.optLong("createdAtMs", 0L),
                     lastHitAtMs = item.optLong("lastHitAtMs", 0L),
-                    hitCount = item.optInt("hitCount", 0)
+                    hitCount = item.optInt("hitCount", 0),
+                    // 2026-11-02 新增：旧文件没有这个字段 → 空串。
+                    // 含生效术语的句子会在下一次 lookup 时被判 stale 并重译；
+                    // 不含术语的句子继续命中，不需要整库清空。
+                    glossaryFingerprint = item.optString("glossaryFingerprint", ""),
+                    origins = parseOrigins(item.optJSONArray("origins"))
                 )
+                index[keyOf(sourceLanguage, targetLanguage, originalText)] =
+                    if (parsed.origins.isEmpty()) parsed.copy(origins = parsed.originsOrLegacy()) else parsed
             }
             compactDirty = true
         }
@@ -489,6 +643,8 @@ class SentenceTranslationRepository(context: Context) {
                     .put("createdAtMs", entry.createdAtMs)
                     .put("lastHitAtMs", entry.lastHitAtMs)
                     .put("hitCount", entry.hitCount)
+                    .put("glossaryFingerprint", entry.glossaryFingerprint)
+                    .put("origins", originsToJson(entry.origins))
             )
         }
         file.writeText(
@@ -497,6 +653,8 @@ class SentenceTranslationRepository(context: Context) {
                 .put("entries", arr)
                 .toString()
         )
+        statsDirty = false
+        lastStatsPersistMs = System.currentTimeMillis()
     }
 
     private fun keyOf(sourceLanguage: String, targetLanguage: String, originalText: String): String {
@@ -582,11 +740,99 @@ class SentenceTranslationRepository(context: Context) {
             if (snapshot == null) return null
             val needHash = entry.originPageHash.isEmpty()
             val needTime = entry.createdAtMs <= 0L
+            // 两个旧字段都已填 → 不动（幂等）。旧文件缺 origins 时由 ensureLoaded
+            // 用旧字段合成一条，不靠回填触发，避免每次启动都重写整份 JSON。
             if (!needHash && !needTime) return null
-            return entry.copy(
+            val patched = entry.copy(
                 originPageHash = if (needHash) snapshot.pageHash else entry.originPageHash,
                 createdAtMs = if (needTime) snapshot.timestampMs else entry.createdAtMs
             )
+            if (patched.originPageHash.isBlank() && patched.origins.isEmpty()) return patched
+            // 旧数据没有多页来源：先用旧字段合成一条，再把历史快照补成第二条。
+            // 两者 pageHash 相同（常见情况）时 mergeOrigin 会合并，不会重复。
+            return patched.copy(
+                origins = mergeOrigin(
+                    origins = patched.originsOrLegacy(),
+                    pageHash = snapshot.pageHash,
+                    label = patched.originLabel,
+                    now = snapshot.timestampMs,
+                    matchKind = MATCH_KIND_NEW,
+                    hit = false,
+                    firstSeenFallback = snapshot.timestampMs
+                )
+            )
+        }
+
+        /**
+         * 合并一条页面来源（纯函数，便于单测）。
+         *
+         * - 同一 `pageHash` 只保留一条：更新最近出现时间，[hit] 时命中次数 +1；
+         * - 首次出现时间优先沿用旧值；[firstSeenFallback] 用于回填旧快照；
+         * - 来源列表按最近出现时间倒序，最多 [MAX_ORIGINS] 条，避免单句无限膨胀。
+         */
+        internal fun mergeOrigin(
+            origins: List<SentenceOrigin>,
+            pageHash: String,
+            label: String,
+            now: Long,
+            matchKind: String? = null,
+            hit: Boolean = false,
+            firstSeenFallback: Long = 0L
+        ): List<SentenceOrigin> {
+            val key = pageHash.trim()
+            if (key.isEmpty()) return origins.take(MAX_ORIGINS)
+            val existing = origins.firstOrNull { it.pageHash == key }
+            val firstSeen = existing?.firstSeenAtMs?.takeIf { it > 0L }
+                ?: firstSeenFallback.takeIf { it > 0L }
+                ?: now
+            val merged = SentenceOrigin(
+                pageHash = key,
+                label = label.trim().ifBlank { existing?.label.orEmpty() },
+                firstSeenAtMs = firstSeen,
+                lastSeenAtMs = maxOf(existing?.lastSeenAtMs ?: 0L, now),
+                hitCount = (existing?.hitCount ?: 0) + if (hit) 1 else 0,
+                lastMatchKind = matchKind?.trim().orEmpty().ifBlank {
+                    existing?.lastMatchKind.orEmpty()
+                }
+            )
+            return (origins.filterNot { it.pageHash == key } + merged)
+                .sortedByDescending { it.lastSeenAtMs }
+                .take(MAX_ORIGINS)
+        }
+
+        internal fun originsToJson(origins: List<SentenceOrigin>): JSONArray {
+            val arr = JSONArray()
+            origins.forEach { origin ->
+                arr.put(
+                    JSONObject()
+                        .put("pageHash", origin.pageHash)
+                        .put("label", origin.label)
+                        .put("firstSeenAtMs", origin.firstSeenAtMs)
+                        .put("lastSeenAtMs", origin.lastSeenAtMs)
+                        .put("hitCount", origin.hitCount)
+                        .put("lastMatchKind", origin.lastMatchKind)
+                )
+            }
+            return arr
+        }
+
+        internal fun parseOrigins(array: JSONArray?): List<SentenceOrigin> {
+            if (array == null || array.length() == 0) return emptyList()
+            val list = mutableListOf<SentenceOrigin>()
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val pageHash = item.optString("pageHash", "").trim()
+                if (pageHash.isEmpty()) continue
+                list += SentenceOrigin(
+                    pageHash = pageHash,
+                    label = item.optString("label", ""),
+                    firstSeenAtMs = item.optLong("firstSeenAtMs", 0L),
+                    lastSeenAtMs = item.optLong("lastSeenAtMs", 0L),
+                    hitCount = item.optInt("hitCount", 0),
+                    lastMatchKind = item.optString("lastMatchKind", "")
+                )
+            }
+            return list.sortedByDescending { it.lastSeenAtMs }.take(MAX_ORIGINS)
         }
 
         /**
@@ -606,6 +852,26 @@ class SentenceTranslationRepository(context: Context) {
          * 永远命中、新策略只对新句子生效。
          */
         const val CACHE_VERSION = 2
+        /** 用户手工改过的译文：永久跳过术语指纹校验。 */
+        const val MANUAL_FINGERPRINT = "manual"
+        /** 单句最多保留多少页来源（超出丢最久以前的，防止句子表无限膨胀）。 */
+        const val MAX_ORIGINS = 12
+        /** 来源列表里「这一页首次翻译」的标记。 */
+        const val MATCH_KIND_NEW = "NEW"
+
+        /**
+         * 术语指纹是否还新鲜（纯函数，便于单测）。
+         *
+         * - [current] 为 null：调用方不关心术语（老入口/测试）→ 永远新鲜；
+         * - 存的是 `manual`：用户手工改过 → 永远新鲜；
+         * - 其他：必须与当前指纹完全一致。
+         */
+        internal fun isGlossaryFingerprintFresh(stored: String, current: String?): Boolean {
+            if (current == null) return true
+            if (stored == MANUAL_FINGERPRINT) return true
+            return stored == current
+        }
+
         private const val TAG = "SentenceCache"
         private const val MIN_FUZZY_COMPACT_LEN = 8
         private const val MIN_COMMON_PREFIX = 6

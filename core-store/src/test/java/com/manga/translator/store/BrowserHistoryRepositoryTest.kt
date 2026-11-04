@@ -11,8 +11,20 @@ import org.junit.Test
  */
 class BrowserHistoryRepositoryTest {
 
-    private fun entry(url: String, ts: Long, title: String = "", visits: Int = 1): BrowserHistoryEntry {
-        return BrowserHistoryEntry(url = url, title = title, lastVisitMs = ts, visitCount = visits)
+    private fun entry(
+        url: String,
+        ts: Long,
+        title: String = "",
+        visits: Int = 1,
+        firstVisitMs: Long = ts
+    ): BrowserHistoryEntry {
+        return BrowserHistoryEntry(
+            url = url,
+            title = title,
+            lastVisitMs = ts,
+            visitCount = visits,
+            firstVisitMs = firstVisitMs
+        )
     }
 
     @Test
@@ -42,6 +54,9 @@ class BrowserHistoryRepositoryTest {
         assertEquals(listOf("https://b.com", "https://a.com"), merged.map { it.url })
         assertEquals(2, merged.first().visitCount)
         assertEquals("B 站", merged.first().title)
+        // 首次访问沿用旧值，不会被本次访问冲掉。
+        assertEquals(100L, merged.first().firstVisitMs)
+        assertEquals(300L, merged.first().lastVisitMs)
         // 未命中的记录保持原样
         assertEquals(1, merged[1].visitCount)
     }
@@ -51,6 +66,17 @@ class BrowserHistoryRepositoryTest {
         val existing = listOf(entry("https://a.com", ts = 100, title = "旧标题"))
         val merged = BrowserHistoryRepository.mergeVisit(existing, "https://a.com", "   ", 200, 10)
         assertEquals("旧标题", merged.first().title)
+        assertEquals(100L, merged.first().firstVisitMs)
+    }
+
+    @Test
+    fun mergeVisitUsesPreviousLastVisitAsFirstForLegacyRows() {
+        val existing = listOf(
+            entry("https://a.com", ts = 100).copy(firstVisitMs = 0L)
+        )
+        val merged = BrowserHistoryRepository.mergeVisit(existing, "https://a.com", "A", 300, 10)
+        assertEquals(100L, merged.first().firstVisitMs)
+        assertEquals(300L, merged.first().lastVisitMs)
     }
 
     @Test
@@ -103,11 +129,13 @@ class BrowserHistoryRepositoryTest {
     }
 
     @Test
-    fun parseEntriesTextDefaultsVisitCountToAtLeastOne() {
+    fun parseEntriesTextDefaultsVisitCountAndFirstVisit() {
         val parsed = BrowserHistoryRepository.parseEntriesText(
             """{"entries":[{"url":"https://a.com","title":"","lastVisitMs":5,"visitCount":0}]}"""
         )
         assertEquals(1, parsed.single().visitCount)
+        // 旧文件没有 firstVisitMs：回退为 lastVisitMs，详情里不会是 1970。
+        assertEquals(5L, parsed.single().firstVisitMs)
     }
 
     @Test
@@ -118,9 +146,16 @@ class BrowserHistoryRepositoryTest {
 
     @Test
     fun urlWithoutSchemeTruncatesLongUrls() {
-        val long = "https://a.com/" + "p".repeat(200)
+        val long = "https://a.com/" + "p".repeat(300)
         val rendered = BrowserHistoryRepository.urlWithoutScheme(long)
-        assertTrue(rendered.length <= BrowserHistoryRepository.MAX_TITLE_LENGTH)
+        assertTrue(rendered.length <= BrowserHistoryRepository.MAX_URL_DISPLAY_LENGTH)
         assertTrue(rendered.endsWith("…"))
+    }
+
+    @Test
+    fun hostOfStripsSchemePathQueryPortAndWww() {
+        assertEquals("a.com", BrowserHistoryRepository.hostOf("https://www.a.com/x?y=1"))
+        assertEquals("a.com", BrowserHistoryRepository.hostOf("http://a.com:8080/x"))
+        assertEquals("", BrowserHistoryRepository.hostOf(""))
     }
 }

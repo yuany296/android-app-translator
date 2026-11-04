@@ -81,6 +81,30 @@ class TranslatePromptTest {
     }
 
     @Test
+    fun userPrompt_matchesKoreanParticleVariantsWhenFilteringGlossary() {
+        val glossary = listOf("레오나르도" to "莱昂纳多")
+        val prompt = client.buildTranslatePrompt(
+            texts = listOf("레오나르도는 웃었다"),
+            sourceLanguageId = "ko",
+            targetLanguageId = "zh-cn",
+            glossary = glossary
+        )
+        assertTrue(prompt.contains("레오나르도=莱昂纳多"))
+    }
+
+    @Test
+    fun userPrompt_doesNotInjectLatinTermInsideLongerWord() {
+        val glossary = listOf("king" to "国王")
+        val prompt = client.buildTranslatePrompt(
+            texts = listOf("kingdom"),
+            sourceLanguageId = "en",
+            targetLanguageId = "zh-cn",
+            glossary = glossary
+        )
+        assertFalse(prompt.contains("king=国王"))
+    }
+
+    @Test
     fun userPrompt_injectsFullPageContextWhenBatchIsOnlyMissingLines() {
         // 2026-10-18 用户选 A：整页台词是上下文，本次只翻未命中的那一句。
         val page = listOf("첫 줄", "둘째 줄", "셋째 줄")

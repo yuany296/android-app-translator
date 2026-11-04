@@ -5,8 +5,10 @@ import com.manga.translator.store.AppSettings
 import com.manga.translator.store.GlossaryEntry
 import com.manga.translator.store.SentenceTranslationUpdate
 import com.manga.translator.store.TranslationHistoryEntry
-import com.manga.translator.store.TranslationOrigin
+import com.manga.translator.store.TranslationOriginContext
+import com.manga.translator.store.TranslationPageRunStats
 import com.manga.translator.translate.Bubble
+import com.manga.translator.translate.GlossaryFingerprint
 import com.manga.translator.translate.NonTranslatableText
 import com.manga.translator.translate.TranslationResult
 import kotlinx.coroutines.CoroutineDispatcher
@@ -35,8 +37,24 @@ class PageTranslationResolver(
         pageHash: String,
         glossaryEntries: List<GlossaryEntry>,
         timer: TranslationTimer,
-        onTranslatorDownloading: ((Boolean) -> Unit)? = null
+        onTranslatorDownloading: ((Boolean) -> Unit)? = null,
+        /**
+         * 翻译历史页面缩略图的源图（2026-11-02）。
+         *
+         * 网页链路传拼接图 + [thumbnailCropTopPx]/[thumbnailCropHeightPx] 裁出当前页；
+         * 悬浮球链路传整张截图（裁剪参数默认 0/0）；网页文字翻译没有图，传 null。
+         * 只在「翻译历史 → 保存页面缩略图」打开时才会真正生成。
+         */
+        thumbnailSource: android.graphics.Bitmap? = null,
+        thumbnailCropTopPx: Int = 0,
+        thumbnailCropHeightPx: Int = 0,
+        /**
+         * 本次翻译的页面现场（2026-11-02）：来源标签、URL、标题、页码、运行 id。
+         * 由调用方显式传入，避免全局变量在并发/切页时互相覆盖。
+         */
+        origin: TranslationOriginContext = TranslationOriginContext()
     ): TranslationOutcome {
+        val originLabel = origin.label.trim()
         // 源语言：2026-11-01 起网页可自动检测，但 auto 在 EmbeddedBrowserScreen 里已经
         // 解析成具体语言后才传入（页面语言冻结 / 首页回退）。这里不再二次识别，
         // 首页与悬浮球链路也始终是用户配置的具体语言。
@@ -47,6 +65,8 @@ class PageTranslationResolver(
         val pageContext = bubbles.map { it.originalText }
             .map { it.trim().replace(Regex("\\s+"), " ") }
             .filter { it.isNotEmpty() }
+        // 术语表只读一次：提示词注入、句子缓存指纹、历史 key 都用同一份快照。
+        val glossaryPairs = glossaryEntries.map { it.source to it.target }
         val sentenceRepo = ServiceLocator.sentenceTranslationRepository
         timer.mark("cache_lookup_start", "bubbles=${bubbles.size}")
         val (translatedByOriginal, missing, cacheStats) = withContext(ioDispatcher) {
@@ -56,6 +76,7 @@ class PageTranslationResolver(
             var compactHits = 0
             var fuzzyHits = 0
             var skipped = 0
+            var glossaryStale = 0
             bubbles.forEach { bubble ->
                 val original = bubble.originalText
                 if (NonTranslatableText.isNonTranslatable(original)) {
@@ -64,7 +85,14 @@ class PageTranslationResolver(
                     skipped += 1
                     return@forEach
                 }
-                val lookup = sentenceRepo.lookup(effective.sourceLanguage, effective.targetLanguage, original)
+                val lookup = sentenceRepo.lookup(
+                    effective.sourceLanguage,
+                    effective.targetLanguage,
+                    original,
+                    glossaryFingerprint = GlossaryFingerprint.relevant(original, glossaryPairs),
+                    originPageHash = pageHash,
+                    originLabel = originLabel
+                )
                 when (lookup.matchKind) {
                     com.manga.translator.store.SentenceCacheMatchKind.EXACT -> {
                         map[original] = lookup.translatedText!!
@@ -81,22 +109,108 @@ class PageTranslationResolver(
                         fuzzyHits += 1
                     }
 
-                    null -> miss += bubble
+                    null -> {
+                        if (lookup.staleGlossary) glossaryStale += 1
+                        miss += bubble
+                    }
                 }
             }
             Triple(
                 map,
                 miss,
-                TranslationCacheStats(exactHits, compactHits, fuzzyHits, skipped, bubbles.size)
+                TranslationCacheStats(
+                    exact = exactHits,
+                    compact = compactHits,
+                    fuzzy = fuzzyHits,
+                    skipped = skipped,
+                    total = bubbles.size,
+                    glossaryStale = glossaryStale
+                )
             )
         }
         timer.mark(
             "sentence_cache",
             "exact=${cacheStats.exact} compact=${cacheStats.compact} fuzzy=${cacheStats.fuzzy} " +
-                "skipped=${cacheStats.skipped} missing=${missing.size} total=${cacheStats.total}"
+                "skipped=${cacheStats.skipped} glossary_stale=${cacheStats.glossaryStale} " +
+                "missing=${missing.size} total=${cacheStats.total}"
         )
+
+        // 页面级历史（2026-11-02）：无论这次是新翻、全缓存还是跳过，都把「哪一页、
+        // 什么 URL/标题、页码、语言、引擎、多少句新翻/复用」记下来。按页历史
+        // 因此能看到完整现场，而不是只有句子表里那几条新译文。
+        withContext(ioDispatcher) {
+            runCatching {
+                ServiceLocator.translationPageRepository.record(
+                    pageHash = pageHash,
+                    context = origin,
+                    stats = TranslationPageRunStats(
+                        sentenceCount = bubbles.size,
+                        newCount = missing.size,
+                        cacheHitCount = cacheStats.hitCount,
+                        exactCount = cacheStats.exact,
+                        compactCount = cacheStats.compact,
+                        fuzzyCount = cacheStats.fuzzy,
+                        skippedCount = cacheStats.skipped,
+                        glossaryStaleCount = cacheStats.glossaryStale
+                    ),
+                    sourceLanguage = effective.sourceLanguage,
+                    targetLanguage = effective.targetLanguage,
+                    ocrEngine = settings.ocrEngine,
+                    translateEngine = settings.translateEngine,
+                    translateProvider = settings.translateProvider,
+                    translateModel = settings.translateModel
+                )
+            }.onFailure {
+                android.util.Log.w(
+                    "TranslationHistory",
+                    "page_record_fail page=$pageHash reason=${it.message?.take(80)}"
+                )
+            }
+        }
+
+        // 页面快照（2026-11-02）：按页历史要能回看原图，这个动作与「这次有没有新句子」无关
+        // —— 即使整页命中句子缓存，也要给这一页留下缩略图。
+        // 源图在调用方返回后会被回收，所以缩略图必须在这里同步生成（IO 线程）；
+        // 落盘放到 appScope，不阻塞翻译返回。
+        if (thumbnailSource != null && ServiceLocator.settingsRepository.isHistorySnapshotEnabled()) {
+            val snapshotImage = withContext(ioDispatcher) {
+                runCatching {
+                    HistorySnapshotFactory.create(
+                        source = thumbnailSource,
+                        cropTopPx = thumbnailCropTopPx,
+                        cropHeightPx = thumbnailCropHeightPx
+                    )
+                }.onFailure {
+                    android.util.Log.w(
+                        "HistorySnapshot",
+                        "snapshot_skip reason=${it.message?.take(80)}"
+                    )
+                }.getOrNull()
+            }
+            if (snapshotImage != null) {
+                val bubblesJson = serializeSnapshotGeometry(bubbles)
+                ServiceLocator.appScope.launch {
+                    runCatching {
+                        ServiceLocator.pageSnapshotRepository.put(
+                            pageHash = pageHash,
+                            originLabel = originLabel,
+                            bubblesJson = bubblesJson,
+                            image = snapshotImage
+                        )
+                    }.onFailure {
+                        android.util.Log.w(
+                            "HistorySnapshot",
+                            "snapshot_store_fail reason=${it.message?.take(80)}"
+                        )
+                    }
+                }
+            }
+        }
+
         if (missing.isEmpty()) {
             timer.mark("translate_response", "sentence_cache_hit=true cached=${translatedByOriginal.size}")
+            // 全缓存命中也会更新「本页出现/命中次数」，这里立即落盘一次。
+            withContext(ioDispatcher) { sentenceRepo.flushStats() }
             return TranslationOutcome(
                 result = TranslationResult(
                     bubbles.map { bubble ->
@@ -112,7 +226,9 @@ class PageTranslationResolver(
             timer.mark(
                 "translate_context",
                 "page=${pageContext.size} missing=${missing.size} " +
-                    "cached=${cacheStats.hitCount} skipped=${cacheStats.skipped}"
+                    "cached=${cacheStats.hitCount} skipped=${cacheStats.skipped} " +
+                    "glossary=${glossaryPairs.size} " +
+                    "glossary_fp=${GlossaryFingerprint.active(glossaryPairs).take(12)}"
             )
             // 唯一阶段 tag：OCR 与翻译都曾用 request_send/response_ok，summary 会把 OCR 的
             // 时间戳覆盖掉，导致 translate_ms 永远为 0（2026-11-02 真机日志发现）。
@@ -145,8 +261,13 @@ class PageTranslationResolver(
                         targetLanguage = effective.targetLanguage,
                         originalText = bubble.originalText,
                         translatedText = value,
-                        originLabel = TranslationOrigin.label,
-                        originPageHash = pageHash
+                        originLabel = originLabel,
+                        originPageHash = pageHash,
+                        // 这句原文实际命中的术语指纹：术语内容一变，这条缓存自动失效。
+                        glossaryFingerprint = GlossaryFingerprint.relevant(
+                            bubble.originalText,
+                            glossaryPairs
+                        )
                     )
                 }
                 // 一页只落盘一次：旧实现每条 put 都重写整个 JSON（2026-11-02，P3）。
@@ -200,6 +321,7 @@ class PageTranslationResolver(
                 cacheStats = cacheStats
             )
         }
+        withContext(ioDispatcher) { sentenceRepo.flushStats() }
         return fresh
     }
 
@@ -310,7 +432,7 @@ class PageTranslationResolver(
     fun buildTranslateKey(
         texts: List<String>,
         settings: AppSettings,
-        glossaryRevision: Int
+        glossaryEntries: List<GlossaryEntry>
     ): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val normalizedTexts = texts
@@ -318,7 +440,7 @@ class PageTranslationResolver(
             .filter { it.isNotEmpty() }
             .sorted()
         val source = listOf(
-            "translate_v2",
+            "translate_v3",
             normalizedTexts.joinToString("\u0001"),
             settings.targetLanguage,
             settings.translateProvider,
@@ -327,10 +449,32 @@ class PageTranslationResolver(
             settings.translateApiKey,
             settings.enableThinking.toString(),
             settings.thinkingBudget.toString(),
-            glossaryRevision.toString()
+            GlossaryFingerprint.active(glossaryEntries.map { it.source to it.target })
         ).joinToString("|")
         val bytes = digest.digest(source.toByteArray(Charsets.UTF_8))
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    }
+
+    /**
+     * 页面快照只存气泡**几何**（2026-11-02）：标记版画框只需要 x/y/w/h + content 框，
+     * 不重复存原文/译文，避免 500 页的索引 JSON 被台词文本撑大。
+     */
+    private fun serializeSnapshotGeometry(bubbles: List<Bubble>): String {
+        val array = JSONArray()
+        bubbles.forEach { bubble ->
+            array.put(
+                JSONObject()
+                    .put("x", bubble.x)
+                    .put("y", bubble.y)
+                    .put("w", bubble.w)
+                    .put("h", bubble.h)
+                    .put("contentX", bubble.contentX)
+                    .put("contentY", bubble.contentY)
+                    .put("contentW", bubble.contentW)
+                    .put("contentH", bubble.contentH)
+            )
+        }
+        return JSONObject().put("bubbles", array).toString()
     }
 
     private fun serializeResult(result: TranslationResult): String {
@@ -367,7 +511,9 @@ data class TranslationCacheStats(
     val compact: Int,
     val fuzzy: Int,
     val skipped: Int,
-    val total: Int
+    val total: Int,
+    /** 命中了旧译文但术语指纹已过期、被迫重译的句数（2026-11-02）。 */
+    val glossaryStale: Int = 0
 ) {
     val hitCount: Int get() = exact + compact + fuzzy
 }

@@ -81,9 +81,10 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
-| `Models.kt` | 跨模块数据结构：`Bubble` / `TextBlock` / `BubbleRegion` / `TranslationResult` | 数据类 | `TextBlock.lineCount`（行高的来源）在此 |
+| `Models.kt` | 跨模块数据结构：`Bubble` / `TextBlock` / `TextElement` / `BubbleRegion` / `TranslationResult` | 数据类 | `TextBlock.lineCount`（行高来源）、`elements`（元素级框）、`splitGroupId`（拆分组）在此 |
 | `LocalTextDetector.kt` | 本地 OCR 引擎的统一接口 | `detect` / `isReady` / `prewarm` | 两个实现：ML Kit / Paddle |
-| `MlKitLocalTextDetector.kt` | ML Kit 识别：段落块 → `TextBlock`（带行数）；长条图分块 + 跨块同文去重 | `detect` | 失败 `mlkit detect failed`；分块 `mlkit_det_tiled … raw=/blocks=/tileBlocks=` |
+| `MlKitLocalTextDetector.kt` | ML Kit 识别：段落块 → `TextBlock`（带行数/元素框）；长条图分块 + 跨块同文去重 + 远距元素拆分 | `detect` | 失败 `mlkit detect failed`；分块 `mlkit_det_tiled … raw=/blocks=/tileBlocks=`；拆分 `mlkit_cluster_split from=/to=/texts=` |
+| `MlKitDetachedClusterSplitter.kt` | 同一 block 内相距很远的元素（分散拟声词）拆成多个 `TextBlock`；同组碎片禁止再合并 | `split` | 纯逻辑；见 Todolist §77 |
 | `PaddleOcrLocalTextDetector.kt` | PaddleOCR(ONNX)：检测 + 多方向识别投票 | `detect` | `paddle_total_ms`、`det_*`、`paddle_quad_reject` |
 | `PaddleOcrBlockMerger.kt` | 把 Paddle 的行碎片合并成段落块，并写入 `lineCount` | `mergeBlocks` | 日志 `raw_blocks=/merged=` |
 | `PaddleQuadGeometry.kt` | 四边形几何：倾角、质量闸、目标文字字符计数 | `rotationDeg` / `isAcceptableResult` | 纯逻辑，可单测 |
@@ -100,7 +101,7 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 
 | 文件 | 一句话职责 | 关键入口 | 日志 / 备注 |
 |---|---|---|---|
-| `app/PageTranslationResolver.kt` | 翻译调度：句子缓存 → 引擎分支 → 回写历史 | `resolveTranslations` / `buildTranslateKey` | `sentence_cache`、`translate_local`、`mode=baidu`、`mode=cloud` |
+| `app/PageTranslationResolver.kt` | 翻译调度：句子缓存（含多页来源）→ 引擎分支 → 回写句子/页面历史 | `resolveTranslations` / `buildTranslateKey` | `sentence_cache`、`translate_local`、`mode=baidu`、`mode=cloud`、`TranslationHistory page_record`；`origin` 显式传页面现场 |
 | `core-translate/MlKitLocalTranslator.kt` | ML Kit 本地翻译（语言对支持/模型下载） | `translate` / `isSupported` | `translate_local`、`translate_local_fallback`、`translate_local_skip` |
 | `core-translate/BaiduTranslateClient.kt` | 百度翻译专用接口（整页多句一次请求 + 签名） | `translate` | `mode=baidu` |
 | `core-translate/OpenAiVisionClient.kt` | OpenAI 兼容客户端：**现在只用于翻译**（+设置页拉模型列表）；术语表以 `buildGlossaryLine` 注入提示词 | `translateTexts` / `fetchAvailableModels` / `buildGlossaryLine` | `mode=cloud`；**原文回退三件套**（2026-10-14）：瞬时错误退避重试 `request_retry_transient`、解析失败/截断拆批 `translate_split_retry`/`translate_parse_retry`/`translate_parse_giveup`、单句重试 `sentence_retry`；返回 `TextTranslationOutcome`（`failedIndices` → 上层提示）；单测 `GlossaryPromptTest`/`OpenAiVisionClientTest`；⚠️ OCR 方法已无调用方（见 §7） |
@@ -198,11 +199,13 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `GlossaryTextImport.kt` | 导入文本的格式识别与解析（JSON / Markdown / CSV） | `detect` / `previewCount` / `parseJson` / `parseMarkdown` | 2026-10-27 导入弹窗与文件导入共用；JSON 支持 glossary/entries/裸数组/键值对，Markdown 支持分隔行/表头/围栏/转义；CSV 识别要求表头或 ≥2 行同列 |
 | `GlossaryTextDecoding.kt` | 术语文件字节解码（UTF-8/BOM → GBK 回退） | `decode` | 中文 Excel 导出的 CSV 常为 GBK；单测 `GlossaryTextDecodingTest` |
 | `TranslationHistoryRepository.kt` | 翻译历史落盘、按页/指纹查询与淘汰 | `all` / `findByPageHash` / `add` | 单测 `HistoryCodecTest` |
-| `SentenceTranslationRepository.kt` | 句子级翻译缓存（精确/紧凑/模糊三级匹配） | `lookup` / `put` | 日志 TAG `SentenceCache`、`lookup miss`、`put skip_noop` |
-| `SentenceSource.kt` | 句子来源分类（网页文字 / 漫画图片），供翻译历史筛选与分组 | `sourceKind` | 网页文字 = `originPageHash` 为 `webpage-text` / `webpage-text:*`；纯函数，旧 JSON 直接可分类 |
+| `SentenceTranslationRepository.kt` | 句子级翻译缓存（精确/紧凑/模糊三级匹配）+ 每句多页来源 `origins` | `lookup` / `putAll` / `flushStats` | 日志 TAG `SentenceCache`、`lookup miss`、`put skip_noop`；来源列表上限 12 页，旧数据按单页字段自动合成 |
+| `SentenceSource.kt` | 句子来源分类（网页文字 / 漫画图片），供翻译历史筛选与分组 | `sourceKind` / `sourceKindOfPageHash` | 网页文字 = `originPageHash` 为 `webpage-text` / `webpage-text:*`；纯函数，旧 JSON 直接可分类 |
+| `TranslationPageRepository.kt` | 按页翻译现场（URL/标题/页码/引擎/新翻复用统计） | `record` / `find` / `all` | 落盘 `mt_translation_pages.json`，上限 1000 页；同 runId 多批累加；日志 TAG `TranslationHistory` `page_record` |
+| `PageSnapshotRepository.kt` | 翻译历史按页缩略图与气泡几何 | `put` / `find` / `stats` | 上限 500 页 / 50MB；与句子历史解耦，删图不影响译文 |
 | `PageOverlayAdjustmentRepository.kt` | 逐页逐气泡的覆盖层微调持久化 | `get` / `save` | 悬浮球链路调参数 |
-| `BrowserHistoryRepository.kt` | 浏览历史落盘、同 URL 去重置顶、超限淘汰 | `record` / `recent` / `lastVisited` | 日志 `history_record`；`urlWithoutScheme` 被全仓用于日志脱敏 |
-| `BrowserFavoriteRepository.kt` | 浏览器收藏落盘与增删改 | `all` / `add` / `update` | 新标签页收藏格子 |
+| `BrowserHistoryRepository.kt` | 浏览历史落盘、同 URL 去重置顶、访问次数/首次访问、标题补写、超限淘汰 | `record` / `updateTitle` / `all` / `recent` | 上限 2000 条，原子写；日志 `history_record` / `history_title`；`urlWithoutScheme` 被全仓用于日志脱敏 |
+| `BrowserFavoriteRepository.kt` | 浏览器收藏落盘与增删改 | `all` / `add` / `update` / `defaultLabel` | 新标签页收藏格子；网页顶栏收藏星「添加」先弹编辑窗（`favoriteEditorForCurrentPage`，2026-11-03） |
 | `BrowserSearchEngine.kt` | 搜索引擎枚举与搜索 URL 模板 | `buildSearchUrl` / `fromId` | 默认必应，可切百度/Google |
 | `BrowserSiteAdapter.kt` | 站点适配声明表 + 按主机/URL 解析 | `BrowserSiteAdapterRegistry.resolve` / `byId` | 日志 `site_adapter page=…`；`BrowserScanScript` 用它注入配置 |
 | `BrowserUrlResolver.kt` | 地址栏/搜索框输入 → 可加载地址 | `resolve` / `searchUrl` | 纯逻辑 + 单测 |
@@ -268,7 +271,12 @@ Select-String -Path app\src\main\java\com\manga\translator\app\*.kt -Pattern 'cr
 | `GlossaryAddPolicy.kt` | 新增术语表单的提交判定（空原文/空译文/重复原文） | `GlossaryAddPolicy.block` / `message` | 纯函数 + `GlossaryAddPolicyTest`；口径与 `GlossaryRepository.add` 一致（trim 后比较、区分大小写） |
 | `GlossaryImportDialog.kt` | 导入入口弹窗：选文件 + 粘贴文本 + 实时识别 + 格式示例 | `GlossaryImportDialog` | 示例覆盖 Markdown / JSON / CSV；粘贴时即时显示「已识别：格式 · N 条术语」 |
 | `HistoryScreen.kt` | 翻译历史列表：展开看气泡、下拉刷新、清空 | `HistoryScreen` / `parseHistoryBubbles` | 清空历史 = 失去该页复用能力（会重新调 API） |
-| `SentencesScreen.kt` | 句子级翻译历史（底栏「翻译历史」）：按句/按页、来源筛选、折叠页卡片、勾选作废/提取术语 | `SentencesScreen` | 2026-10-31 增加「全部 / 网页文字 / 漫画图片」筛选与按页折叠；>40 句的页默认收起；句子行是独立 LazyColumn item（大页展开不卡） |
+| `SentencesScreen.kt` | 句子级翻译历史（底栏「翻译历史」）：按句/按页、来源筛选、折叠页卡片、勾选作废/提取术语 | `SentencesScreen` | 2026-10-31 增加「全部 / 网页文字 / 漫画图片」筛选与按页折叠；>40 句的页默认收起；句子行是独立 LazyColumn item（大页展开不卡）；2026-11-02 按 origins 展开多页来源并加页面/句子详情弹层 |
+| `HistoryPageGrouping.kt` | 历史「按页」聚合：每句按 origins 展开到多张页卡片，来源筛选按任一来源匹配 | `buildSentencePageGroups` / `matchesSourceKind` | 纯逻辑 + `HistoryPageGroupingTest`；同一句可在多页出现，页内按句子去重 |
+| `TranslationHistoryDetails.kt` | 历史详情弹层与纯格式化（页面详情 / 译文详情 / 引擎短名 / 时间 / 术语状态） | `TranslationPageDetailDialog` / `sentenceOriginLines` | 旧记录没有页面详情时明确提示；本地/百度引擎不显示云端厂商与模型 |
+| `HistorySnapshotFactory.kt` | 翻译历史缩略图生成、解码、标记版绘制、保存相册 | `create` / `decode` / `annotate` | 缩略图 360px 宽、最长 1400px、JPEG 72；标记版实时画框不落盘 |
+| `PageSnapshotDialogs.kt` | 页面快照查看（原图/标记版）与图片管理（单删/清空） | `PageSnapshotViewerDialog` / `PageSnapshotManagerDialog` | 只动图片，不动句子历史与译文 |
+| `BrowserHistoryDialogs.kt` | 浏览历史详情（完整标题/URL/首次与最近访问/次数） | `BrowserHistoryDetailDialog` | 长按历史行打开；打开/复制/删除；详情时间 `formatHistoryDetailTime` |
 | `ui/MtUi.kt` | 全应用共用按钮/卡片/列表行/自绘图标 | `MtCard` / `MtPrimaryButton` / `MtListRow` | 规格取设计稿「14-配色与组件规范」；⚠️ `MtOutlineButton`/`MtTextButton` **无调用方 = 死代码** |
 | `ui/theme/Color.kt` | 全应用色板常量 | `MtColors` | 改配色只改这里 |
 | `app/ui/theme/Theme.kt` | 把色板、字号阶梯与圆角组装成 MaterialTheme（App 自己界面的设计令牌总闸） | `MangaTranslatorTheme` / `MtTypography` / `MtShapes` | 只在 [MainActivity:250](app/src/main/java/com/manga/translator/app/MainActivity.kt#L250) `setContent` 里用一次，包住全部 Compose 界面；只做**浅色**（`lightColorScheme`）；`surfaceTint = Surface` 刻意**关掉 M3 高程染色**（设计稿弹窗是纯白）；字号全 `letterSpacing = 0`（中文排版）⚠️ `MtShapes` 无消费方（见 §7） |

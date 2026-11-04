@@ -228,6 +228,24 @@ class SettingsRepository(context: Context) {
     }
 
     /**
+     * 翻译历史是否自动保存「页面缩略图」（2026-11-02，默认关）。
+     *
+     * 只对**开启之后新产生的历史记录**生效：原始截图在翻译结束后就回收了，
+     * 旧记录无法补图。缩略图存原图；带框的标记版在查看时按历史里的气泡坐标实时生成，
+     * 不额外占空间。
+     *
+     * 默认关：每页一张图虽然已经缩到 360px 宽，但 500 条历史仍会占十几 MB，
+     * 由用户在「翻译历史」页自己决定是否开启。
+     */
+    fun isHistorySnapshotEnabled(): Boolean {
+        return prefs.getBoolean(KEY_HISTORY_SNAPSHOT, false)
+    }
+
+    fun setHistorySnapshotEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_HISTORY_SNAPSHOT, enabled).apply()
+    }
+
+    /**
      * 内嵌浏览器默认搜索引擎（2026-09-28 用户反馈：写死 Google，国内用不了）。
      * 同样是独立 pref（不属于翻译 API 档案），默认 [BrowserSearchEngine.DEFAULT] = 必应。
      */
@@ -507,6 +525,7 @@ class SettingsRepository(context: Context) {
         const val KEY_BROWSER_DOM_OVERLAY = "browser_dom_overlay"
         const val KEY_VISION_MODEL = "vision_model"
         const val KEY_LOW_QUALITY_VISION_OCR = "low_quality_vision_ocr"
+        const val KEY_HISTORY_SNAPSHOT = "history_snapshot"
         const val KEY_BROWSER_SEARCH_ENGINE = "browser_search_engine"
         const val KEY_BROWSER_SITE_ADAPTER = "browser_site_adapter"
         const val KEY_BROWSER_DISABLED_SITES = "browser_disabled_sites"
